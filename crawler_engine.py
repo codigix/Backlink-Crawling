@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from crawlee import ConcurrencySettings, Request
+from crawlee import ConcurrencySettings, Request, SkippedReason
 from crawlee.crawlers import (
     BeautifulSoupCrawler, BeautifulSoupCrawlingContext, PlaywrightCrawler, PlaywrightCrawlingContext,
 )
@@ -109,11 +109,11 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
                       "pending" if ok else "skipped")
         new_links += conn.execute(
             "INSERT OR IGNORE INTO outgoing_links (source_url, destination_url, destination_domain, anchor_text,"
-            " rel_attributes, link_type, is_nofollow, is_sponsored, is_ugc, img_alt, position, context)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " rel_attributes, link_type, is_nofollow, is_sponsored, is_ugc, img_alt, position, context, source_domain)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (key_url, dest, ddom, anchor, rel, ltype, ex.get("nofollow", 0), ex.get("sponsored", 0), ex.get("ugc", 0),
-             ex.get("img_alt"), ex.get("position"), ex.get("context"))).rowcount
-        conn.execute("UPDATE outgoing_links SET last_seen=?, is_active=1, rel_attributes=?, is_nofollow=?, is_sponsored=?,"
+             ex.get("img_alt"), ex.get("position"), ex.get("context"), src_dom)).rowcount
+        conn.execute("UPDATE outgoing_links SET last_seen=?, is_active=1, lost_at=NULL, rel_attributes=?, is_nofollow=?, is_sponsored=?,"
                      " is_ugc=?, img_alt=?, position=?, context=? WHERE source_url=? AND destination_url=? AND anchor_text=?",
                      (core.now(), rel, ex.get("nofollow", 0), ex.get("sponsored", 0), ex.get("ugc", 0), ex.get("img_alt"),
                       ex.get("position"), ex.get("context"), key_url, dest, anchor))
@@ -139,7 +139,7 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
     for r in conn.execute("SELECT id, destination_url, anchor_text FROM outgoing_links WHERE source_url=? AND is_active=1",
                           (key_url,)).fetchall():
         if (r["destination_url"], r["anchor_text"]) not in seen_out:
-            conn.execute("UPDATE outgoing_links SET is_active=0 WHERE id=?", (r["id"],))
+            conn.execute("UPDATE outgoing_links SET is_active=0, lost_at=? WHERE id=?", (core.now(), r["id"]))
     suspected = False  # one miss is only a suspicion (soft blocks, layout changes); a second consecutive miss confirms
     for b in conn.execute("SELECT id, target_domain_id, destination_url, link_status FROM backlinks WHERE source_url=? AND"
                           " is_active=1 AND link_status IN ('verified','fetch_failed','suspected_removed')", (key_url,)).fetchall():
@@ -156,7 +156,8 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
             suspected = True
     conn.execute(
         "UPDATE discovered_urls SET crawl_status='completed', http_status=?, content_type=?, last_crawled=?, crawl_error=NULL,"
-        " retry_count=0, next_crawl_at=?, canonical_url=?, last_successful_crawl=?, content_hash=?, title=? WHERE normalized_url=?",
+        " retry_count=0, next_crawl_at=?, canonical_url=?, last_successful_crawl=?, content_hash=?, title=?, lease_owner=NULL,"
+        " lease_expires=NULL WHERE normalized_url=?",
         (status, ctype, core.now(), core.later(days=1 if suspected else cfg.recrawl_days), canonical, core.now(),
          hashlib.sha256(str(soup).encode()).hexdigest(), (soup.title.get_text(strip=True)[:300] if soup.title else None),
          core.normalize_url(key_url)))
@@ -177,8 +178,8 @@ def mark_failed(conn, url: str, error: str, status: int | None, cfg: Config, sta
         state, nxt = "failed", core.later(days=1)
     else:
         state, nxt = "retry_pending", core.later(minutes=5 * 2 ** tries)
-    conn.execute("UPDATE discovered_urls SET crawl_status=?, retry_count=?, next_crawl_at=?, crawl_error=?, http_status=?"
-                 " WHERE normalized_url=?", (state, tries, nxt, error[:500], status, norm))
+    conn.execute("UPDATE discovered_urls SET crawl_status=?, retry_count=?, next_crawl_at=?, crawl_error=?, http_status=?,"
+                 " lease_owner=NULL, lease_expires=NULL WHERE normalized_url=?", (state, tries, nxt, error[:500], status, norm))
     conn.execute("UPDATE backlinks SET link_status='fetch_failed' WHERE source_url=? AND link_status='verified'", (url,))
     conn.execute("INSERT INTO crawl_history (source_url, crawl_started, crawl_completed, http_status, error_message)"
                  " VALUES (?,?,?,?,?)", (url, started, core.now(), status, error[:500]))
@@ -259,7 +260,8 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
                          (resp.headers.get("content-type") if resp else None))
     else:
         crawler = BeautifulSoupCrawler(http_client=ImpitHttpClient(timeout=cfg.timeout, browser=None, max_redirects=cfg.max_redirects,
-                                                        headers={"User-Agent": core.USER_AGENT}), **common)
+                                                        headers={"User-Agent": core.USER_AGENT}),
+                                   navigation_timeout=timedelta(seconds=cfg.timeout), **common)  # the client's own timeout is not what Crawlee applies
 
         @crawler.router.default_handler
         async def bs(context: BeautifulSoupCrawlingContext) -> None:
@@ -268,6 +270,16 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
             if int(r.headers.get("content-length") or 0) > cfg.max_response_bytes:
                 raise ValueError("response too large")
             await handle(context, context.soup, r.status_code, ctype)
+
+    @crawler.on_skipped_request
+    async def skipped(url: str, reason: SkippedReason) -> None:
+        if reason != "robots_txt":
+            return
+        # terminal state: without this the URL stays 'crawling', is released to 'pending' and is claimed again forever
+        with core.connect() as c:
+            c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='robots_txt', lease_owner=NULL, lease_expires=NULL"
+                      " WHERE normalized_url=? AND crawl_status IN ('crawling','recrawling')", (core.normalize_url(url),))
+        log.info("skipped %s | robots.txt", url)
 
     crawler.pre_navigation_hook(polite)
     crawler.failed_request_handler(failed)
@@ -358,30 +370,46 @@ async def run_crawl(cfg: Config, source_urls: list[str], job_id: str | None = No
 
 
 def due_urls(limit: int = 1000) -> list[tuple[str, int]]:
+    """Successfully crawled pages whose recrawl time has come. failed / retry_pending are never recrawl work:
+    retry_pending is retried by the forward crawler (claim_urls), failed is terminal."""
     with core.connect() as c:
-        rows = c.execute("SELECT url, crawl_depth FROM discovered_urls WHERE crawl_status IN ('completed','retry_pending','failed')"
+        rows = c.execute("SELECT url, crawl_depth FROM discovered_urls WHERE crawl_status='completed'"
                          " AND next_crawl_at IS NOT NULL AND next_crawl_at<=? ORDER BY next_crawl_at LIMIT ?",
                          (core.now(), limit)).fetchall()
     return [(r["url"], r["crawl_depth"]) for r in rows]
 
 
-async def recrawl_due(cfg: Config, job_id: str | None = None, urls: list[str] | None = None) -> int:
-    """Re-fetch pages whose next_crawl_at has passed (or the given URLs). Crawlee never revisits completed
-    requests on its own, so each recrawl uses a fresh queue fed from SQLite. Newly found internal URLs are stored
-    as pending and picked up by the next run_crawl."""
-    if urls is not None:
-        with core.connect() as c:
-            work = [(r["url"], r["crawl_depth"]) for u in urls for r in
-                    c.execute("SELECT url, crawl_depth FROM discovered_urls WHERE normalized_url=?", (core.normalize_url(u),))]
-    else:
-        work = due_urls(cfg.max_pages)
+def claim_recrawl(limit: int, urls: list[str] | None = None, owner: str = "recrawl", lease_seconds: int = 900) -> list[tuple[str, int, str]]:
+    """Atomically move due pages (or an explicit manual list, any non-skipped state) to 'recrawling' under a lease.
+    Returns (url, depth, previous_status) so unreached pages go back exactly where they were."""
     with core.connect() as c:
-        for u, _ in work:
-            c.execute("UPDATE discovered_urls SET crawl_status='recrawl_due' WHERE url=?", (u,))
-    await crawl_round(cfg, job_id, work, set(), False, max(len(work), 1))
-    with core.connect() as c:  # anything the crawl never reached goes back to the schedule
-        c.execute("UPDATE discovered_urls SET crawl_status='completed' WHERE crawl_status='recrawl_due'")
-    return len(work)
+        c.execute("BEGIN IMMEDIATE")  # select + update as one unit: two claimers can never get the same row
+        if urls is not None:
+            norms = [n for n in map(core.normalize_url, urls) if n]
+            rows = c.execute(f"SELECT id, url, crawl_depth, crawl_status FROM discovered_urls WHERE normalized_url IN"
+                             f" ({','.join('?' * len(norms)) or 'NULL'}) AND crawl_status IN ('completed','retry_pending','failed')", norms).fetchall()
+        else:
+            rows = c.execute("SELECT id, url, crawl_depth, crawl_status FROM discovered_urls WHERE crawl_status='completed'"
+                             " AND next_crawl_at IS NOT NULL AND next_crawl_at<=? ORDER BY next_crawl_at LIMIT ?",
+                             (core.now(), limit)).fetchall()
+        c.executemany("UPDATE discovered_urls SET crawl_status='recrawling', lease_owner=?, lease_expires=? WHERE id=?",
+                      [(owner, core.later(seconds=lease_seconds), r["id"]) for r in rows])
+    return [(r["url"], r["crawl_depth"], r["crawl_status"]) for r in rows]
+
+
+async def recrawl_due(cfg: Config, job_id: str | None = None, urls: list[str] | None = None, limit: int | None = None,
+                      owner: str = "recrawl") -> int:
+    """Re-fetch up to `limit` due pages (or the given URLs). Crawlee never revisits completed requests on its own, so each
+    recrawl uses a fresh queue fed from SQLite. Success -> completed, failure -> mark_failed (retry_pending/failed);
+    pages the round never reached return to their previous status. Newly found internal URLs are stored as pending."""
+    claimed = claim_recrawl(limit or cfg.max_pages, urls, owner)
+    try:
+        await crawl_round(cfg, job_id, [(u, d) for u, d, _ in claimed], set(), False, max(len(claimed), 1))
+    finally:  # also runs on cancellation: nothing stays 'recrawling' because of a shutdown
+        with core.connect() as c:
+            c.executemany("UPDATE discovered_urls SET crawl_status=?, lease_owner=NULL, lease_expires=NULL WHERE url=? AND crawl_status='recrawling'",
+                          [(prev, u) for u, _, prev in claimed])
+    return len(claimed)
 
 
 async def scheduler_loop(cfg: Config, every: int = 3600, stop: asyncio.Event | None = None) -> None:

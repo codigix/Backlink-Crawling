@@ -1,123 +1,15 @@
-"""FastAPI router for the universal forward crawler / link graph. Mounted by backlink_api.py."""
-
-import asyncio
-import json
-import logging
-import sys
-import uuid
+"""Read-only FastAPI router over the link graph (backlink search + inspection). Mounted by backlink_api.py.
+Crawling is done only by the standalone autonomous.py process."""
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 import crawler_core as core
-import crawler_engine as engine
 
 router = APIRouter()
-_tasks: set[asyncio.Task] = set()  # strong refs so background jobs are not garbage-collected
-
-
-class StartRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    target_domain: str | None = Field(default=None, examples=["codigix.co"])
-    source_urls: list[HttpUrl] = Field(default_factory=list, max_length=1000)
-    max_pages: int = Field(default=50_000, ge=1, le=1_000_000)
-    max_depth: int = Field(default=15, ge=0, le=50)
-    concurrency: int = Field(default=5, ge=1, le=50)
-    use_playwright: bool = False
-    enable_sitemap_discovery: bool = True
-    enable_external_domain_discovery: bool = False
-    max_domains: int = Field(default=20, ge=1, le=10_000)
-    timeout: int = Field(default=30, ge=1, le=300)
-    max_retries: int = Field(default=3, ge=1, le=10)
-
-
-class DomainRequest(BaseModel):
-    domain: str
-
-
-class SeedsRequest(BaseModel):
-    urls: list[HttpUrl] = Field(min_length=1, max_length=1000)
-
-
-class RecrawlRequest(BaseModel):
-    urls: list[HttpUrl] | None = Field(default=None, description="Omit to recrawl everything that is due")
-    use_playwright: bool = False
-    concurrency: int = Field(default=5, ge=1, le=50)
-
-
-def _launch(job_id: str, coro_factory) -> None:
-    """Run a crawl in its own thread + Proactor loop (Playwright cannot start under uvicorn's selector loop on Windows)."""
-    async def job() -> None:
-        try:
-            await asyncio.to_thread(asyncio.run, coro_factory(),
-                                    loop_factory=asyncio.ProactorEventLoop if sys.platform == "win32" else None)
-            status, err = "finished", None
-        except Exception as e:  # noqa: BLE001 - recorded on the job
-            status, err = "failed", repr(e)
-        with core.connect() as c:
-            c.execute("UPDATE crawl_jobs SET status=?, error=?, finished_at=? WHERE job_id=?", (status, err, core.now(), job_id))
-        logging.getLogger("crawler").info("job %s %s %s", job_id, status.upper(), err or "")
-
-    t = asyncio.create_task(job())
-    _tasks.add(t)
-    t.add_done_callback(_tasks.discard)
-
-
-def _new_job(target: str | None, cfg: dict) -> str:
-    job_id = uuid.uuid4().hex
-    with core.connect() as c:
-        c.execute("INSERT INTO crawl_jobs (job_id, target_domain, status, config, created_at) VALUES (?,?,'running',?,?)",
-                  (job_id, target, json.dumps(cfg), core.now()))
-    return job_id
 
 
 def _page(conn, sql: str, args: list, limit: int, offset: int) -> list[dict]:
     return [dict(r) for r in conn.execute(sql + " LIMIT ? OFFSET ?", (*args, limit, offset))]
-
-
-@router.post("/crawler/start", status_code=202)
-async def start(req: StartRequest) -> dict:
-    """Start (or resume) forward crawling. With no source_urls it continues pending URLs already in the database."""
-    try:
-        target = core.clean_target(req.target_domain) if req.target_domain else None
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    cfg = engine.Config(target_domain=target, **req.model_dump(exclude={"target_domain", "source_urls"}))
-    job_id = _new_job(target, engine.config_dict(cfg))
-    _launch(job_id, lambda: engine.run_crawl(cfg, [str(u) for u in req.source_urls], job_id))
-    return {"job_id": job_id, "status": "running"}
-
-
-@router.post("/crawler/add-domain")
-async def add_domain(req: DomainRequest) -> dict:
-    """Register a source domain as approved for crawling (seeds its homepage and sitemap URLs)."""
-    try:
-        domain = core.registrable_domain(core.clean_target(req.domain))
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    ok = await engine.admit_domain(engine.Config(), None, domain)
-    return {"domain": domain, "admitted": ok, **({} if ok else {"reason": "blocked by SSRF guard"})}
-
-
-@router.post("/crawler/add-seeds")
-async def add_seeds(req: SeedsRequest) -> dict:
-    """Add seed URLs; their domains are approved. Crawl them with POST /crawler/start."""
-    results = {}
-    for u in map(str, req.urls):
-        results[u] = await engine.admit_domain(engine.Config(enable_sitemap_discovery=False), None,
-                                               core.registrable_domain(core.hostname(u)), u)
-    return {"admitted": results}
-
-
-@router.get("/crawler/status/{job_id}")
-def status(job_id: str) -> dict:
-    with core.connect() as c:
-        job = c.execute("SELECT * FROM crawl_jobs WHERE job_id=?", (job_id,)).fetchone()
-        pending = c.execute("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status IN ('pending','crawling')").fetchone()["n"]
-    if job is None:
-        raise HTTPException(404, "job not found")
-    return {**dict(job), "config": json.loads(job["config"] or "{}"), "pending_urls": pending}
 
 
 @router.get("/crawler/discovered-urls")
@@ -157,97 +49,84 @@ def outgoing_links(source_url: str | None = None, destination_domain: str | None
         return {"total": total, "items": _page(c, "SELECT * FROM outgoing_links" + clause + " ORDER BY id", args, limit, offset)}
 
 
-def _ensure_target(c, target: str) -> None:
-    """Backfill from the link graph only the first time a target is seen; the crawler records its backlinks afterwards,
-    so repeat GETs stay read-only and never wait for the crawler's write lock."""
-    if c.execute("SELECT 1 FROM target_domains WHERE domain=? AND is_active=1", (target,)).fetchone() is None:
-        core.match_target_from_graph(c, target)
+def _clean(domain: str) -> str:
+    try:
+        return core.clean_target(domain)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
 
 
-def _backlink_rows(c, target: str, active_only: bool = True) -> list:
-    sql = ("SELECT b.* FROM backlinks b JOIN target_domains t ON t.id=b.target_domain_id WHERE t.domain=?"
-           + (" AND b.is_active=1" if active_only else "") + " ORDER BY b.id")
-    return c.execute(sql, (target,)).fetchall()
+def _graph(c, target: str, active_only: bool = True, limit: int | None = None, offset: int = 0) -> tuple[int, list]:
+    """(total, rows) of html links into `target` straight from the global outgoing_links graph: no crawl, no network, no
+    registration needed. Registrable-domain targets page in SQL; subdomain targets are host-filtered in Python (capped)."""
+    reg = core.registrable_domain(target)
+    where = " FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND source_domain!=?" + (" AND is_active=1" if active_only else "")
+    if target == reg:
+        total = c.execute("SELECT COUNT(*)" + where, (reg, reg)).fetchone()[0]
+        return total, c.execute("SELECT *" + where + " ORDER BY id LIMIT ? OFFSET ?", (reg, reg, limit or 100_000, offset)).fetchall()
+    rows = [r for r in c.execute("SELECT *" + where + " ORDER BY id LIMIT 100000", (reg, ""))  # shortcut: 100k cap for subdomain targets
+            if core.host_matches(core.hostname(r["destination_url"]), target) and not core.host_matches(core.hostname(r["source_url"]), target)]
+    return len(rows), rows[offset:offset + limit] if limit else rows
 
 
 @router.get("/backlinks/{target_domain}")
-def backlinks(target_domain: str, include_removed: bool = False) -> dict:
-    """Backlinks for ANY domain. Unknown targets are registered and matched against the existing link graph."""
-    try:
-        target = core.clean_target(target_domain)
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
+def backlinks(target_domain: str, include_removed: bool = False, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
+    """Backlinks for ANY domain, read from our own link graph. Never starts a crawl or calls an external service."""
+    target = _clean(target_domain)
     with core.connect() as c:
-        _ensure_target(c, target)
-        rows = _backlink_rows(c, target, not include_removed)
+        total, rows = _graph(c, target, not include_removed, limit, offset)
+        active = total if not include_removed else _graph(c, target)[0]
+        refs = len({r["source_domain"] for r in _graph(c, target, not include_removed)[1]})
+    if total == 0:
+        return {"domain": target, "target_domain": target, "total_backlinks": 0, "referring_domains": 0, "total_referring_domains": 0,
+                "status": "not_found_in_current_index", "message": "No discovered backlinks are currently available.", "backlinks": []}
     return {
-        "target_domain": target,
-        "total_backlinks": len(rows),
-        "verified_backlinks": sum(r["link_status"] == "verified" for r in rows),
-        "total_referring_domains": len({core.registrable_domain(core.hostname(r["source_url"])) for r in rows}),
+        "domain": target, "target_domain": target, "status": "ok", "total_backlinks": total, "verified_backlinks": active,
+        "referring_domains": refs, "total_referring_domains": refs, "limit": limit, "offset": offset,
         "backlinks": [{
             "source_url": r["source_url"], "destination_url": r["destination_url"], "anchor_text": r["anchor_text"],
-            "rel": r["rel_attributes"], "verification_status": r["link_status"], "discovery_method": r["discovery_method"],
-            "last_verified": r["last_verified"], "is_active": bool(r["is_active"]),
+            "rel": r["rel_attributes"], "source_domain": r["source_domain"], "link_status": "verified" if r["is_active"] else "removed",
+            "verification_status": "verified" if r["is_active"] else "removed", "discovery_method": "forward_crawl",
+            "first_seen": r["first_seen"], "last_verified": r["last_seen"], "is_active": bool(r["is_active"]),
         } for r in rows],
     }
+
+
+@router.get("/backlinks/{target_domain}/referring-domains")
+def referring_domains(target_domain: str) -> dict:
+    target = _clean(target_domain)
+    agg: dict[str, dict] = {}
+    with core.connect() as c:
+        for r in _graph(c, target)[1]:  # shortcut: aggregated in Python, fine to ~100k links per target
+            d = agg.setdefault(r["source_domain"], {"domain": r["source_domain"], "backlinks": 0, "first_seen": r["first_seen"], "last_verified": r["last_seen"]})
+            d["backlinks"] += 1
+            d["first_seen"], d["last_verified"] = min(d["first_seen"], r["first_seen"]), max(d["last_verified"], r["last_seen"])
+    items = sorted(agg.values(), key=lambda d: -d["backlinks"])
+    return {"domain": target, "status": "ok" if items else "not_found_in_current_index", "total_referring_domains": len(items), "referring_domains": items}
 
 
 @router.get("/backlinks/{target_domain}/anchors")
 def backlink_anchors(target_domain: str) -> dict:
     """Anchor-text distribution of the active backlinks."""
-    try:
-        target = core.clean_target(target_domain)
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    with core.connect() as c:
-        _ensure_target(c, target)
-        rows = _backlink_rows(c, target)
+    target = _clean(target_domain)
     counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["anchor_text"] or ""] = counts.get(r["anchor_text"] or "", 0) + 1
-    return {"target_domain": target, "anchors": [{"anchor_text": a, "count": n} for a, n in sorted(counts.items(), key=lambda x: -x[1])]}
-
-
-@router.get("/backlinks/{target_domain}/changes")
-def backlink_changes(target_domain: str, event_type: str | None = None, limit: int = Query(200, le=1000)) -> dict:
-    """History: first_discovered / verified / link_changed / confirmed_removed / reappeared."""
-    try:
-        target = core.clean_target(target_domain)
-    except ValueError as e:
-        raise HTTPException(422, str(e)) from e
-    sql = ("SELECT h.event_type, h.detected_at, h.details, b.source_url, b.destination_url FROM backlink_history h"
-           " JOIN backlinks b ON b.id=h.backlink_id JOIN target_domains t ON t.id=b.target_domain_id WHERE t.domain=?")
-    args: list = [target]
-    if event_type:
-        sql += " AND h.event_type=?"
-        args.append(event_type)
     with core.connect() as c:
-        return {"target_domain": target, "events": [dict(r) for r in c.execute(sql + " ORDER BY h.id DESC LIMIT ?", (*args, limit))]}
+        for r in _graph(c, target)[1]:
+            counts[r["anchor_text"] or ""] = counts.get(r["anchor_text"] or "", 0) + 1
+    return {"target_domain": target, "domain": target, "anchors": [{"anchor_text": a, "count": n} for a, n in sorted(counts.items(), key=lambda x: -x[1])]}
 
 
-@router.post("/crawler/recrawl", status_code=202)
-async def recrawl(req: RecrawlRequest) -> dict:
-    """Refetch pages that are due (or the given URLs) and diff their links against history."""
-    cfg = engine.Config(use_playwright=req.use_playwright, concurrency=req.concurrency)
-    job_id = _new_job(None, engine.config_dict(cfg))
-    urls = [str(u) for u in req.urls] if req.urls else None
-    _launch(job_id, lambda: engine.recrawl_due(cfg, job_id, urls))
-    return {"job_id": job_id, "status": "running"}
-
-
-@router.get("/crawler/statistics")
-def statistics() -> dict:
+@router.get("/backlinks/{target_domain}/history")
+def backlink_history(target_domain: str, limit: int = Query(200, le=1000)) -> dict:
+    """New and lost backlinks, newest first, from the graph itself (so it works for domains nobody registered)."""
+    target = _clean(target_domain)
+    ev = []
     with core.connect() as c:
-        one = lambda sql: c.execute(sql).fetchone()[0]  # noqa: E731
-        return {
-            "discovered_urls": one("SELECT COUNT(*) FROM discovered_urls"),
-            "discovered_domains": one("SELECT COUNT(*) FROM discovered_domains"),
-            "outgoing_links": one("SELECT COUNT(*) FROM outgoing_links"),
-            "backlinks_verified": one("SELECT COUNT(*) FROM backlinks WHERE link_status='verified' AND is_active=1"),
-            "backlinks_suspected_removed": one("SELECT COUNT(*) FROM backlinks WHERE link_status='suspected_removed'"),
-            "backlinks_removed": one("SELECT COUNT(*) FROM backlinks WHERE link_status='removed'"),
-            "urls_by_status": {r[0]: r[1] for r in c.execute("SELECT crawl_status, COUNT(*) FROM discovered_urls GROUP BY 1")},
-            "domains_by_status": {r[0]: r[1] for r in c.execute("SELECT discovery_status, COUNT(*) FROM discovered_domains GROUP BY 1")},
-            "recrawl_due_now": len(engine.due_urls()),
-        }
+        for r in _graph(c, target, False)[1]:
+            ev.append({"event": "new", "at": r["first_seen"], "source_url": r["source_url"], "destination_url": r["destination_url"]})
+            if r["lost_at"]:
+                ev.append({"event": "lost", "at": r["lost_at"], "source_url": r["source_url"], "destination_url": r["destination_url"]})
+    ev.sort(key=lambda e: e["at"], reverse=True)
+    return {"domain": target, "events": ev[:limit]}
+
+

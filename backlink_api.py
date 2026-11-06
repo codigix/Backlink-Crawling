@@ -9,6 +9,7 @@ import logging
 from fastapi import FastAPI
 
 import crawler_core
+from autonomous_api import router as discovery_router
 from crawler_api import router as crawler_router
 
 # Progress of crawl jobs shows in this terminal (extraction = each page, verification = backlinks found/removed).
@@ -22,5 +23,8 @@ logging.getLogger("crawler").propagate = False  # Crawlee adds its own root hand
 with crawler_core.connect() as conn:
     crawler_core.migrate(conn, recover=False)  # a separate crawler_worker process may be mid-crawl
 
+
+
 app = FastAPI(title="Backlink Crawler")
 app.include_router(crawler_router)
+app.include_router(discovery_router)

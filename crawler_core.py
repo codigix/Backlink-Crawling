@@ -6,8 +6,10 @@ The SQLite file is the permanent link graph. Crawlee's RequestQueue is only a pe
 import ipaddress
 import os
 import re
+import random
 import socket
 import sqlite3
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -141,10 +143,11 @@ CREATE TABLE IF NOT EXISTS discovered_urls (
     is_internal INTEGER DEFAULT 0, is_external INTEGER DEFAULT 0,
     http_status INTEGER, content_type TEXT, last_crawled DATETIME, crawl_error TEXT,
     next_crawl_at DATETIME, retry_count INTEGER DEFAULT 0, sitemap_lastmod TEXT, canonical_url TEXT,
-    last_successful_crawl DATETIME, content_hash TEXT, title TEXT
+    last_successful_crawl DATETIME, content_hash TEXT, title TEXT, lease_owner TEXT, lease_expires DATETIME, skip_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_discovered_domain ON discovered_urls(domain);
 CREATE INDEX IF NOT EXISTS idx_discovered_status ON discovered_urls(crawl_status);
+CREATE INDEX IF NOT EXISTS idx_discovered_dom_status ON discovered_urls(domain, crawl_status);
 CREATE TABLE IF NOT EXISTS discovered_domains (
     id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE,
     first_seen DATETIME DEFAULT CURRENT_TIMESTAMP, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -158,7 +161,7 @@ CREATE TABLE IF NOT EXISTS outgoing_links (
     first_seen DATETIME DEFAULT CURRENT_TIMESTAMP, last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
     is_active INTEGER DEFAULT 1,
     is_nofollow INTEGER DEFAULT 0, is_sponsored INTEGER DEFAULT 0, is_ugc INTEGER DEFAULT 0,
-    img_alt TEXT, position TEXT, context TEXT,
+    img_alt TEXT, position TEXT, context TEXT, source_domain TEXT, lost_at DATETIME,
     UNIQUE(source_url, destination_url, anchor_text)
 );
 CREATE INDEX IF NOT EXISTS idx_outgoing_destination ON outgoing_links(destination_domain);
@@ -187,6 +190,24 @@ CREATE TABLE IF NOT EXISTS backlink_history (
     detected_at DATETIME DEFAULT CURRENT_TIMESTAMP, details TEXT,
     FOREIGN KEY(backlink_id) REFERENCES backlinks(id)
 );
+CREATE TABLE IF NOT EXISTS discovery_sources (
+    name TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, status TEXT DEFAULT 'idle', cursor TEXT,
+    items_imported INTEGER DEFAULT 0, runs INTEGER DEFAULT 0, last_run DATETIME, last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS engine_state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS worker_status (
+    name TEXT PRIMARY KEY, status TEXT, heartbeat DATETIME, runs INTEGER DEFAULT 0, errors INTEGER DEFAULT 0, last_error TEXT,
+    last_heartbeat_at DATETIME, last_success_at DATETIME, restart_count INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS discovery_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, domain_id INTEGER NOT NULL, source TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_retry_at DATETIME, last_error TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(domain_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_jobs_pending ON discovery_jobs(source, status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_discovered_status_next ON discovered_urls(crawl_status, next_crawl_at);
+CREATE INDEX IF NOT EXISTS idx_discovered_status_depth ON discovered_urls(crawl_status, crawl_depth);
 CREATE TABLE IF NOT EXISTS crawl_jobs (
     job_id TEXT PRIMARY KEY, target_domain TEXT, status TEXT, config TEXT, error TEXT,
     pages_crawled INTEGER DEFAULT 0, pages_failed INTEGER DEFAULT 0, domains_admitted INTEGER DEFAULT 0,
@@ -199,8 +220,28 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path or DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+BUSY_ERRORS = 0  # transient lock errors seen by retry_locked in this process (monitoring)
+
+
+def retry_locked(fn, tries: int = 4):
+    """Run fn, retrying SQLITE_BUSY/LOCKED with bounded jittered backoff. Anything else (or the last failure) is raised."""
+    global BUSY_ERRORS
+    for i in range(tries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if not any(w in str(e).lower() for w in ("locked", "busy")):
+                raise
+            BUSY_ERRORS += 1
+            if i == tries - 1:
+                raise
+            time.sleep(0.2 * 2 ** i * random.uniform(0.5, 1.5))
 
 
 def migrate(conn: sqlite3.Connection, recover: bool = True) -> None:
@@ -214,15 +255,26 @@ def migrate(conn: sqlite3.Connection, recover: bool = True) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_legacy_backlinks_domain ON legacy_backlinks(target_domain)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_legacy_backlinks_job ON legacy_backlinks(job_id)")
     conn.executescript(SCHEMA)
-    for table, adds in (("discovered_urls", ("last_successful_crawl DATETIME", "content_hash TEXT", "title TEXT")),
+    for table, adds in (("discovered_urls", ("last_successful_crawl DATETIME", "content_hash TEXT", "title TEXT",
+                                             "lease_owner TEXT", "lease_expires DATETIME", "skip_reason TEXT")),
+                        ("worker_status", ("last_heartbeat_at DATETIME", "last_success_at DATETIME", "restart_count INTEGER DEFAULT 0")),
                         ("outgoing_links", ("is_nofollow INTEGER DEFAULT 0", "is_sponsored INTEGER DEFAULT 0",
-                                            "is_ugc INTEGER DEFAULT 0", "img_alt TEXT", "position TEXT", "context TEXT"))):
+                                            "is_ugc INTEGER DEFAULT 0", "img_alt TEXT", "position TEXT", "context TEXT",
+                                            "source_domain TEXT", "lost_at DATETIME"))):
         have = {c["name"] for c in conn.execute(f"PRAGMA table_info({table})")}  # tables from an earlier build
         for col in adds:
             if col.split()[0] not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_outgoing_source_domain ON outgoing_links(source_domain)")
+    for (u,) in conn.execute("SELECT DISTINCT source_url FROM outgoing_links WHERE source_domain IS NULL").fetchall():  # rows from older builds
+        conn.execute("UPDATE outgoing_links SET source_domain=? WHERE source_url=? AND source_domain IS NULL",
+                     (registrable_domain(hostname(u)), u))
     if recover:  # only the process that runs crawls may do this; the API must not reset a separate worker's in-flight work
-        conn.execute("UPDATE discovered_urls SET crawl_status='pending' WHERE crawl_status IN ('crawling','recrawl_due')")
+        conn.execute("UPDATE discovered_urls SET crawl_status='pending', lease_owner=NULL, lease_expires=NULL WHERE crawl_status='crawling'")
+        # interrupted recrawls go back to the schedule, never to 'pending' (they were crawled before) or 'completed' blindly
+        conn.execute("UPDATE discovered_urls SET lease_owner=NULL, lease_expires=NULL, crawl_status=CASE WHEN last_successful_crawl IS NOT NULL"
+                     " THEN 'completed' ELSE 'pending' END WHERE crawl_status IN ('recrawling','recrawl_due')")
+        conn.execute("UPDATE discovery_jobs SET status='retry_pending' WHERE status='processing'")
         conn.execute("UPDATE crawl_jobs SET status='interrupted' WHERE status='running'")
     conn.commit()
 
