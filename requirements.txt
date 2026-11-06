@@ -1,3 +1,6 @@
 crawlee[beautifulsoup,playwright]==1.11.1
 fastapi
 uvicorn[standard]
+tldextract
+httpx
+pytest
