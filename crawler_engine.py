@@ -1,7 +1,7 @@
 """Forward crawler: crawls approved source domains, stores every URL and link, admits new domains, recrawls.
 
 Crawlee's RequestQueue is a throwaway per-round work list. Everything permanent (what was found, what is
-crawled, when to recrawl) lives in SQLite via crawler_core, so a restart loses nothing.
+crawled, when to recrawl) lives in PostgreSQL via crawler_core, so a restart loses nothing.
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from crawlee import ConcurrencySettings, Request, SkippedReason
 from crawlee.crawlers import (
     BeautifulSoupCrawler, BeautifulSoupCrawlingContext, PlaywrightCrawler, PlaywrightCrawlingContext,
 )
+from crawlee._utils.robots import RobotsTxtFile
 from crawlee.http_clients import ImpitHttpClient
 from crawlee.storage_clients import MemoryStorageClient
 from crawlee.storages import RequestQueue
@@ -58,6 +59,18 @@ class Config:
     max_redirects: int = 5
 
 
+HTTP = {"started": 0, "done": 0, "total": 0.0, "retries": 0}  # fetch counters for the diagnostics log (single event loop, no lock needed)
+_T0: dict[str, float] = {}
+
+
+def _http_done(url: str, failed: bool = False) -> None:
+    t = _T0.pop(url, None)
+    if t is not None:
+        HTTP["done"] += 1
+        HTTP["total"] += time.monotonic() - t
+        HTTP["retries"] += failed
+
+
 def _job_add(job_id: str | None, col: str, n: int = 1) -> None:
     if job_id and col in ("pages_crawled", "pages_failed", "domains_admitted"):
         with core.connect() as c:
@@ -93,6 +106,7 @@ def extract_links(soup, base: str) -> list[tuple[str, str, str | None, str, dict
 def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: int | None, ctype: str | None,
                  cfg: Config, approved: set[str], follow: bool, started: str) -> list[tuple[str, int]]:
     """Persist one successfully fetched page. Returns internal (url, depth) pairs to crawl next."""
+    conn.execute("SELECT pg_advisory_xact_lock(724002)")  # one page's graph writes at a time: concurrent pages touching the same domain rows would deadlock
     src_dom = core.registrable_domain(core.hostname(key_url))
     links = extract_links(soup, base_url)
     if base_url != key_url:  # redirect
@@ -111,11 +125,11 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
             "INSERT OR IGNORE INTO outgoing_links (source_url, destination_url, destination_domain, anchor_text,"
             " rel_attributes, link_type, is_nofollow, is_sponsored, is_ugc, img_alt, position, context, source_domain)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (key_url, dest, ddom, anchor, rel, ltype, ex.get("nofollow", 0), ex.get("sponsored", 0), ex.get("ugc", 0),
+            (key_url, dest, ddom, anchor, rel, ltype, int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)),
              ex.get("img_alt"), ex.get("position"), ex.get("context"), src_dom)).rowcount
         conn.execute("UPDATE outgoing_links SET last_seen=?, is_active=1, lost_at=NULL, rel_attributes=?, is_nofollow=?, is_sponsored=?,"
                      " is_ugc=?, img_alt=?, position=?, context=? WHERE source_url=? AND destination_url=? AND anchor_text=?",
-                     (core.now(), rel, ex.get("nofollow", 0), ex.get("sponsored", 0), ex.get("ugc", 0), ex.get("img_alt"),
+                     (core.now(), rel, int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)), ex.get("img_alt"),
                       ex.get("position"), ex.get("context"), key_url, dest, anchor))
         seen_out.add((dest, anchor))
         if ltype == "canonical":
@@ -185,6 +199,26 @@ def mark_failed(conn, url: str, error: str, status: int | None, cfg: Config, sta
                  " VALUES (?,?,?,?,?)", (url, started, core.now(), status, error[:500]))
 
 
+def concurrent_robots(crawler, timeout: float = 10) -> None:
+    """Crawlee fetches robots.txt files one at a time under a single crawler-wide lock, so one slow or dead host stalls every
+    other fetch (a round of 100 sites sat idle for minutes). This replaces that lookup with one fetch per site, run in parallel,
+    each capped at `timeout`. An unreachable robots.txt counts as 'no rules', same as Crawlee's own behaviour.
+    shortcut: overrides a private Crawlee method (crawlee is pinned in requirements.txt); re-check it when upgrading."""
+    cache: dict[str, asyncio.Future] = {}
+
+    async def get(url: str):
+        p = urlsplit(url)
+        origin = f"{p.scheme}://{p.netloc}"
+        if origin not in cache:
+            cache[origin] = asyncio.ensure_future(asyncio.wait_for(RobotsTxtFile.find(url, crawler._http_client), timeout))
+        try:
+            return await asyncio.shield(cache[origin])
+        except Exception:  # noqa: BLE001 - timeout / network error: crawl as if there were no robots.txt
+            return None
+
+    crawler._get_robots_txt_file_for_url = get
+
+
 async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int]], approved: set[str], follow: bool,
                       limit: int) -> None:
     """Run one Crawlee crawl over `work` [(url, depth)]; internal links found are queued dynamically if `follow`."""
@@ -206,9 +240,13 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         if wait > 0:
             await asyncio.sleep(wait)
         started[context.request.url] = core.now()
+        if context.request.url not in _T0:
+            HTTP["started"] += 1
+        _T0[context.request.url] = time.monotonic()
 
     async def handle(context, soup, status, ctype) -> None:
         url, base = context.request.url, context.request.loaded_url or context.request.url
+        _http_done(url)  # response received (body parsing and database work after this are not HTTP time)
         t0 = started.get(url, core.now())
         if status is not None and status >= 400:  # ignored by Crawlee so it does not retry; recorded as a permanent failure
             with core.connect() as c:
@@ -223,8 +261,10 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
                 c.execute("UPDATE discovered_urls SET crawl_status='skipped', content_type=?, http_status=? WHERE normalized_url=?",
                           (ctype, status, core.normalize_url(url)))
             return
-        with core.connect() as c:  # one transaction per page
-            nxt = process_page(c, url, base, context.request.user_data["depth"], soup, status, ctype, cfg, approved, follow, t0)
+        def persist():
+            with core.connect() as c:  # one transaction per page
+                return process_page(c, url, base, context.request.user_data["depth"], soup, status, ctype, cfg, approved, follow, t0)
+        nxt = await asyncio.to_thread(persist)  # hundreds of statements per page: must not freeze the event loop (and every other fetch)
         _job_add(job_id, "pages_crawled")
         with core.connect() as c:
             n = c.execute("SELECT links_found, new_links_found FROM crawl_history WHERE source_url=? ORDER BY id DESC LIMIT 1", (url,)).fetchone()
@@ -234,6 +274,7 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
 
     async def failed(context, error: Exception) -> None:
         log.warning("FAILED %s | %s", context.request.url, error)
+        _http_done(context.request.url, failed=True)
         with core.connect() as c:
             mark_failed(c, context.request.url, repr(error), getattr(error, "status_code", None), cfg,
                         started.get(context.request.url, core.now()))
@@ -283,6 +324,8 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
 
     crawler.pre_navigation_hook(polite)
     crawler.failed_request_handler(failed)
+    concurrent_robots(crawler)
+    await asyncio.gather(*(crawler._get_robots_txt_file_for_url(u) for u, _ in work))  # all sites at once, before add_requests checks them one by one
     await crawler.run([req(u, d) for u, d in work])
 
 
@@ -300,13 +343,15 @@ async def admit_domain(cfg: Config, job_id: str | None, domain: str, seed_url: s
     if cfg.enable_sitemap_discovery:
         async with httpx.AsyncClient(timeout=cfg.timeout, follow_redirects=True, headers={"User-Agent": core.USER_AGENT}) as client:
             sitemap = await core.discover_sitemaps(client, origin + "/")
-    with core.connect() as c:
-        c.execute("INSERT OR IGNORE INTO discovered_domains (domain, discovery_source) VALUES (?, 'seed')", (domain,))
-        c.execute("UPDATE discovered_domains SET discovery_status='admitted' WHERE domain=?", (domain,))
-        core.save_url(c, seed_url or origin + "/", None, "seed", 0, True)
-        for u, mod in sitemap:
-            if core.registrable_domain(core.hostname(u)) == domain:
-                core.save_url(c, u, origin + "/sitemap.xml", "sitemap", 1, True, "pending" if core.crawlable(u) else "skipped", mod)
+    def save() -> None:
+        with core.connect() as c:
+            c.execute("INSERT OR IGNORE INTO discovered_domains (domain, discovery_source) VALUES (?, 'seed')", (domain,))
+            c.execute("UPDATE discovered_domains SET discovery_status='admitted' WHERE domain=?", (domain,))
+            core.save_url(c, seed_url or origin + "/", None, "seed", 0, True)
+            for u, mod in sitemap:
+                if core.registrable_domain(core.hostname(u)) == domain:
+                    core.save_url(c, u, origin + "/sitemap.xml", "sitemap", 1, True, "pending" if core.crawlable(u) else "skipped", mod)
+    await asyncio.to_thread(save)  # up to 5000 urls: 2-3s of database work that must not block crawling
     _job_add(job_id, "domains_admitted")
     log.info("admitted %s (%d sitemap urls)", domain, len(sitemap))
     return True
@@ -383,14 +428,14 @@ def claim_recrawl(limit: int, urls: list[str] | None = None, owner: str = "recra
     """Atomically move due pages (or an explicit manual list, any non-skipped state) to 'recrawling' under a lease.
     Returns (url, depth, previous_status) so unreached pages go back exactly where they were."""
     with core.connect() as c:
-        c.execute("BEGIN IMMEDIATE")  # select + update as one unit: two claimers can never get the same row
         if urls is not None:
             norms = [n for n in map(core.normalize_url, urls) if n]
             rows = c.execute(f"SELECT id, url, crawl_depth, crawl_status FROM discovered_urls WHERE normalized_url IN"
-                             f" ({','.join('?' * len(norms)) or 'NULL'}) AND crawl_status IN ('completed','retry_pending','failed')", norms).fetchall()
+                             f" ({','.join('?' * len(norms)) or 'NULL'}) AND crawl_status IN ('completed','retry_pending','failed')"
+                             " FOR UPDATE SKIP LOCKED", norms).fetchall()
         else:
             rows = c.execute("SELECT id, url, crawl_depth, crawl_status FROM discovered_urls WHERE crawl_status='completed'"
-                             " AND next_crawl_at IS NOT NULL AND next_crawl_at<=? ORDER BY next_crawl_at LIMIT ?",
+                             " AND next_crawl_at IS NOT NULL AND next_crawl_at<=? ORDER BY next_crawl_at LIMIT ? FOR UPDATE SKIP LOCKED",
                              (core.now(), limit)).fetchall()
         c.executemany("UPDATE discovered_urls SET crawl_status='recrawling', lease_owner=?, lease_expires=? WHERE id=?",
                       [(owner, core.later(seconds=lease_seconds), r["id"]) for r in rows])

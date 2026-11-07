@@ -2,9 +2,8 @@
 job queue, rolling admission, shutdown. Network is mocked; the local test server comes from test_crawler."""
 
 import asyncio
-import sqlite3
-
 import httpx
+import psycopg
 import pytest
 
 import autonomous
@@ -111,9 +110,9 @@ def test_forward_crawl_progresses_during_recrawl(env, monkeypatch):
 
 
 # ---- supervision ----
-def test_heartbeat_sqlite_error_does_not_kill_worker(env, monkeypatch):
+def test_heartbeat_db_error_does_not_kill_worker(env, monkeypatch):
     def locked(*a, **k):
-        raise sqlite3.OperationalError("database is locked")
+        raise psycopg.errors.DeadlockDetected("deadlock")
     monkeypatch.setattr(autonomous, "_beat", locked)
     eng, runs = autonomous.Engine(acfg()), []
 
@@ -167,7 +166,7 @@ def test_heartbeat_survives_failures_and_revives_dead_supervisor(env, monkeypatc
     def flaky(name):
         n["c"] += 1
         if n["c"] == 1:
-            raise sqlite3.OperationalError("database is locked")
+            raise psycopg.errors.DeadlockDetected("deadlock")
         real(name)
     monkeypatch.setattr(autonomous, "_pulse", flaky)
 
@@ -346,25 +345,37 @@ def test_freed_slot_admits_a_new_domain_and_exhausted_one_is_not_readmitted(env)
     assert asyncio.run(autonomous.admit_batch(cfg)) == 0  # 'crawled' is not 'discovered': a finished domain is not admitted again
 
 
-def test_old_schema_migrates_without_losing_rows(env):
-    with core.connect() as c:
-        c.execute("DROP TABLE worker_status")
-        c.execute("CREATE TABLE worker_status (name TEXT PRIMARY KEY, status TEXT, heartbeat DATETIME, runs INTEGER DEFAULT 0,"
-                  " errors INTEGER DEFAULT 0, last_error TEXT)")
-        c.execute("INSERT INTO worker_status (name, status) VALUES ('crawler','idle')")
-        core.migrate(c)
-    r = rows("SELECT * FROM worker_status")[0]
-    assert r["name"] == "crawler" and r["restart_count"] == 0 and "last_heartbeat_at" in r
-
-
 def test_retry_locked_retries_only_transient_errors(env):
     n = []
 
     def flaky():
         n.append(1)
         if len(n) < 3:
-            raise sqlite3.OperationalError("database is locked")
+            raise psycopg.errors.DeadlockDetected("deadlock")
         return "ok"
     assert core.retry_locked(flaky) == "ok" and len(n) == 3
-    with pytest.raises(sqlite3.OperationalError):
-        core.retry_locked(lambda: (_ for _ in ()).throw(sqlite3.OperationalError("no such table: x")))
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        core.retry_locked(lambda: (_ for _ in ()).throw(psycopg.errors.UndefinedTable("no such table: x")))
+
+
+# robots.txt lookups must not queue behind each other: five 1-second sites are checked in ~1s, not ~5s
+def test_robots_lookups_run_in_parallel(monkeypatch):
+    import time
+
+    async def slow_find(url, client):
+        await asyncio.sleep(1)
+        return "robots"
+    monkeypatch.setattr(engine.RobotsTxtFile, "find", slow_find)
+
+    class Fake:
+        _http_client = None
+    f = Fake()
+    engine.concurrent_robots(f, timeout=5)
+
+    async def go():
+        t = time.monotonic()
+        got = await asyncio.gather(*(f._get_robots_txt_file_for_url(f"https://s{i}.example/x") for i in range(5)),
+                                   f._get_robots_txt_file_for_url("https://s0.example/y"))  # same site: one fetch, shared
+        return time.monotonic() - t, got
+    took, got = asyncio.run(go())
+    assert took < 2.5 and got == ["robots"] * 6

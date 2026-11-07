@@ -1,4 +1,4 @@
-"""Run crawls as a separate process, so the API stays responsive. State lives in the shared SQLite file.
+"""Run crawls as a separate process, so the API stays responsive. State lives in the shared PostgreSQL database (DATABASE_URL).
 
   python crawler_worker.py crawl --target fitness-events.com --seed https://example.com/ --max-pages 500
   python crawler_worker.py crawl            # resume pending URLs

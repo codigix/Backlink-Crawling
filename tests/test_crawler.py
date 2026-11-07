@@ -5,8 +5,10 @@ Run: .venv/Scripts/python -m pytest tests -q
 
 import asyncio
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import psycopg
 import pytest
 
 import crawler_core as core
@@ -41,13 +43,18 @@ def port():
 
 
 @pytest.fixture()
-def env(port, tmp_path, monkeypatch):
-    monkeypatch.setattr(core, "DB_FILE", tmp_path / "t.db")
-    monkeypatch.setattr(core, "ALLOW_PRIVATE", True)
-    SITES.clear()
-    with core.connect() as c:
-        core.migrate(c)
-    return lambda host, path="/": f"http://{host}.localhost:{port}{path}"
+def env(port, monkeypatch):
+    """Each test gets its own PostgreSQL schema in the database at DATABASE_URL (dropped afterwards)."""
+    schema = "t_" + uuid.uuid4().hex[:12]
+    with psycopg.connect(core.DATABASE_URL, autocommit=True) as admin:
+        admin.execute(f"CREATE SCHEMA {schema}")
+        monkeypatch.setattr(core, "DB_SCHEMA", schema)
+        monkeypatch.setattr(core, "ALLOW_PRIVATE", True)
+        SITES.clear()
+        with core.connect() as c:
+            core.migrate(c)
+        yield lambda host, path="/": f"http://{host}.localhost:{port}{path}"
+        admin.execute(f"DROP SCHEMA {schema} CASCADE")
 
 
 def cfg(**kw) -> engine.Config:
@@ -257,20 +264,11 @@ def test_sitemap_discovery(env):
     assert r["discovery_method"] == "sitemap" and r["sitemap_lastmod"] == "2024-05-01" and r["crawl_status"] == "completed"
 
 
-def test_migration_preserves_legacy_rows(tmp_path):
-    import sqlite3
-    db = tmp_path / "old.db"
-    old = sqlite3.connect(db)
-    old.execute("CREATE TABLE backlinks (job_id TEXT, target_domain TEXT, source_url TEXT, backlink_found INTEGER,"
-                " matching_links TEXT, error TEXT, checked_at TEXT, source_site TEXT)")
-    old.execute("INSERT INTO backlinks VALUES ('j','t.com','http://s/',1,'[]',NULL,'now','http://s/')")
-    old.commit()
-    old.close()
-    c = core.connect(db)
-    core.migrate(c)
-    core.migrate(c)  # idempotent
-    assert c.execute("SELECT COUNT(*) FROM legacy_backlinks").fetchone()[0] == 1
-    assert "target_domain_id" in {r["name"] for r in c.execute("PRAGMA table_info(backlinks)")}
+def test_migration_is_idempotent(env):
+    with core.connect() as c:
+        core.migrate(c)
+        core.migrate(c)
+        assert c.execute("SELECT COUNT(*) FROM discovered_urls").fetchone()[0] == 0
 
 
 def test_idna_and_user_agent_constant():

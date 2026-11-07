@@ -113,7 +113,7 @@ def test_five_workers_end_to_end(env, monkeypatch):
     assert not rows("SELECT * FROM crawl_history WHERE source_url LIKE '%/private/%'")
     assert {r["source_url"].split(":")[0] for r in rows("SELECT * FROM backlinks")} == {"http"}
     assert len(rows("SELECT * FROM backlinks WHERE link_status='verified'")) == 3  # /, /about on a; / on b: backlinks were stored
-    assert rows("SELECT COUNT(*) n FROM discovered_urls GROUP BY normalized_url HAVING n>1") == []
+    assert rows("SELECT COUNT(*) n FROM discovered_urls GROUP BY normalized_url HAVING COUNT(*)>1") == []
     w = {r["name"]: r for r in rows("SELECT * FROM worker_status")}
     assert set(w) == set(alive) and all(r["last_heartbeat_at"] for r in w.values())
     assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status IN ('crawling','recrawling')")[0]["n"] == 0

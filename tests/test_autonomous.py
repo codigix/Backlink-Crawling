@@ -47,7 +47,7 @@ def test_autonomous_pipeline_and_database_first_search(env, monkeypatch):
     cycle(autonomous.Engine(cfg), 2)  # rolling admission frees finished domains' slots; stop before codigix.co could take one
     assert {r["domain"] for r in rows("SELECT domain FROM discovered_domains WHERE discovery_status='admitted'")} == {"a.localhost", "b.localhost"}
     assert rows("SELECT COUNT(*) n FROM discovered_domains WHERE domain='codigix.co'")[0]["n"] == 1  # discovered, never admitted
-    assert rows("SELECT COUNT(*) n FROM discovered_urls GROUP BY normalized_url HAVING n>1") == []  # dedup
+    assert rows("SELECT COUNT(*) n FROM discovered_urls GROUP BY normalized_url HAVING COUNT(*)>1") == []  # dedup
     assert len(rows("SELECT * FROM crawl_history WHERE source_url LIKE '%/p2'")) == 1  # /p2 linked twice, fetched once
     assert rows("SELECT 1 FROM outgoing_links WHERE source_domain IS NULL") == []
 
@@ -219,3 +219,15 @@ def test_seeded_domains_claimed_first_without_starving_others(env):
     assert len(got) == 20 and len(set(got)) == 20
     assert len(seeded) == 10  # seed_batch caps the reservation, shared round-robin between seeds
     assert len({u.split("/")[2] for u in got if "//n" in u}) == 10  # the rest is round-robin over normal domains
+
+
+# POST /crawler/seed only leaves flags; the engine's scheduler must turn them into priority-0 admitted domains
+def test_api_seed_flags_are_admitted_at_top_priority(env):
+    import autonomous_api
+    SITES["a.localhost"] = {"/": page("hi")}
+    autonomous_api.seed(autonomous_api.SeedRequest(urls=[env("a")]))
+    eng = autonomous.Engine(acfg())
+    asyncio.run(eng.scheduler())
+    d = rows("SELECT * FROM discovered_domains WHERE domain='a.localhost'")[0]
+    assert d["priority"] == 0 and d["discovery_status"] == "admitted"
+    assert rows("SELECT COUNT(*) n FROM engine_state WHERE key LIKE 'seed:%'")[0]["n"] == 0  # consumed

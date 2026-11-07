@@ -4,3 +4,5 @@ uvicorn[standard]
 tldextract
 httpx
 pytest
+psycopg[binary]
+python-dotenv

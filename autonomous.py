@@ -1,11 +1,11 @@
-"""Autonomous engine: bootstraps its own discovery sources, then runs five supervised workers over the SQLite graph.
+"""Autonomous engine: bootstraps its own discovery sources, then runs five supervised workers over the PostgreSQL graph.
 
   python autonomous.py            # no seeds needed; Ctrl+C shuts down gracefully
   python autonomous.py seed example.com --directories   # optional: crawl these first (high priority)
   uvicorn backlink_api:app        # separate process: only reads the database and sets pause/bootstrap flags
 
 Workers: discovery (public sources) | scheduler (leases, domain admission) | crawler (claims frontier URLs)
-         | indexer (tracked-target backlinks) | verifier (recrawls due pages). SQLite is the only shared state, so
+         | indexer (tracked-target backlinks) | verifier (recrawls due pages). PostgreSQL is the only shared state, so
 pause/resume and status work from any process. Archived (Common Crawl) URLs only enter the frontier; a link becomes
 a backlink only after OUR live fetch of the source page saw it.
 """
@@ -51,7 +51,9 @@ class AutoConfig:
     monitor_every: float = 60
     lease_seconds: int = 900
     source_interval: dict = field(default_factory=lambda: {"tranco": 3600, "feeds": 3600, "commoncrawl": 60})
-    crawl: engine.Config = field(default_factory=lambda: engine.Config(max_depth=3, concurrency=5, domain_delay=1.0, timeout=20, max_retries=2))
+    # Fetching is network-bound (real sites average ~10s per URL), so many fetches in flight; set CRAWL_CONCURRENCY to tune
+    crawl: engine.Config = field(default_factory=lambda: engine.Config(
+        max_depth=3, concurrency=int(os.environ.get("CRAWL_CONCURRENCY", 25)), domain_delay=1.0, timeout=20, max_retries=2))
 
 
 # ---------- discovery sources: each returns ([(url, priority|None, depth)], new_cursor) ----------
@@ -113,7 +115,8 @@ async def src_commoncrawl(client, cfg, cursor):
         jobs = c.execute(
             "UPDATE discovery_jobs SET status='processing', attempts=attempts+1, updated_at=? WHERE id IN (SELECT id FROM discovery_jobs"
             " WHERE source='commoncrawl' AND status IN ('pending','retry_pending') AND (next_retry_at IS NULL OR next_retry_at<=?)"
-            " ORDER BY id LIMIT ?) RETURNING id, attempts, (SELECT domain FROM discovered_domains WHERE id=domain_id) domain",
+            " ORDER BY id LIMIT ?) AND status IN ('pending','retry_pending') RETURNING id, attempts,"
+            " (SELECT domain FROM discovered_domains WHERE id=domain_id) AS domain",
             (core.now(), core.now(), cfg.cc_domains_per_run)).fetchall()
     out = []
     if not jobs:
@@ -174,12 +177,16 @@ async def run_source(name: str, cfg: AutoConfig, client, force: bool = False) ->
     try:
         urls, cursor = await SOURCES[name](client, cfg, row["cursor"])
         err = None
-        with core.connect() as c:
-            for url, prio, depth in urls:
-                if core.normalize_url(url) and core.crawlable(url):
-                    new += core.save_url(c, url, None, name, depth, True)
-                    if prio:
-                        c.execute("UPDATE discovered_domains SET priority=? WHERE priority>0 AND domain=?", (prio, core.registrable_domain(core.hostname(url))))
+        def save() -> int:
+            n = 0
+            with core.connect() as c:
+                for url, prio, depth in urls:
+                    if core.normalize_url(url) and core.crawlable(url):
+                        n += core.save_url(c, url, None, name, depth, True)
+                        if prio:
+                            c.execute("UPDATE discovered_domains SET priority=? WHERE priority>0 AND domain=?", (prio, core.registrable_domain(core.hostname(url))))
+            return n
+        new = await asyncio.to_thread(save)
     except Exception as e:  # noqa: BLE001 - an unavailable source must never stop the engine
         cursor, err = row["cursor"], repr(e)[:300]
         log.warning("source %s failed: %s", name, err)
@@ -210,11 +217,17 @@ def claim_urls(owner: str, cfg: AutoConfig) -> list[tuple[str, int]]:
             "  LEFT JOIN (SELECT domain, COUNT(*) n FROM discovered_urls WHERE crawl_status IN ('completed','crawling')"
             "   GROUP BY domain) k ON k.domain=u.domain"  # counted once per domain, not once per pending URL
             "  WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?))"
-            "   AND d.discovery_status='admitted' AND u.crawl_depth<=?)"
-            "  WHERE rn<=? AND rn+used<=?)"  # seeded domains (priority 0) first, at most seed_batch URLs; the rest round-robin
-            " ORDER BY CASE WHEN priority=0 AND sr<=? THEN 0 ELSE 1 END, rn, priority, id LIMIT ?) RETURNING url, crawl_depth",
+            "   AND d.discovery_status='admitted' AND u.crawl_depth<=?) t1"
+            "  WHERE rn<=? AND rn+used<=?) t2"  # seeded domains (priority 0) first, at most seed_batch URLs; the rest round-robin
+            " ORDER BY CASE WHEN priority=0 AND sr<=? THEN 0 ELSE 1 END, rn, priority, id LIMIT ?)"
+            " AND crawl_status IN ('pending','retry_pending') RETURNING url, crawl_depth,"
+            " (SELECT priority FROM discovered_domains d WHERE d.domain=discovered_urls.domain) AS prio",
             (owner, core.later(seconds=cfg.lease_seconds), core.now(), cfg.crawl.max_depth, cfg.per_batch, cfg.domain_page_budget,
              cfg.seed_batch, cfg.claim_batch)).fetchall()
+    rows.sort(key=lambda r: 99 if r["prio"] is None else r["prio"])  # seeded (priority 0) URLs first in this round's queue, not just in the claim
+    seeded = [r["url"] for r in rows if r["prio"] == 0]
+    if seeded:
+        log.info(">>> SEED-PRIORITY: claimed %d seeded URL(s) ahead of the backlog (of %d claimed), e.g. %s", len(seeded), len(rows), seeded[:3])
     return [(r["url"], r["crawl_depth"]) for r in rows]
 
 
@@ -292,6 +305,7 @@ async def seed(urls: list[str], cfg: AutoConfig | None = None) -> dict[str, bool
         out[u] = await engine.admit_domain(cfg.crawl, None, dom, u)
         with core.connect() as c:
             c.execute("UPDATE discovered_domains SET priority=0 WHERE domain=?", (dom,))
+        log.info(">>> SEED-PRIORITY: %s %s at priority 0 (top)", u, "admitted" if out[u] else "NOT admitted (blocked/unsafe)")
     return out
 
 
@@ -299,7 +313,8 @@ async def seed(urls: list[str], cfg: AutoConfig | None = None) -> dict[str, bool
 
 def set_paused(paused: bool) -> None:
     with core.connect() as c:
-        c.execute("INSERT OR REPLACE INTO engine_state (key, value) VALUES ('paused', ?)", ("1" if paused else "0",))
+        c.execute("INSERT INTO engine_state (key, value) VALUES ('paused', ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                  ("1" if paused else "0",))
 
 
 def is_paused() -> bool:
@@ -315,7 +330,7 @@ def _beat(name: str, status: str, error: str | None = None) -> None:
         c.execute("INSERT OR IGNORE INTO worker_status (name) VALUES (?)", (name,))
         c.execute("UPDATE worker_status SET status=?, heartbeat=?, runs=runs+?, errors=errors+?, restart_count=restart_count+?,"
                   " last_success_at=CASE WHEN ? THEN ? ELSE last_success_at END, last_error=COALESCE(?, last_error) WHERE name=?",
-                  (status, core.now(), ok, int(error is not None), int(error is not None), ok, core.now(), error, name))
+                  (status, core.now(), ok, int(error is not None), int(error is not None), bool(ok), core.now(), error, name))
 
 
 def _pulse(name: str) -> None:
@@ -342,7 +357,7 @@ class Engine:
     def _status(self, name: str, status: str, error: str | None = None) -> None:
         try:
             _beat(name, status, error)
-        except Exception:  # noqa: BLE001 - a locked database must not kill a worker; the heartbeat age will show the problem
+        except Exception:  # noqa: BLE001 - an unavailable database must not kill a worker; the heartbeat age will show the problem
             core.BUSY_ERRORS += 1
             log.warning("could not record %s status %s", name, status, exc_info=True)
 
@@ -407,6 +422,26 @@ class Engine:
             except asyncio.TimeoutError:
                 pass
 
+    async def diagnostics(self) -> None:
+        """Every 10s: one log line of frontier/connection/lock/HTTP state. Own single thread, so a starved default thread pool or an
+        exhausted database cannot silence it; if the snapshot itself hangs, that is logged instead."""
+        import concurrent.futures
+        import engine_stats
+        dlog, pool = logging.getLogger("crawler.diag"), concurrent.futures.ThreadPoolExecutor(1, "diag")
+        while not self.stop.is_set():
+            try:
+                snap = await asyncio.wait_for(asyncio.wrap_future(pool.submit(engine_stats.diagnostics, engine.HTTP)), 8)
+                snap["workers"] = {n: ("done" if t.done() else "alive") for n, t in self.tasks.items()}
+                snap["active_workers"] = sum(not t.done() for t in self.tasks.values())
+                snap["asyncio_tasks"] = len(asyncio.all_tasks())
+                dlog.info("DIAG %s", json.dumps(snap, default=str))
+            except Exception as e:  # noqa: BLE001
+                dlog.error("DIAG snapshot failed/hung: %r | open_conns=%d", e, core.OPEN_CONNS)
+            try:
+                await asyncio.wait_for(self.stop.wait(), 10)
+            except asyncio.TimeoutError:
+                pass
+
     async def discovery(self) -> bool:
         with core.connect() as c:  # POST /discovery/bootstrap leaves a flag here; only this process ever fetches sources
             asked = c.execute("DELETE FROM engine_state WHERE key='bootstrap_requested'").rowcount
@@ -414,15 +449,20 @@ class Engine:
         return False
 
     async def scheduler(self) -> bool:
-        release()
-        retire_unreachable()
-        retire_exhausted(self.cfg)
+        with core.connect() as c:  # POST /crawler/seed leaves seed:<url> flags; admit them at top priority, then clear them
+            keys = [r["key"] for r in c.execute("SELECT key FROM engine_state WHERE key LIKE 'seed:%'")]
+        if keys:
+            log.info(">>> SEED-PRIORITY: received %d seed(s) from the API: %s", len(keys), [k.removeprefix("seed:") for k in keys])
+            await seed([k.removeprefix("seed:") for k in keys], self.cfg)
+            with core.connect() as c:
+                c.executemany("DELETE FROM engine_state WHERE key=?", [(k,) for k in keys])
+        await asyncio.to_thread(lambda: (release(), retire_unreachable(), retire_exhausted(self.cfg)))
         return bool(await admit_batch(self.cfg))
 
     async def crawler(self) -> bool:
         if self.stop.is_set():
             return False
-        work = claim_urls(self.owner, self.cfg)
+        work = await asyncio.to_thread(claim_urls, self.owner, self.cfg)
         if not work:
             return False
         try:
@@ -458,7 +498,7 @@ class Engine:
                       "indexer": (self.indexer, 300), "verifier": (self.verifier, 60, 5)}
         for name in self.specs:
             self._spawn(name)
-        side = [asyncio.create_task(self._heartbeat(n), name=f"heartbeat-{n}") for n in self.specs] + [asyncio.create_task(self.monitor())]
+        side = [asyncio.create_task(self._heartbeat(n), name=f"heartbeat-{n}") for n in self.specs] + [asyncio.create_task(self.monitor()), asyncio.create_task(self.diagnostics())]
         try:
             await self.stop.wait()
         finally:  # normal stop or cancellation (Ctrl+C): give workers a moment, then stop everything and return all leases

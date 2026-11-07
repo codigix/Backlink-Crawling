@@ -1,4 +1,4 @@
-"""Discovery / global-crawler endpoints. Read-only views of SQLite plus flags (pause, bootstrap) for the standalone
+"""Discovery / global-crawler endpoints. Read-only views of PostgreSQL plus flags (pause, bootstrap) for the standalone
 `python autonomous.py` engine."""
 
 from fastapi import APIRouter, HTTPException
@@ -15,7 +15,7 @@ router = APIRouter()
 def discovery_bootstrap() -> dict:
     """Ask the standalone engine to run every enabled source now (within ~30s). The API itself never fetches anything."""
     with core.connect() as c:
-        c.execute("INSERT OR REPLACE INTO engine_state (key, value) VALUES ('bootstrap_requested', '1')")
+        c.execute("INSERT INTO engine_state (key, value) VALUES ('bootstrap_requested', '1') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value")
     return {"requested": True}
 
 
@@ -32,7 +32,8 @@ def seed(req: SeedRequest) -> dict:
     if bad or not urls:
         raise HTTPException(422, f"invalid or empty urls: {bad}")
     with core.connect() as c:
-        c.executemany("INSERT OR REPLACE INTO engine_state (key, value) VALUES (?, '1')", [(f"seed:{u}",) for u in urls])
+        c.executemany("INSERT INTO engine_state (key, value) VALUES (?, '1') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                      [(f"seed:{u}",) for u in urls])
     return {"queued": urls}
 
 
