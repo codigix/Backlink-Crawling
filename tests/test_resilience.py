@@ -234,6 +234,7 @@ def cc_handler(code, text="", headers=None):
 def add_admitted(domain, id_):
     with core.connect() as c:
         c.execute("INSERT INTO discovered_domains (id, domain, discovery_status) VALUES (?,?,'admitted')", (id_, domain))
+        c.execute("SELECT setval(pg_get_serial_sequence('discovered_domains','id'), (SELECT MAX(id) FROM discovered_domains))")  # explicit id: keep the sequence ahead
 
 
 def job():

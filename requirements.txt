@@ -6,3 +6,6 @@ httpx
 pytest
 psycopg[binary]
 python-dotenv
+celery[redis]
+redis
+flower

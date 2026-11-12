@@ -8,6 +8,7 @@ import os
 import re
 import random
 import socket
+import threading
 import time
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -21,7 +22,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")  # real environment variables still win
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/backlinks")
-DB_SCHEMA = None  # test hook: search_path for an isolated schema
+DB_SCHEMA = os.environ.get("DB_SCHEMA") or None  # test hook: search_path for an isolated schema (env so Celery worker processes share it)
 TS = "(to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'))"  # same text format the code compares as strings
 # Honest identification; set CRAWLER_CONTACT_URL to a page describing who runs the crawler.
 USER_AGENT = f"BacklinkGraphBot/1.0 (+{os.environ.get('CRAWLER_CONTACT_URL', 'https://example.com/bot')})"
@@ -31,7 +32,7 @@ UNSAFE_PATH = re.compile(r"(log-?out|sign-?out|delete|remove|unsubscribe|/cdn-cg
 HOSTNAME = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$|^[a-z0-9-]+\.localhost$")
 
 # Test hook only: tests crawl 127.0.0.1 and must switch the SSRF guard off.
-ALLOW_PRIVATE = False
+ALLOW_PRIVATE = os.environ.get("CRAWLER_ALLOW_PRIVATE") == "1"  # never set in production
 
 
 def now() -> str:
@@ -99,7 +100,7 @@ def registrable_domain(host: str) -> str:
 
 def host_matches(host: str, target: str) -> bool:
     """True if host is target or a subdomain of it. Never substring matching."""
-    target = target.lower().lstrip(".")
+    target, host = idna(target.lstrip(".")), idna(host)  # Unicode and punycode spellings of one name must match
     return host == target or host.endswith("." + target)
 
 
@@ -113,23 +114,76 @@ def clean_target(domain: str) -> str:
     return d
 
 
-def is_safe_url(url: str) -> bool:
-    """SSRF guard: http(s) only, no credentials, no localhost/private/link-local/reserved addresses."""
+class UnsafeURL(ValueError):
+    """A request was refused before it was sent (SSRF guard). Permanent: retrying the same URL cannot make it safe."""
+
+
+def blocked_reason(url: str) -> str | None:
+    """Why `url` must not be fetched, or None if it is safe. Checked for the first request AND for every redirect hop, right
+    before it is sent (the DNS answer is looked up at that moment, which narrows the DNS-rebinding window to the connect itself).
+    Every resolved address must be globally routable: loopback, private, link-local, CGNAT, reserved, multicast, unspecified and
+    IPv4-mapped IPv6 forms of those are refused."""
     if ALLOW_PRIVATE:
-        return True
+        return None
     p = urlsplit(url)
     host = hostname(url)
-    if p.scheme not in ("http", "https") or not host or p.username or host == "localhost" or host.endswith(".localhost"):
-        return False
+    if p.scheme not in ("http", "https") or not host:
+        return "scheme not http(s) or no host"
+    if p.username or p.password:
+        return "credentials in URL"
+    if host == "localhost" or host.endswith(".localhost"):
+        return "localhost"
     try:
         infos = socket.getaddrinfo(host, None)
-    except OSError:
-        return False
+    except OSError as e:
+        return f"DNS failure: {e}"
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
-            return False
-    return True
+        if not ip_allowed(info[4][0]):
+            return f"{host} resolves to non-public address {info[4][0]}"
+    return None
+
+
+def ip_allowed(addr: str) -> bool:
+    """True if `addr` is globally routable (the egress proxy applies this to the address it actually connects to)."""
+    if ALLOW_PRIVATE:
+        return True
+    ip = ipaddress.ip_address(addr.split("%")[0])
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_global and not ip.is_multicast
+
+
+def log_blocked(why: str) -> None:
+    import logging
+    logging.getLogger("crawler.discovery").warning("EGRESS BLOCKED | %s", why)
+
+
+def is_safe_url(url: str) -> bool:
+    return blocked_reason(url) is None
+
+
+_TEST_IPS: dict[str, str] = {}  # test hook: logical *.localhost name -> its own loopback address (Windows cannot resolve *.localhost)
+
+
+def test_ip(host: str) -> str:
+    return _TEST_IPS.setdefault(host, f"127.0.{len(_TEST_IPS) // 250}.{len(_TEST_IPS) % 250 + 1}")
+
+
+def test_route(url: str) -> tuple[str, dict[str, str]]:
+    """Only with CRAWLER_ALLOW_PRIVATE=1 (tests): fetch http://x.localhost:P/.. from 127.0.x.y:P with the original Host header."""
+    host = hostname(url)
+    if not ALLOW_PRIVATE or not host.endswith(".localhost"):
+        return url, {}
+    ip = test_ip(host)
+    p = urlsplit(url)
+    return urlunsplit((p.scheme, f"{ip}:{p.port}" if p.port else ip, p.path, p.query, p.fragment)), {"Host": p.netloc}
+
+
+def test_unroute(url: str) -> str:
+    for host, ip in _TEST_IPS.items():
+        if (urlsplit(url).hostname or "") == ip:
+            p = urlsplit(url)
+            return urlunsplit((p.scheme, f"{host}:{p.port}" if p.port else host, p.path, p.query, p.fragment))
+    return url
 
 
 def crawlable(url: str) -> bool:
@@ -214,7 +268,6 @@ CREATE TABLE IF NOT EXISTS discovery_jobs (
 CREATE INDEX IF NOT EXISTS idx_discovery_jobs_pending ON discovery_jobs(source, status, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_discovered_status_next ON discovered_urls(crawl_status, next_crawl_at);
 CREATE INDEX IF NOT EXISTS idx_discovered_status_depth ON discovered_urls(crawl_status, crawl_depth);
-CREATE INDEX IF NOT EXISTS idx_outgoing_source_domain ON outgoing_links(source_domain);
 CREATE TABLE IF NOT EXISTS crawl_jobs (
     job_id TEXT PRIMARY KEY, target_domain TEXT, status TEXT, config TEXT, error TEXT,
     pages_crawled INTEGER DEFAULT 0, pages_failed INTEGER DEFAULT 0, domains_admitted INTEGER DEFAULT 0,
@@ -251,7 +304,12 @@ class Cursor(psycopg.Cursor):
         return super().executemany(_sql(query, ()), params_seq, **kw)
 
 
-OPEN_CONNS = 0  # connections this process has open right now (there is no pool: every core.connect() is a new connection)
+OPEN_CONNS = 0  # connections this process has open right now
+# Per-process cap on simultaneously open connections (several workers x threads would otherwise exceed PostgreSQL's max_connections).
+# Callers over the cap wait up to DB_POOL_WAIT seconds, then fail loudly instead of hanging or exhausting the server.
+DB_MAX_CONN = int(os.environ.get("DB_MAX_CONNECTIONS", 20))
+DB_POOL_WAIT = float(os.environ.get("DB_POOL_WAIT", 30))
+_SLOTS = threading.BoundedSemaphore(DB_MAX_CONN)
 
 
 class Connection(psycopg.Connection):
@@ -259,6 +317,7 @@ class Connection(psycopg.Connection):
         global OPEN_CONNS
         if not self.closed:
             OPEN_CONNS -= 1
+            _SLOTS.release()  # exactly once per opened connection
         super().close()
 
     def executemany(self, query, params_seq):  # sqlite3 had it on the connection, psycopg only on cursors
@@ -270,8 +329,16 @@ class Connection(psycopg.Connection):
 def connect() -> Connection:
     """New connection (committed and closed by `with`). DB_SCHEMA isolates tests in their own schema."""
     global OPEN_CONNS
-    opts = {"options": f"-c search_path={DB_SCHEMA}"} if DB_SCHEMA else {}
-    conn = Connection.connect(DATABASE_URL, cursor_factory=Cursor, row_factory=_row_factory, application_name="backlink-crawler", **opts)
+    # Server-side limits turn "waits forever" into a loud error: a lock wait, a statement or an abandoned transaction ends after 60s / 5min.
+    options = "-c lock_timeout=60000 -c statement_timeout=300000 -c idle_in_transaction_session_timeout=300000"
+    if not _SLOTS.acquire(timeout=DB_POOL_WAIT):
+        raise TimeoutError(f"database connection limit reached ({DB_MAX_CONN} open, waited {DB_POOL_WAIT}s): leak or overload")
+    try:
+        conn = Connection.connect(DATABASE_URL, cursor_factory=Cursor, row_factory=_row_factory, application_name="backlink-crawler",
+                                  connect_timeout=10, options=options + (f" -c search_path={DB_SCHEMA}" if DB_SCHEMA else ""))
+    except BaseException:
+        _SLOTS.release()
+        raise
     OPEN_CONNS += 1
     return conn
 
@@ -293,10 +360,56 @@ def retry_locked(fn, tries: int = 4):
             time.sleep(0.2 * 2 ** i * random.uniform(0.5, 1.5))
 
 
+# Versioned migrations. Each version runs in its own transaction and is recorded in schema_migrations, so a failure leaves every
+# earlier version applied and the failing one untouched. Append a new version; never edit an applied one. All statements are
+# idempotent (IF NOT EXISTS), so a database created by an older build, or by the SQLite migration script, is upgraded in place.
+_V1_COLUMNS = [
+    ("discovered_urls", "lease_owner TEXT"), ("discovered_urls", "lease_expires TEXT"), ("discovered_urls", "skip_reason TEXT"),
+    ("discovered_urls", "canonical_url TEXT"), ("discovered_urls", "last_successful_crawl TEXT"), ("discovered_urls", "content_hash TEXT"),
+    ("discovered_urls", "title TEXT"), ("discovered_urls", "sitemap_lastmod TEXT"),
+    ("outgoing_links", "img_alt TEXT"), ("outgoing_links", "position TEXT"), ("outgoing_links", "context TEXT"),
+    ("outgoing_links", "source_domain TEXT"), ("outgoing_links", "lost_at TEXT"),
+    ("worker_status", "last_heartbeat_at TEXT"), ("worker_status", "last_success_at TEXT"),
+    ("worker_status", "restart_count INTEGER DEFAULT 0"),
+]
+MIGRATIONS: list[tuple[int, str, list[str]]] = [
+    (1, "baseline schema and columns", [SCHEMA] + [f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {c}" for t, c in _V1_COLUMNS]
+     + ["CREATE INDEX IF NOT EXISTS idx_outgoing_source_domain ON outgoing_links(source_domain)"]),  # after the ALTERs: old tables lack the column
+    (2, "link history, Common Crawl job cursor, API indexes", [
+        "CREATE TABLE IF NOT EXISTS link_history (id BIGSERIAL PRIMARY KEY, source_url TEXT NOT NULL, destination_url TEXT NOT NULL,"
+        " destination_domain TEXT, anchor_text TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, detected_at TEXT DEFAULT " + TS + ")",
+        "CREATE INDEX IF NOT EXISTS idx_link_history_dest ON link_history(destination_domain, detected_at)",
+        "ALTER TABLE discovery_jobs ADD COLUMN IF NOT EXISTS page_cursor INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE discovery_jobs ADD COLUMN IF NOT EXISTS total_pages INTEGER",
+        "ALTER TABLE discovery_jobs ADD COLUMN IF NOT EXISTS index_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_outgoing_dest_active ON outgoing_links(destination_domain, link_type, is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_backlink_history_bl ON backlink_history(backlink_id)",
+        "CREATE INDEX IF NOT EXISTS idx_backlinks_source ON backlinks(source_url)",
+        "CREATE INDEX IF NOT EXISTS idx_discovered_lease ON discovered_urls(lease_owner) WHERE lease_owner IS NOT NULL",
+    ]),
+]
+SCHEMA_VERSION = MIGRATIONS[-1][0]
+
+
 def migrate(conn, recover: bool = True) -> None:
-    """Idempotent: creates the schema, optionally recovers work a dead process left in flight."""
-    conn.execute("SELECT pg_advisory_xact_lock(724001)")  # concurrent CREATE ... IF NOT EXISTS from two processes can collide
-    conn.execute(SCHEMA)
+    """Idempotent: applies pending schema versions, optionally recovers work a dead process left in flight."""
+    conn.execute("SELECT pg_advisory_xact_lock(724001)")  # concurrent migrations from two processes would collide
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT DEFAULT " + TS + ")")
+    conn.commit()
+    for version, name, statements in MIGRATIONS:
+        conn.execute("SELECT pg_advisory_xact_lock(724001)")
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
+            conn.commit()
+            continue
+        try:
+            for stmt in statements:
+                conn.execute(stmt)
+            conn.execute("INSERT INTO schema_migrations (version, name) VALUES (?,?)", (version, name))
+            conn.commit()
+        except BaseException:
+            conn.rollback()  # this version is all-or-nothing; earlier versions stay applied
+            raise
+    conn.execute("SELECT pg_advisory_xact_lock(724001)")
     if recover:  # only the process that runs crawls may do this; the API must not reset a separate worker's in-flight work
         conn.execute("UPDATE discovered_urls SET crawl_status='pending', lease_owner=NULL, lease_expires=NULL WHERE crawl_status='crawling'")
         # interrupted recrawls go back to the schedule, never to 'pending' (they were crawled before) or 'completed' blindly
@@ -307,11 +420,33 @@ def migrate(conn, recover: bool = True) -> None:
     conn.commit()
 
 
+def schema_problems(conn) -> list[str]:
+    """What an up-to-date database must have and this one lacks (empty list = healthy). Used by tests and diagnostics."""
+    have = {r[0] for r in conn.execute("SELECT version FROM schema_migrations")} if conn.execute(
+        "SELECT to_regclass('schema_migrations')").fetchone()[0] else set()
+    out = [f"migration {v} not applied" for v, _, _ in MIGRATIONS if v not in have]
+    cols = {(r[0], r[1]) for r in conn.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema=current_schema()")}
+    for t, c in [(t, c.split()[0]) for t, c in _V1_COLUMNS] + [("discovery_jobs", "page_cursor"), ("discovery_jobs", "index_id")]:
+        if (t, c) not in cols:
+            out.append(f"missing column {t}.{c}")
+    idx = {r[0] for r in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname=current_schema()")}
+    out += [f"missing index {i}" for i in ("idx_outgoing_dest_active", "idx_link_history_dest", "idx_backlink_history_bl") if i not in idx]
+    unique = [r[0] for r in conn.execute("SELECT tablename||' '||indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexdef LIKE 'CREATE UNIQUE%'")]
+    for table, columns in (("backlinks", "(target_domain_id, source_url, destination_url)"), ("outgoing_links", "(source_url, destination_url, anchor_text)"),
+                           ("discovered_urls", "(normalized_url)"), ("discovered_domains", "(domain)"), ("discovery_jobs", "(domain_id, source)")):
+        if not any(u.startswith(table + " ") and columns in u for u in unique):
+            out.append(f"missing unique constraint {table}{columns} (existing duplicates must be removed by hand first)")
+    fks = [r[0] for r in conn.execute("SELECT conrelid::regclass::text FROM pg_constraint WHERE contype='f' AND connamespace=current_schema()::regnamespace")]
+    out += [f"missing foreign key on {t}" for t in ("backlinks", "backlink_history") if t not in fks]
+    return out
+
+
 # ---------- graph writes ----------
 
 def save_url(conn, url: str, from_url: str | None, method: str, depth: int, internal: bool, status: str = "pending",
-             lastmod: str | None = None) -> bool:
-    """Record a discovered URL (never deletes). Returns True if it was new."""
+             lastmod: str | None = None, reason: str | None = None, touch_domain: bool = True) -> bool:
+    """Record a discovered URL (never deletes). Returns True if it was new. process_page passes touch_domain=False and upserts each
+    domain once per page instead (see upsert_domain), which keeps hot domain rows out of the per-link loop."""
     norm = normalize_url(url)
     if norm is None:
         return False
@@ -319,16 +454,25 @@ def save_url(conn, url: str, from_url: str | None, method: str, depth: int, inte
     dom = registrable_domain(host)
     new = conn.execute(
         "INSERT OR IGNORE INTO discovered_urls (url, normalized_url, domain, hostname, discovered_from, discovery_method,"
-        " crawl_depth, is_internal, is_external, crawl_status, sitemap_lastmod) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (url, norm, dom, host, from_url, method, depth, int(internal), int(not internal), status, lastmod),
+        " crawl_depth, is_internal, is_external, crawl_status, sitemap_lastmod, skip_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (url, norm, dom, host, from_url, method, depth, int(internal), int(not internal), status, lastmod, reason if status == "skipped" else None),
     ).rowcount == 1
     if not new:
-        conn.execute("UPDATE discovered_urls SET last_seen=?, crawl_depth=LEAST(crawl_depth, ?),"
-                     " sitemap_lastmod=COALESCE(?, sitemap_lastmod) WHERE normalized_url=?", (now(), depth, lastmod, norm))
-    conn.execute("INSERT OR IGNORE INTO discovered_domains (domain, discovery_source) VALUES (?,?)", (dom, from_url or method))
-    conn.execute("UPDATE discovered_domains SET last_seen=?, pages_discovered=pages_discovered+? WHERE domain=?",
-                 (now(), int(new), dom))
+        # A URL skipped only for max_depth comes back as pending when it is found again within reach. robots / security / not_html skips stay.
+        react = "(crawl_status='skipped' AND skip_reason='max_depth' AND ?::text='pending' AND ?<=crawl_depth)"
+        conn.execute(f"UPDATE discovered_urls SET last_seen=?, crawl_status=CASE WHEN {react} THEN 'pending' ELSE crawl_status END,"
+                     f" skip_reason=CASE WHEN {react} THEN NULL ELSE skip_reason END, crawl_depth=LEAST(crawl_depth, ?),"
+                     " sitemap_lastmod=COALESCE(?, sitemap_lastmod) WHERE normalized_url=?",
+                     (now(), status, depth, status, depth, depth, lastmod, norm))
+    if touch_domain:
+        upsert_domain(conn, dom, from_url or method, int(new))
     return new
+
+
+def upsert_domain(conn, dom: str, source: str, new_pages: int = 0) -> None:
+    conn.execute("INSERT INTO discovered_domains (domain, discovery_source, pages_discovered, last_seen) VALUES (?,?,?,?)"
+                 " ON CONFLICT (domain) DO UPDATE SET last_seen=EXCLUDED.last_seen,"
+                 " pages_discovered=discovered_domains.pages_discovered+EXCLUDED.pages_discovered", (dom, source, new_pages, now()))
 
 
 def active_targets(conn) -> list[tuple[int, str]]:

@@ -32,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     for p in (c, r):
         p.add_argument("--concurrency", type=int, default=5)
         p.add_argument("--playwright", action="store_true")
+    ap.add_argument("--force", action="store_true", help="start even though the autonomous engine looks alive")
     a = ap.parse_args(argv)
 
     h = logging.StreamHandler()
@@ -40,6 +41,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("crawler").setLevel(logging.INFO)
     logging.getLogger("crawler").propagate = False
 
+    with core.connect() as conn:
+        core.migrate(conn, recover=False)
+        live = conn.execute("SELECT name FROM worker_status WHERE last_heartbeat_at>? AND status IN ('running','idle')", (core.later(seconds=-60),)).fetchall()
+    if live and not a.force:  # crash recovery below resets 'crawling' URLs, which would steal the running engine's work
+        print(f"refusing to start: the autonomous engine is running ({[r['name'] for r in live]}). Stop it, or pass --force.")
+        return 3
     with core.connect() as conn:
         core.migrate(conn)  # includes crash recovery; the API process deliberately does not do this
     if a.cmd == "crawl":

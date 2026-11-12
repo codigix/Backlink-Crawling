@@ -5,6 +5,7 @@ Run: .venv/Scripts/python -m pytest tests -q
 
 import asyncio
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -14,6 +15,7 @@ import pytest
 import crawler_core as core
 import crawler_engine as engine
 
+HITS: dict[tuple[str, str], int] = {}  # (host, path) -> requests the test server saw
 SITES: dict[str, dict[str, tuple[int, str, str]]] = {}  # host -> path -> (status, content_type, body)
 
 
@@ -21,6 +23,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         host = (self.headers.get("Host") or "").split(":")[0]
         status, ctype, body = SITES.get(host, {}).get(self.path, (404, "text/plain", "nope"))
+        HITS[(host, self.path)] = HITS.get((host, self.path), 0) + 1
+        if ctype.startswith("sleep:"):  # slow endpoint: "sleep:3" waits 3s, then answers 200 html
+            time.sleep(float(ctype[6:]))
+            ctype = "text/html"
+        if status == 302:  # body is the Location
+            self.send_response(302)
+            self.send_header("Location", body)
+            self.end_headers()
+            return
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.end_headers()
@@ -36,7 +47,7 @@ def page(*links: str) -> tuple[int, str, str]:
 
 @pytest.fixture(scope="module")
 def port():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv = ThreadingHTTPServer(("0.0.0.0", 0), Handler)  # each *.localhost name is reached via its own 127.0.x.y address (see core.test_route)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield srv.server_address[1]
     srv.shutdown()
@@ -51,6 +62,7 @@ def env(port, monkeypatch):
         monkeypatch.setattr(core, "DB_SCHEMA", schema)
         monkeypatch.setattr(core, "ALLOW_PRIVATE", True)
         SITES.clear()
+        HITS.clear()
         with core.connect() as c:
             core.migrate(c)
         yield lambda host, path="/": f"http://{host}.localhost:{port}{path}"
@@ -83,8 +95,9 @@ def test_extraction_stores_everything(env):
     assert len(out) == 5 and {r["link_type"] for r in out} == {"html", "canonical"}
     assert u("c", "/x?id=1#frag") in {r["destination_url"] for r in out}  # query and fragment kept
     assert {"b.localhost", "c.localhost", "example.org"} <= {r["domain"] for r in rows("SELECT domain FROM discovered_domains")}
-    # depth 0: external and internal links are stored but not crawled
-    assert rows("SELECT crawl_status FROM discovered_urls WHERE url=?", u("a", "/about/"))[0]["crawl_status"] == "pending"
+    # depth 0: links are stored but not crawled; the internal one is deeper than max_depth so it is skipped, never left pending
+    assert rows("SELECT crawl_status, skip_reason FROM discovered_urls WHERE url=?", u("a", "/about/"))[0] == {"crawl_status": "skipped", "skip_reason": "max_depth"}
+    assert rows("SELECT crawl_status FROM discovered_urls WHERE url=?", u("b"))[0]["crawl_status"] == "pending"
     assert rows("SELECT COUNT(*) n FROM crawl_history")[0]["n"] == 1
 
 
@@ -206,7 +219,7 @@ def test_recrawl_add_remove(env):
     SITES["a.localhost"]["/blog"] = page(a("https://codigix.co/", "Codigix"))
     asyncio.run(engine.recrawl_due(cfg(), urls=[src]))
     events = [r["event_type"] for r in rows("SELECT event_type FROM backlink_history ORDER BY id")]
-    assert events == ["first_discovered", "verified", "suspected_removed", "confirmed_removed", "reappeared"]
+    assert events == ["first_discovered", "verified", "fetch_failed", "suspected_removed", "confirmed_removed", "reappeared"]
     assert rows("SELECT content_hash, last_successful_crawl FROM discovered_urls WHERE url=?", src)[0]["content_hash"]
     assert rows("SELECT COUNT(*) n FROM crawl_history WHERE source_url=?", src)[0]["n"] == 6
 

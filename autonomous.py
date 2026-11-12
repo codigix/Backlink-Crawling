@@ -39,6 +39,9 @@ class AutoConfig:
     feeds: tuple = DEFAULT_FEEDS
     cc_domains_per_run: int = 3
     cc_urls_per_domain: int = 100
+    cc_pages_per_run: int = 3  # CDX pages fetched per job and run (pagination)
+    cc_max_pages: int = 20  # pages per domain and index; a deliberate ceiling
+    cc_failed_reset: int = 86400  # a failed job is retried from scratch after this long
     max_admitted: int = 500  # total domains allowed to be crawled
     admit_per_cycle: int = 5
     domain_page_budget: int = 200  # pages crawled per domain, ever (breadth over depth)
@@ -104,59 +107,128 @@ def _cc_finish(jid: int, status: str, attempts: int = 0, err: str | None = None,
         c.execute("UPDATE discovery_jobs SET status=?, next_retry_at=?, last_error=?, updated_at=? WHERE id=?", (status, nxt, err, core.now(), jid))
 
 
+def _cc_update(jid: int, **cols) -> None:
+    sets = ", ".join(f"{k}=?" for k in cols)
+    with core.connect() as c:
+        c.execute(f"UPDATE discovery_jobs SET {sets}, updated_at=? WHERE id=?", (*cols.values(), core.now(), jid))
+
+
+async def _cc_get(client, api: str, params: dict, jid: int, att: int, rest: list):
+    """One CDX request. Returns (response | None, abort_run). On any problem the job is already moved to its next state
+    (retry_pending with backoff / failed) and None is returned; 429/503 additionally hand the not-yet-started jobs back."""
+    try:
+        resp = await client.get(api, params=params)
+    except httpx.HTTPError as e:
+        _cc_finish(jid, "retry_pending", att, repr(e)[:300])
+        return None, False
+    code = resp.status_code
+    if code in (200, 404):  # CDX answers 404 "No Captures found" for a domain it has never seen: a finished, empty result
+        return resp, False
+    if code in (429, 503):  # slow down: this job backs off (Retry-After wins if longer), the rest wait for a later run
+        ra = resp.headers.get("Retry-After", "")
+        _cc_finish(jid, "retry_pending", att, f"HTTP {code}", float(ra) if ra.isdigit() else 0)
+        with core.connect() as c:
+            c.executemany("UPDATE discovery_jobs SET status='pending', attempts=attempts-1 WHERE id=?", [(x["id"],) for x in rest])
+        return None, True
+    if code >= 500:
+        _cc_finish(jid, "retry_pending", att, f"HTTP {code}")
+    else:  # other 4xx: our query is wrong; retrying cannot help
+        _cc_finish(jid, "failed", att, f"HTTP {code}: {resp.text[:200]}")
+    return None, False
+
+
 async def src_commoncrawl(client, cfg, cursor):
-    """Historical URLs per admitted domain, driven by the persistent discovery_jobs queue (not a domain-id cursor, which
-    skipped late-admitted lower ids). One request at a time; the CDX index is queried per domain."""
+    """Historical URLs per domain from the Common Crawl CDX index, driven by the persistent discovery_jobs queue.
+
+    - A job exists for every admitted AND retired ('crawled') domain, created at admission (admit_domain) or here as a safety net.
+    - Pagination: showNumPages gives the page count; each run fetches up to cc_pages_per_run pages per job and stores page_cursor,
+      so a job resumes where it stopped (capped at cc_max_pages per domain and index).
+    - The job records index_id. When a newer index appears, completed jobs go back to 'pending' (periodic rediscovery).
+    - Errors keep attempts and last_error; 429/503 honour Retry-After; 'failed' jobs get a fresh start after cc_failed_reset seconds.
+    Results only enter the frontier as discovered URLs; they are never reported as backlinks until our own live fetch sees the link."""
+    idx_err = None
     with core.connect() as c:
         c.execute("UPDATE discovery_jobs SET status='retry_pending' WHERE status='processing' AND updated_at<?",
                   (core.later(seconds=-cfg.lease_seconds),))  # a worker died mid-query
+        c.execute("UPDATE discovery_jobs SET status='retry_pending', attempts=0 WHERE source='commoncrawl' AND status='failed' AND updated_at<?",
+                  (core.later(seconds=-cfg.cc_failed_reset),))  # failed jobs are not dead forever
         c.execute("INSERT OR IGNORE INTO discovery_jobs (domain_id, source) SELECT id, 'commoncrawl' FROM discovered_domains"
-                  " WHERE discovery_status='admitted'")  # every admitted domain gets exactly one job, whatever its id
+                  " WHERE discovery_status IN ('admitted','crawled')")  # one job per domain; retired domains are not excluded
+        has_jobs = c.execute("SELECT 1 FROM discovery_jobs WHERE source='commoncrawl' LIMIT 1").fetchone()
+    if has_jobs and getattr(cfg, "_cc_api", (0, None, None))[0] < time.monotonic():  # at most one collinfo request per hour
+        try:
+            latest = (await client.get("https://index.commoncrawl.org/collinfo.json")).raise_for_status().json()[0]
+            cfg._cc_api = (time.monotonic() + 3600, latest["cdx-api"], latest.get("id") or latest["cdx-api"])  # the index changes monthly
+        except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
+            idx_err = e
+    with core.connect() as c:
+        if not idx_err and has_jobs:  # a newer index exists: finished jobs are due again (their page cursor restarts)
+            c.execute("UPDATE discovery_jobs SET status='pending', page_cursor=0, total_pages=NULL, attempts=0 WHERE source='commoncrawl'"
+                      " AND status='completed' AND index_id IS DISTINCT FROM ?", (cfg._cc_api[2],))
         jobs = c.execute(
             "UPDATE discovery_jobs SET status='processing', attempts=attempts+1, updated_at=? WHERE id IN (SELECT id FROM discovery_jobs"
             " WHERE source='commoncrawl' AND status IN ('pending','retry_pending') AND (next_retry_at IS NULL OR next_retry_at<=?)"
-            " ORDER BY id LIMIT ?) AND status IN ('pending','retry_pending') RETURNING id, attempts,"
+            " ORDER BY id LIMIT ?) AND status IN ('pending','retry_pending') RETURNING id, attempts, page_cursor, total_pages, index_id,"
             " (SELECT domain FROM discovered_domains WHERE id=domain_id) AS domain",
             (core.now(), core.now(), cfg.cc_domains_per_run)).fetchall()
     out = []
     if not jobs:
         return out, cursor
-    try:
-        if getattr(cfg, "_cc_api", (0, None))[0] < time.monotonic():
-            api = (await client.get("https://index.commoncrawl.org/collinfo.json")).raise_for_status().json()[0]["cdx-api"]
-            cfg._cc_api = (time.monotonic() + 3600, api)  # the latest index changes monthly; do not re-ask every minute
-        api = cfg._cc_api[1]
-    except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
+    if idx_err:
         for r in jobs:
-            _cc_finish(r["id"], "retry_pending", r["attempts"], repr(e)[:300])
+            _cc_finish(r["id"], "retry_pending", r["attempts"], repr(idx_err)[:300])
         return out, cursor
+    api, index_id = cfg._cc_api[1], cfg._cc_api[2]
     for n, r in enumerate(jobs):
         jid, att, dom = r["id"], r["attempts"], r["domain"]
-        try:
-            resp = await client.get(api, params={"url": f"{dom}/*", "output": "json", "fl": "url", "limit": cfg.cc_urls_per_domain,
-                                                 "filter": ["=status:200", "=mime:text/html"]})
-        except httpx.HTTPError as e:
-            _cc_finish(jid, "retry_pending", att, repr(e)[:300])
-            continue
-        code = resp.status_code
-        if code in (200, 404):  # CDX answers 404 "No Captures found" for a domain it has never seen: a finished, empty result
+        page, total = (r["page_cursor"], r["total_pages"]) if r["index_id"] == index_id else (0, None)  # a half-done job on an old index restarts
+        base = {"url": f"{dom}/*", "output": "json", "fl": "url", "filter": ["=status:200", "=mime:text/html"]}
+        got, ok = [], True
+        for _ in range(cfg.cc_pages_per_run + 1):  # +1: the page-count probe
+            if total is None:  # first contact: ask how many pages there are
+                resp, abort = await _cc_get(client, api, {**base, "showNumPages": "true"}, jid, att, jobs[n + 1:])
+                if resp is None:
+                    ok = False
+                    if abort:
+                        return out + got, cursor
+                    break
+                lines = [ln for ln in resp.text.splitlines() if ln.startswith("{")] if resp.status_code == 200 else []
+                try:
+                    first = json.loads(lines[0]) if lines else {}
+                    if "pages" in first:
+                        total = min(int(first["pages"]), cfg.cc_max_pages)
+                        _cc_update(jid, total_pages=total, index_id=index_id)
+                        continue
+                    got += [(json.loads(ln)["url"], None, 1) for ln in lines]  # server without paging: everything came in one answer
+                except (ValueError, KeyError, TypeError) as e:
+                    _cc_finish(jid, "retry_pending", att, f"bad response: {e!r}"[:300])
+                    ok = False
+                    break
+                total, page = 1, 1
+                break
+            if page >= total:
+                break
+            resp, abort = await _cc_get(client, api, {**base, "page": page}, jid, att, jobs[n + 1:])
+            if resp is None:
+                ok = False
+                if abort:
+                    return out + got, cursor
+                break
             try:
-                urls = [json.loads(line)["url"] for line in resp.text.splitlines() if line.startswith("{")] if code == 200 else []
+                got += [(json.loads(ln)["url"], None, 1) for ln in resp.text.splitlines() if ln.startswith("{")] if resp.status_code == 200 else []
             except (ValueError, KeyError) as e:
                 _cc_finish(jid, "retry_pending", att, f"bad response: {e!r}"[:300])
-                continue
-            out += [(u, None, 1) for u in urls if core.registrable_domain(core.hostname(u)) == dom]
-            _cc_finish(jid, "completed", att, None if code == 200 else "404 no captures")
-        elif code in (429, 503):  # slow down: this job backs off (Retry-After wins if longer), the rest wait for a later run
-            ra = resp.headers.get("Retry-After", "")
-            _cc_finish(jid, "retry_pending", att, f"HTTP {code}", float(ra) if ra.isdigit() else 0)
-            with core.connect() as c:
-                c.executemany("UPDATE discovery_jobs SET status='pending', attempts=attempts-1 WHERE id=?", [(x["id"],) for x in jobs[n + 1:]])
-            break
-        elif code >= 500:
-            _cc_finish(jid, "retry_pending", att, f"HTTP {code}")
-        else:  # other 4xx: our query is wrong; retrying cannot help
-            _cc_finish(jid, "failed", att, f"HTTP {code}: {resp.text[:200]}")
+                ok = False
+                break
+            page += 1
+            _cc_update(jid, page_cursor=page, index_id=index_id)
+            await asyncio.sleep(cfg.cc_delay)
+        out += [(u, None, 1) for u, _, _ in got if core.registrable_domain(core.hostname(u)) == dom]
+        if ok:
+            if total is not None and page >= total:
+                _cc_update(jid, status="completed", index_id=index_id, page_cursor=page, total_pages=total, last_error=None, next_retry_at=None)
+            else:  # more pages remain: back in the queue for the next run (not a failure, attempts reset)
+                _cc_update(jid, status="pending", attempts=0, last_error=None, next_retry_at=None)
         await asyncio.sleep(cfg.cc_delay)
     return out, cursor
 
@@ -210,6 +282,7 @@ def claim_urls(owner: str, cfg: AutoConfig) -> list[tuple[str, int]]:
     with core.connect() as c:
         rows = c.execute(
             "UPDATE discovered_urls SET crawl_status='crawling', lease_owner=?, lease_expires=? WHERE id IN ("
+            " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND id IN ("  # SKIP LOCKED: concurrent claimers never wait on, or share, a row
             " SELECT id FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY priority=0 ORDER BY rn, id) sr FROM ("
             " SELECT u.id, d.priority, COALESCE(k.n, 0) used,"
             "  ROW_NUMBER() OVER (PARTITION BY u.domain ORDER BY u.crawl_depth, u.id) rn"
@@ -219,7 +292,7 @@ def claim_urls(owner: str, cfg: AutoConfig) -> list[tuple[str, int]]:
             "  WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?))"
             "   AND d.discovery_status='admitted' AND u.crawl_depth<=?) t1"
             "  WHERE rn<=? AND rn+used<=?) t2"  # seeded domains (priority 0) first, at most seed_batch URLs; the rest round-robin
-            " ORDER BY CASE WHEN priority=0 AND sr<=? THEN 0 ELSE 1 END, rn, priority, id LIMIT ?)"
+            " ORDER BY CASE WHEN priority=0 AND sr<=? THEN 0 ELSE 1 END, rn, priority, id LIMIT ?) FOR UPDATE SKIP LOCKED)"
             " AND crawl_status IN ('pending','retry_pending') RETURNING url, crawl_depth,"
             " (SELECT priority FROM discovered_domains d WHERE d.domain=discovered_urls.domain) AS prio",
             (owner, core.later(seconds=cfg.lease_seconds), core.now(), cfg.crawl.max_depth, cfg.per_batch, cfg.domain_page_budget,
@@ -241,6 +314,28 @@ def release(owner: str | None = None) -> int:
         c.execute("UPDATE discovered_urls SET lease_owner=NULL, lease_expires=NULL, crawl_status=CASE WHEN last_successful_crawl IS NOT NULL"
                   " THEN 'completed' ELSE 'pending' END WHERE crawl_status='recrawling' AND " + who, arg)
         return n
+
+
+def renew(owner: str, seconds: int) -> int:
+    with core.connect() as c:
+        return c.execute("UPDATE discovered_urls SET lease_expires=? WHERE lease_owner=? AND crawl_status IN ('crawling','recrawling')",
+                         (core.later(seconds=seconds), owner)).rowcount
+
+
+async def with_lease(owner: str, cfg: AutoConfig, work):
+    """Await `work` while a side task keeps extending this owner's leases, so a slow round is never released as 'dead'."""
+    async def keep():
+        while True:
+            await asyncio.sleep(cfg.lease_seconds / 3)
+            try:
+                await asyncio.to_thread(renew, owner, cfg.lease_seconds)
+            except Exception:  # noqa: BLE001 - a missed renewal only matters if it repeats for a whole lease
+                log.warning("lease renewal failed for %s", owner, exc_info=True)
+    t = asyncio.create_task(keep())
+    try:
+        return await work
+    finally:
+        t.cancel()
 
 
 async def admit_batch(cfg: AutoConfig) -> int:
@@ -280,14 +375,33 @@ def retire_unreachable() -> int:
 
 def retire_exhausted(cfg: AutoConfig) -> int:
     """Rolling admission: free the slot of an admitted domain whose forward work is done or page budget spent. The row stays
-    (status 'crawled', so it is never re-admitted). Never while a URL is leased or still pending/retrying within max_depth."""
+    (status 'crawled', so it is never re-admitted). Never while a URL is leased or still pending/retrying within max_depth.
+    Pending URLs that can never be crawled are marked skipped with a reason instead of staying pending forever."""
     with core.connect() as c:
+        c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='max_depth', lease_owner=NULL, lease_expires=NULL"
+                  " WHERE crawl_status IN ('pending','retry_pending') AND crawl_depth>?", (cfg.crawl.max_depth,))
+        c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='domain_page_budget_exhausted' WHERE crawl_status IN"
+                  " ('pending','retry_pending') AND domain IN (SELECT domain FROM discovered_domains WHERE discovery_status IN ('admitted','crawled'))"
+                  " AND (SELECT COUNT(*) FROM discovered_urls k WHERE k.domain=discovered_urls.domain AND k.crawl_status='completed')>=?",
+                  (cfg.domain_page_budget,))
         return c.execute(
             "UPDATE discovered_domains SET discovery_status='crawled' WHERE discovery_status='admitted'"
             " AND NOT EXISTS (SELECT 1 FROM discovered_urls u WHERE u.domain=discovered_domains.domain AND u.crawl_status='crawling')"
             " AND ((SELECT COUNT(*) FROM discovered_urls u WHERE u.domain=discovered_domains.domain AND u.crawl_status='completed')>=?"
             "  OR NOT EXISTS (SELECT 1 FROM discovered_urls u WHERE u.domain=discovered_domains.domain AND u.crawl_depth<=?"
             "   AND u.crawl_status IN ('pending','retry_pending')))", (cfg.domain_page_budget, cfg.crawl.max_depth)).rowcount
+
+
+def reactivate_domains(cfg: AutoConfig) -> int:
+    """A finished domain that has crawlable pending URLs again (found later, e.g. linked from another site) goes back to
+    'discovered' so admit_batch re-admits it. Blocked/skipped/unreachable domains and spent page budgets stay as they are."""
+    with core.connect() as c:
+        return c.execute(
+            "UPDATE discovered_domains SET discovery_status='discovered' WHERE discovery_status='crawled'"
+            " AND EXISTS (SELECT 1 FROM discovered_urls u WHERE u.domain=discovered_domains.domain AND u.crawl_depth<=?"
+            "  AND u.crawl_status IN ('pending','retry_pending'))"
+            " AND (SELECT COUNT(*) FROM discovered_urls u WHERE u.domain=discovered_domains.domain AND u.crawl_status='completed')<?",
+            (cfg.crawl.max_depth, cfg.domain_page_budget)).rowcount
 
 
 # ---------- optional targeted seeding (python autonomous.py seed ...) ----------
@@ -347,7 +461,8 @@ def worker_health(row: dict, max_age: int = 60) -> bool:
 class Engine:
     def __init__(self, cfg: AutoConfig | None = None):
         self.cfg = cfg or AutoConfig()
-        self.owner = uuid.uuid4().hex
+        self.forward_owner = uuid.uuid4().hex  # separate owners: release() of one must never reset the other's leases
+        self.verify_owner = uuid.uuid4().hex
         self.stop = asyncio.Event()
         self.forward_lock = asyncio.Lock()  # forward crawling and recrawling are independent: neither waits for the other's round
         self.recrawl_lock = asyncio.Lock()
@@ -431,6 +546,9 @@ class Engine:
         while not self.stop.is_set():
             try:
                 snap = await asyncio.wait_for(asyncio.wrap_future(pool.submit(engine_stats.diagnostics, engine.HTTP)), 8)
+                if os.environ.get("USE_CELERY") == "1":
+                    import tasks
+                    snap["celery"] = await asyncio.wait_for(asyncio.wrap_future(pool.submit(tasks.celery_stats)), 5)
                 snap["workers"] = {n: ("done" if t.done() else "alive") for n, t in self.tasks.items()}
                 snap["active_workers"] = sum(not t.done() for t in self.tasks.values())
                 snap["asyncio_tasks"] = len(asyncio.all_tasks())
@@ -456,21 +574,26 @@ class Engine:
             await seed([k.removeprefix("seed:") for k in keys], self.cfg)
             with core.connect() as c:
                 c.executemany("DELETE FROM engine_state WHERE key=?", [(k,) for k in keys])
-        await asyncio.to_thread(lambda: (release(), retire_unreachable(), retire_exhausted(self.cfg)))
+        await asyncio.to_thread(lambda: (release(), retire_unreachable(), retire_exhausted(self.cfg), reactivate_domains(self.cfg)))
         return bool(await admit_batch(self.cfg))
 
     async def crawler(self) -> bool:
         if self.stop.is_set():
             return False
-        work = await asyncio.to_thread(claim_urls, self.owner, self.cfg)
+        if os.environ.get("USE_CELERY") == "1":  # Celery workers crawl; this loop keeps their queue fed and recovers dead leases
+            import tasks
+            await asyncio.to_thread(tasks.recover)
+            return bool(await asyncio.to_thread(tasks.dispatch))
+        work = await asyncio.to_thread(claim_urls, self.forward_owner, self.cfg)
         if not work:
             return False
         try:
             async with self.forward_lock:
                 # follow=False: new internal URLs stay in the frontier and are claimed fairly next cycle
-                await engine.crawl_round(self.cfg.crawl, None, work, engine._approved(), False, len(work))
+                await with_lease(self.forward_owner, self.cfg,
+                                 engine.crawl_round(self.cfg.crawl, None, work, engine._approved(), False, len(work)))
         finally:
-            release(self.owner)
+            release(self.forward_owner)
         return True
 
     async def indexer(self) -> bool:
@@ -483,7 +606,8 @@ class Engine:
         if self.stop.is_set():
             return False
         async with self.recrawl_lock:  # never shared with the forward crawl, and only a small slice per round
-            return bool(await engine.recrawl_due(self.cfg.crawl, limit=self.cfg.recrawl_batch, owner=self.owner))
+            return bool(await with_lease(self.verify_owner, self.cfg, engine.recrawl_due(
+                self.cfg.crawl, limit=self.cfg.recrawl_batch, owner=self.verify_owner, lease_seconds=self.cfg.lease_seconds)))
 
     async def run(self) -> None:
         with core.connect() as c:
@@ -509,7 +633,8 @@ class Engine:
             for t in pending:
                 t.cancel()
             await asyncio.gather(*side, *self.tasks.values(), return_exceptions=True)
-            release(self.owner)
+            release(self.forward_owner)
+            release(self.verify_owner)
 
 
 if __name__ == "__main__":

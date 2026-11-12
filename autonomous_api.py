@@ -11,6 +11,7 @@ import engine_stats
 router = APIRouter()
 
 
+
 @router.post("/discovery/bootstrap", status_code=202)
 def discovery_bootstrap() -> dict:
     """Ask the standalone engine to run every enabled source now (within ~30s). The API itself never fetches anything."""

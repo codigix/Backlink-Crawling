@@ -72,8 +72,12 @@ def test_lost_backlink_shows_in_history(env, monkeypatch):
     cycle(autonomous.Engine(cfg), 1)
     SITES["a.localhost"] = {"/": page()}
     asyncio.run(engine.recrawl_due(cfg.crawl, None, [u("a")]))
+    first = bl("codigix.co")  # one miss = suspected, still listed, not yet a lost event
+    assert first["total_backlinks"] == 1 and first["backlinks"][0]["link_status"] == "suspected_removed"
+    assert {e["event"] for e in crawler_api.backlink_history("codigix.co", limit=200)["events"]} == {"new", "suspected_removed"}
+    asyncio.run(engine.recrawl_due(cfg.crawl, None, [u("a")]))  # second successful miss confirms
     h = crawler_api.backlink_history("codigix.co", limit=200)["events"]
-    assert {e["event"] for e in h} == {"new", "lost"}
+    assert {e["event"] for e in h} == {"new", "suspected_removed", "lost"}
     assert bl("codigix.co")["status"] == "not_found_in_current_index"
     assert bl("codigix.co", include_removed=True)["total_backlinks"] == 1
 

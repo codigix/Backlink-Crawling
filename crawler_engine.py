@@ -7,6 +7,7 @@ crawled, when to recrawl) lives in PostgreSQL via crawler_core, so a restart los
 import asyncio
 import hashlib
 import logging
+import re
 import warnings
 import time
 import uuid
@@ -21,11 +22,14 @@ from crawlee.crawlers import (
     BeautifulSoupCrawler, BeautifulSoupCrawlingContext, PlaywrightCrawler, PlaywrightCrawlingContext,
 )
 from crawlee._utils.robots import RobotsTxtFile
+from crawlee.errors import PersistentRateLimitError, RequestThrottledError
+from crawlee.request_loaders import ThrottlingRequestManager
 from crawlee.http_clients import ImpitHttpClient
 from crawlee.storage_clients import MemoryStorageClient
 from crawlee.storages import RequestQueue
 
 import crawler_core as core
+import egress_proxy
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)  # XML pages are skipped by content type anyway
 
@@ -57,6 +61,10 @@ class Config:
     recrawl_days: int = 7
     max_response_bytes: int = 2_000_000
     max_redirects: int = 5
+    js_fallback: bool = True  # re-fetch JavaScript-looking pages in a browser (never every page)
+    rate_limit_base: float = 2.0  # first backoff after an HTTP 429, doubling up to 60s
+    rate_limit_stall: float = 300.0  # a host rate limited this long ends the round
+    max_js_pages: int = 20  # per round: browsers are expensive
 
 
 HTTP = {"started": 0, "done": 0, "total": 0.0, "retries": 0}  # fetch counters for the diagnostics log (single event loop, no lock needed)
@@ -69,6 +77,20 @@ def _http_done(url: str, failed: bool = False) -> None:
         HTTP["done"] += 1
         HTTP["total"] += time.monotonic() - t
         HTTP["retries"] += failed
+
+
+_PL: dict = {}
+PERSIST_QUEUE_SECONDS = 300  # extra handler time for waiting in line behind pages of the same domain
+
+
+def _persist_lock(domain: str) -> asyncio.Lock:
+    """In-process queue per source domain (the cross-process guard is the advisory lock inside process_page). Waiting here holds
+    no thread and no database connection. Different domains never wait for each other."""
+    loop = asyncio.get_running_loop()
+    if _PL.get("loop") is not loop:
+        _PL.clear()
+        _PL.update(loop=loop, locks={})
+    return _PL["locks"].setdefault(domain, asyncio.Lock())
 
 
 def _job_add(job_id: str | None, col: str, n: int = 1) -> None:
@@ -103,34 +125,57 @@ def extract_links(soup, base: str) -> list[tuple[str, str, str | None, str, dict
     return out
 
 
+def link_event(conn, source: str, dest: str, ddom: str, anchor: str, kind: str) -> None:
+    """Append-only record of a link changing state (suspected_removed / lost / reappeared). Never updated or deleted, so repeated
+    removal and reappearance all stay visible; outgoing_links only holds the current state."""
+    conn.execute("INSERT INTO link_history (source_url, destination_url, destination_domain, anchor_text, event_type) VALUES (?,?,?,?,?)",
+                 (source, dest, ddom, anchor, kind))
+
+
 def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: int | None, ctype: str | None,
                  cfg: Config, approved: set[str], follow: bool, started: str) -> list[tuple[str, int]]:
-    """Persist one successfully fetched page. Returns internal (url, depth) pairs to crawl next."""
-    conn.execute("SELECT pg_advisory_xact_lock(724002)")  # one page's graph writes at a time: concurrent pages touching the same domain rows would deadlock
+    """Persist one successfully fetched page in ONE transaction (all of it or none of it). Returns internal (url, depth) to crawl next.
+
+    Concurrency: pages of the same source domain are serialized by a per-domain advisory lock (they share hot rows: the domain row,
+    sibling URLs). Pages of different domains run in parallel; their writes are made in one global order (links sorted by registrable
+    domain, then URL; one upsert per domain, also sorted), which is what prevents lock cycles. A rare remaining deadlock is detected by
+    PostgreSQL and the whole transaction is retried by the caller (core.retry_locked), so nothing is half-written."""
     src_dom = core.registrable_domain(core.hostname(key_url))
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", ("page:" + src_dom,))
     links = extract_links(soup, base_url)
     if base_url != key_url:  # redirect
         links.append((base_url, "", None, "redirect", {}))
+    prepared = {}
+    for dest, anchor, rel, ltype, ex in links:  # one row per (destination, anchor); the order below is the global lock order
+        prepared.setdefault((dest, anchor), (core.registrable_domain(core.hostname(dest)), core.normalize_url(dest) or dest, rel, ltype, ex))
+    ordered = sorted(prepared.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0][1]))
     targets = core.active_targets(conn)
     seen_out: set[tuple[str, str]] = set()
     found_backlinks: set[tuple[int, str]] = set()
+    domains: dict[str, int] = {src_dom: 0}
     to_queue, new_links, canonical = [], 0, None
-    for dest, anchor, rel, ltype, ex in links:
-        ddom = core.registrable_domain(core.hostname(dest))
+    for (dest, anchor), (ddom, ndest, rel, ltype, ex) in ordered:
         internal = ddom == src_dom
         ok = core.crawlable(dest) and ddom not in NO_CRAWL_DOMAINS
-        core.save_url(conn, dest, key_url, "forward_crawl", depth + 1 if internal else 0, internal,
-                      "pending" if ok else "skipped")
-        new_links += conn.execute(
+        too_deep = internal and depth + 1 > cfg.max_depth  # claim_urls never leases these, so "pending" would be forever
+        is_new = core.save_url(conn, dest, key_url, "forward_crawl", depth + 1 if internal else 0, internal,
+                               "pending" if ok and not too_deep else "skipped", reason="max_depth" if ok and too_deep else None,
+                               touch_domain=False)
+        domains[ddom] = domains.get(ddom, 0) + int(is_new)
+        flags = (int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)), ex.get("img_alt"), ex.get("position"), ex.get("context"))
+        fresh = conn.execute(
             "INSERT OR IGNORE INTO outgoing_links (source_url, destination_url, destination_domain, anchor_text,"
             " rel_attributes, link_type, is_nofollow, is_sponsored, is_ugc, img_alt, position, context, source_domain)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (key_url, dest, ddom, anchor, rel, ltype, int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)),
-             ex.get("img_alt"), ex.get("position"), ex.get("context"), src_dom)).rowcount
-        conn.execute("UPDATE outgoing_links SET last_seen=?, is_active=1, lost_at=NULL, rel_attributes=?, is_nofollow=?, is_sponsored=?,"
-                     " is_ugc=?, img_alt=?, position=?, context=? WHERE source_url=? AND destination_url=? AND anchor_text=?",
-                     (core.now(), rel, int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)), ex.get("img_alt"),
-                      ex.get("position"), ex.get("context"), key_url, dest, anchor))
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (key_url, dest, ddom, anchor, rel, ltype, *flags, src_dom)).rowcount
+        new_links += fresh
+        if not fresh:  # existing row: refresh it and learn whether it was suspected/removed (one statement, row locked)
+            was = conn.execute(
+                "WITH o AS (SELECT id, is_active, lost_at FROM outgoing_links WHERE source_url=? AND destination_url=? AND anchor_text=? FOR UPDATE)"
+                " UPDATE outgoing_links l SET last_seen=?, is_active=1, lost_at=NULL, rel_attributes=?, is_nofollow=?, is_sponsored=?, is_ugc=?,"
+                " img_alt=?, position=?, context=? FROM o WHERE l.id=o.id RETURNING o.is_active AS was_active, o.lost_at AS was_lost",
+                (key_url, dest, anchor, core.now(), rel, *flags)).fetchone()
+            if was and ltype == "html" and (not was["was_active"] or was["was_lost"]):
+                link_event(conn, key_url, dest, ddom, anchor, "reappeared")
         seen_out.add((dest, anchor))
         if ltype == "canonical":
             canonical = dest
@@ -143,20 +188,23 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
                     found_backlinks.add((tid, dest))
                     vlog.info("backlink verified %s -> %s", key_url, dest)
         if follow and internal and ok and ltype != "redirect" and depth + 1 <= cfg.max_depth and ddom in approved:
-            row = conn.execute("SELECT url, crawl_status, crawl_depth FROM discovered_urls WHERE normalized_url=?",
-                               (core.normalize_url(dest),)).fetchone()
+            row = conn.execute("SELECT url, crawl_status, crawl_depth FROM discovered_urls WHERE normalized_url=?", (ndest,)).fetchone()
             if row["crawl_status"] == "pending":
-                conn.execute("UPDATE discovered_urls SET crawl_status='crawling' WHERE normalized_url=?",
-                             (core.normalize_url(dest),))
+                conn.execute("UPDATE discovered_urls SET crawl_status='crawling' WHERE normalized_url=?", (ndest,))
                 to_queue.append((row["url"], row["crawl_depth"]))
-    # Fetch succeeded, so absence is now real: deactivate links that vanished (history is kept, rows are not deleted).
-    for r in conn.execute("SELECT id, destination_url, anchor_text FROM outgoing_links WHERE source_url=? AND is_active=1",
-                          (key_url,)).fetchall():
+    for dom in sorted(domains):  # one upsert per domain, in sorted order
+        core.upsert_domain(conn, dom, key_url, domains[dom])
+    # Same two-miss rule as backlinks, so the graph and the backlinks table never disagree: first successful miss sets lost_at
+    # (suspected, still active); a second one deactivates. Seeing the link again clears lost_at (above). Rows are never deleted.
+    for r in conn.execute("SELECT id, destination_url, destination_domain, anchor_text, link_type, lost_at FROM outgoing_links"
+                          " WHERE source_url=? AND is_active=1 ORDER BY id FOR UPDATE", (key_url,)).fetchall():
         if (r["destination_url"], r["anchor_text"]) not in seen_out:
-            conn.execute("UPDATE outgoing_links SET is_active=0, lost_at=? WHERE id=?", (core.now(), r["id"]))
+            conn.execute("UPDATE outgoing_links SET is_active=?, lost_at=? WHERE id=?", (int(not r["lost_at"]), core.now(), r["id"]))
+            if r["link_type"] == "html":
+                link_event(conn, key_url, r["destination_url"], r["destination_domain"], r["anchor_text"], "lost" if r["lost_at"] else "suspected_removed")
     suspected = False  # one miss is only a suspicion (soft blocks, layout changes); a second consecutive miss confirms
     for b in conn.execute("SELECT id, target_domain_id, destination_url, link_status FROM backlinks WHERE source_url=? AND"
-                          " is_active=1 AND link_status IN ('verified','fetch_failed','suspected_removed')", (key_url,)).fetchall():
+                          " is_active=1 AND link_status IN ('verified','fetch_failed','suspected_removed') ORDER BY id FOR UPDATE", (key_url,)).fetchall():
         if (b["target_domain_id"], b["destination_url"]) in found_backlinks:
             continue
         if b["link_status"] == "suspected_removed":
@@ -194,7 +242,8 @@ def mark_failed(conn, url: str, error: str, status: int | None, cfg: Config, sta
         state, nxt = "retry_pending", core.later(minutes=5 * 2 ** tries)
     conn.execute("UPDATE discovered_urls SET crawl_status=?, retry_count=?, next_crawl_at=?, crawl_error=?, http_status=?,"
                  " lease_owner=NULL, lease_expires=NULL WHERE normalized_url=?", (state, tries, nxt, error[:500], status, norm))
-    conn.execute("UPDATE backlinks SET link_status='fetch_failed' WHERE source_url=? AND link_status='verified'", (url,))
+    for b in conn.execute("UPDATE backlinks SET link_status='fetch_failed' WHERE source_url=? AND link_status='verified' RETURNING id", (url,)).fetchall():
+        core.event(conn, b["id"], "fetch_failed", error[:200])  # not removed: one failed fetch proves nothing about the link
     conn.execute("INSERT INTO crawl_history (source_url, crawl_started, crawl_completed, http_status, error_message)"
                  " VALUES (?,?,?,?,?)", (url, started, core.now(), status, error[:500]))
 
@@ -219,75 +268,249 @@ def concurrent_robots(crawler, timeout: float = 10) -> None:
     crawler._get_robots_txt_file_for_url = get
 
 
+class ResponseTooLarge(ValueError):
+    """The body exceeded Config.max_response_bytes while it was being downloaded (the download is cut off, not just flagged)."""
+
+
+class _Buffered:
+    """A fully read, size-checked response with the surface that Crawlee's redirect loop and adapter use."""
+
+    def __init__(self, response, body: bytes) -> None:
+        self._r, self.content, self.is_closed, self.is_stream_consumed = response, body, True, True
+
+    @property
+    def url(self) -> str:
+        return core.test_unroute(str(self._r.url))
+
+    def __getattr__(self, name):
+        return getattr(self._r, name)
+
+
+class _Guarded:
+    """Wraps impit's AsyncClient. Crawlee follows redirects hop by hop, calling this for the first request AND for every hop, so
+    each destination is validated right before it is sent. Bodies are streamed with a hard byte cap."""
+
+    def __init__(self, inner, max_bytes: int) -> None:
+        self._inner, self._max = inner, max_bytes
+
+    async def request(self, *, url: str, headers=None, stream: bool = False, **kw):
+        why = await asyncio.to_thread(core.blocked_reason, url)
+        if why:
+            log.warning("BLOCKED %s | %s", url, why)
+            raise core.UnsafeURL(f"blocked before fetch ({why}): {url}")
+        real, extra = core.test_route(url)
+        resp = await self._inner.request(url=real, headers={**(headers or {}), **extra} or None, stream=True, **kw)
+        if stream:
+            return resp
+        try:
+            if int(resp.headers.get("content-length") or 0) > self._max:
+                raise ResponseTooLarge(f"Content-Length over {self._max} bytes")
+            chunks, n = [], 0
+            async for chunk in resp.aiter_bytes():
+                n += len(chunk)
+                if n > self._max:
+                    raise ResponseTooLarge(f"body over {self._max} bytes")
+                chunks.append(chunk)
+        finally:
+            resp.close()
+        return _Buffered(resp, b"".join(chunks))
+
+
+class SafeImpitClient(ImpitHttpClient):
+    """ImpitHttpClient whose every outgoing request (pages, redirect hops, robots.txt) goes through _Guarded.
+    shortcut: overrides the private _get_client / relies on Crawlee's hop-by-hop redirect loop (crawlee is pinned in requirements.txt); re-check on upgrade."""
+
+    def __init__(self, *, max_response_bytes: int, **kw) -> None:
+        super().__init__(**kw)
+        self._max_bytes, self._guards = max_response_bytes, {}
+
+    def _get_client(self, proxy_url):
+        inner = super()._get_client(egress_proxy.ensure())  # every connection is re-validated and pinned by the egress proxy
+        return self._guards.setdefault(id(inner), _Guarded(inner, self._max_bytes))
+
+    async def crawl(self, request, **kw):
+        try:
+            return await super().crawl(request, **kw)
+        except (core.UnsafeURL, ResponseTooLarge):
+            request.no_retry = True  # the same URL will be refused / too large again
+            raise
+
+
+def needs_js(soup) -> bool:
+    """Cheap static heuristic: a near-empty page shell (few links, JS app root / noscript notice / script-heavy with little text)."""
+    if soup.body is None or len(soup.find_all("a", href=True)) >= 3:
+        return False
+    text = len(soup.body.get_text(" ", strip=True))
+    shell = soup.find(id=re.compile(r"^(root|app|__next|__nuxt|svelte)$")) is not None
+    noscript = any("javascript" in n.get_text().lower() for n in soup.find_all("noscript"))
+    return noscript or (shell and text < 300) or (len(soup.find_all("script")) >= 3 and text < 200)
+
+
 async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int]], approved: set[str], follow: bool,
                       limit: int) -> None:
-    """Run one Crawlee crawl over `work` [(url, depth)]; internal links found are queued dynamically if `follow`."""
+    """Run one Crawlee crawl over `work` [(url, depth)]; internal links found are queued dynamically if `follow`.
+    Static HTML first; pages that look JavaScript-rendered are re-fetched in a browser (Playwright) in a second pass of the
+    same round and persisted through the same process_page."""
     if not work or limit <= 0:
         return
-    queue = await RequestQueue.open(alias=uuid.uuid4().hex, storage_client=MemoryStorageClient())
     slots: dict[str, float] = {}
     slot_lock = asyncio.Lock()
     started: dict[str, str] = {}
+    deferred: dict[str, tuple] = {}  # url -> (soup, base, status, ctype, depth, t0): static fetch awaiting its rendered version
+    done_render: set[str] = set()
+    finished: set[str] = set()  # URLs whose outcome is recorded (persisted, failed or skipped)
 
     def req(url: str, depth: int) -> Request:
         return Request.from_url(url, unique_key=core.normalize_url(url) or url, user_data={"depth": depth})
 
-    async def polite(context) -> None:  # per-domain rate limit
-        dom = core.registrable_domain(core.hostname(context.request.url))
+    async def slot_wait(url: str) -> None:  # one shared per-domain schedule for static fetches, browser navigations and redirect hops
+        dom = core.registrable_domain(core.hostname(url))
         async with slot_lock:
             wait = slots.get(dom, 0) - time.monotonic()
             slots[dom] = max(time.monotonic(), slots.get(dom, 0)) + cfg.domain_delay
         if wait > 0:
             await asyncio.sleep(wait)
+
+    async def polite(context) -> None:  # SSRF check before the request, then per-domain rate limit
+        why = await asyncio.to_thread(core.blocked_reason, context.request.url)
+        if why:
+            context.request.no_retry = True
+            raise core.UnsafeURL(f"blocked before fetch ({why}): {context.request.url}")
+        await slot_wait(context.request.url)
         started[context.request.url] = core.now()
         if context.request.url not in _T0:
             HTTP["started"] += 1
         _T0[context.request.url] = time.monotonic()
 
-    async def handle(context, soup, status, ctype) -> None:
+    async def persist_page(url, base, depth, soup, status, ctype, t0):
+        def persist():
+            def once():
+                with core.connect() as c:  # one transaction per page; a deadlock victim is rolled back whole and retried
+                    return process_page(c, url, base, depth, soup, status, ctype, cfg, approved, follow, t0)
+            return core.retry_locked(once)
+        async with _persist_lock(core.registrable_domain(core.hostname(url))):  # waiting here holds no thread or connection
+            nxt = await asyncio.to_thread(persist)
+        finished.add(url)
+        _job_add(job_id, "pages_crawled")
+        def last():
+            with core.connect() as c:
+                return c.execute("SELECT links_found, new_links_found FROM crawl_history WHERE source_url=? ORDER BY id DESC LIMIT 1", (url,)).fetchone()
+        n = await asyncio.to_thread(last)
+        xlog.info("crawled %s | status %s | links %s (new %s) | queued %d", url, status, n["links_found"], n["new_links_found"], len(nxt))
+        return nxt
+
+    async def handle(context, soup, status, ctype, defer: bool = False) -> None:
         url, base = context.request.url, context.request.loaded_url or context.request.url
         _http_done(url)  # response received (body parsing and database work after this are not HTTP time)
         t0 = started.get(url, core.now())
         if status is not None and status >= 400:  # ignored by Crawlee so it does not retry; recorded as a permanent failure
-            with core.connect() as c:
-                mark_failed(c, url, f"HTTP {status}", status, cfg, t0, permanent=True)
+            def fail():
+                with core.connect() as c:
+                    mark_failed(c, url, f"HTTP {status}", status, cfg, t0, permanent=True)
+            await asyncio.to_thread(fail)
+            finished.add(url)
             _job_add(job_id, "pages_failed")
             log.info("skipped %s | HTTP %s", url, status)
             return
         if base != url and not await asyncio.to_thread(core.is_safe_url, base):
-            raise ValueError(f"redirect to unsafe URL blocked: {base}")
+            raise core.UnsafeURL(f"redirect to unsafe URL blocked: {base}")
         if ctype and "html" not in ctype.lower():
             with core.connect() as c:
-                c.execute("UPDATE discovered_urls SET crawl_status='skipped', content_type=?, http_status=? WHERE normalized_url=?",
-                          (ctype, status, core.normalize_url(url)))
+                c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='not_html', content_type=?, http_status=?,"
+                          " lease_owner=NULL, lease_expires=NULL WHERE normalized_url=?", (ctype, status, core.normalize_url(url)))
+            finished.add(url)
             return
-        def persist():
-            with core.connect() as c:  # one transaction per page
-                return process_page(c, url, base, context.request.user_data["depth"], soup, status, ctype, cfg, approved, follow, t0)
-        nxt = await asyncio.to_thread(persist)  # hundreds of statements per page: must not freeze the event loop (and every other fetch)
-        _job_add(job_id, "pages_crawled")
-        with core.connect() as c:
-            n = c.execute("SELECT links_found, new_links_found FROM crawl_history WHERE source_url=? ORDER BY id DESC LIMIT 1", (url,)).fetchone()
-        xlog.info("crawled %s | status %s | links %s (new %s) | queued %d", url, status, n["links_found"], n["new_links_found"], len(nxt))
+        depth = context.request.user_data["depth"]
+        if defer and cfg.js_fallback and len(deferred) < cfg.max_js_pages and needs_js(soup):
+            deferred[url] = (soup, base, status, ctype, depth, t0)  # persisted after the rendered pass (or, if that fails, as fetched)
+            return
+        nxt = await persist_page(url, base, depth, soup, status, ctype, t0)
         if nxt:
             await context.add_requests([req(u, d) for u, d in nxt])
 
     async def failed(context, error: Exception) -> None:
         log.warning("FAILED %s | %s", context.request.url, error)
         _http_done(context.request.url, failed=True)
-        with core.connect() as c:
-            mark_failed(c, context.request.url, repr(error), getattr(error, "status_code", None), cfg,
-                        started.get(context.request.url, core.now()))
+        permanent = isinstance(error, (core.UnsafeURL, ResponseTooLarge))  # blocked / oversized: retrying cannot help
+        def fail():
+            with core.connect() as c:
+                mark_failed(c, context.request.url, f"{type(error).__name__}: {error}" if permanent else repr(error),
+                            getattr(error, "status_code", None) or (429 if isinstance(error, RequestThrottledError) else None), cfg, started.get(context.request.url, core.now()), permanent=permanent)
+        await asyncio.to_thread(fail)
+        finished.add(context.request.url)
         _job_add(job_id, "pages_failed")
 
-    common = dict(
-        request_manager=queue, max_requests_per_crawl=limit, max_request_retries=cfg.max_retries,
-        concurrency_settings=ConcurrencySettings(desired_concurrency=cfg.concurrency, max_concurrency=cfg.concurrency),
-        request_handler_timeout=timedelta(seconds=cfg.timeout * 2), respect_robots_txt_file=True,
-        ignore_http_error_status_codes=PERMANENT_HTTP,
-    )
-    if cfg.use_playwright:
-        crawler = PlaywrightCrawler(browser_new_context_options={"user_agent": core.USER_AGENT}, **common)
+    def common(**extra) -> dict:
+        return dict(
+            max_requests_per_crawl=limit, max_request_retries=cfg.max_retries,
+            concurrency_settings=ConcurrencySettings(desired_concurrency=cfg.concurrency, max_concurrency=cfg.concurrency),
+            request_handler_timeout=timedelta(seconds=cfg.timeout * 2 + PERSIST_QUEUE_SECONDS), respect_robots_txt_file=True,
+            ignore_http_error_status_codes=PERMANENT_HTTP, http_client=SafeImpitClient(
+                max_response_bytes=cfg.max_response_bytes, timeout=cfg.timeout, browser=None, max_redirects=cfg.max_redirects,
+                headers={"User-Agent": core.USER_AGENT}), **extra)
+
+    async def run(crawler, items) -> None:
+        @crawler.on_skipped_request
+        async def skipped(url: str, reason: SkippedReason) -> None:
+            if reason != "robots_txt":
+                return
+            # terminal state: without this the URL stays 'crawling', is released to 'pending' and is claimed again forever
+            with core.connect() as c:
+                c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='robots_txt', lease_owner=NULL, lease_expires=NULL"
+                          " WHERE normalized_url=? AND crawl_status IN ('crawling','recrawling')", (core.normalize_url(url),))
+            finished.add(url)
+            log.info("skipped %s | robots.txt", url)
+
+        crawler.pre_navigation_hook(polite)
+        concurrent_robots(crawler)
+        await asyncio.gather(*(crawler._get_robots_txt_file_for_url(u) for u, _ in items))  # all sites at once, before add_requests checks them one by one
+        try:
+            await crawler.run([req(u, d) for u, d in items])
+        except PersistentRateLimitError as e:  # a host answered 429 for the whole stall window: reschedule what never finished
+            log.warning("rate limited: %s", e)
+            def resched():
+                with core.connect() as c:
+                    for u, _ in items:
+                        if u not in finished:
+                            mark_failed(c, u, "HTTP 429 (persistent rate limit)", 429, cfg, started.get(u, core.now()))
+            await asyncio.to_thread(resched)
+
+    async def queue(*, alias=None, storage_client=None, configuration=None):  # also the opener for the per-host sub-queues
+        # always a fresh alias: the throttler's own per-host aliases are fixed names, and a reused queue remembers URLs as already handled
+        return await RequestQueue.open(alias=uuid.uuid4().hex, storage_client=MemoryStorageClient())
+
+    async def queue_for(items):
+        """Per-host throttling manager: an HTTP 429 holds that host back with exponential backoff (cfg.rate_limit_base .. 60s) and
+        robots.txt Crawl-delay is honoured; other hosts keep going. A host that stays rate limited for cfg.rate_limit_stall seconds
+        ends the round (caught below) and its unfinished URLs are rescheduled."""
+        hosts = sorted({core.hostname(u) for u, _ in items if core.hostname(u)})
+        return ThrottlingRequestManager(await queue(), domains=hosts, request_manager_opener=queue,
+                                        base_delay=timedelta(seconds=cfg.rate_limit_base), max_delay=timedelta(seconds=60),
+                                        max_domain_stall=timedelta(seconds=cfg.rate_limit_stall))
+
+    async def playwright_crawler(handler_failed, items):
+        crawler = PlaywrightCrawler(
+            request_manager=await queue(),  # plain queue: the throttling manager never dispatched requests to Playwright (verified)
+            browser_new_context_options={"user_agent": core.USER_AGENT},
+            # all browser traffic through the egress proxy; <-loopback> stops Chromium from bypassing it for 127.0.0.1 / localhost
+            browser_launch_options={"proxy": {"server": egress_proxy.ensure()}, "args": ["--proxy-bypass-list=<-loopback>"]},
+            navigation_timeout=timedelta(seconds=cfg.timeout), **common())
+        safe: dict[str, bool] = {}
+
+        @crawler.pre_navigation_hook
+        async def guard(context: PlaywrightCrawlingContext) -> None:  # every browser request, including redirects and sub-resources
+            async def route(r) -> None:
+                u = r.request.url
+                if not u.startswith(("http://", "https://")):
+                    return await r.continue_()
+                host = core.hostname(u)
+                if host not in safe:
+                    safe[host] = await asyncio.to_thread(core.is_safe_url, u)
+                if safe[host]:
+                    return await r.continue_()
+                log.warning("BLOCKED (browser) %s", u)
+                await r.abort("blockedbyclient")
+            await context.page.route("**/*", route)
 
         @crawler.router.default_handler
         async def pw(context: PlaywrightCrawlingContext) -> None:
@@ -299,34 +522,49 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
             resp = context.response
             await handle(context, BeautifulSoup(html, "html.parser"), resp.status if resp else None,
                          (resp.headers.get("content-type") if resp else None))
-    else:
-        crawler = BeautifulSoupCrawler(http_client=ImpitHttpClient(timeout=cfg.timeout, browser=None, max_redirects=cfg.max_redirects,
-                                                        headers={"User-Agent": core.USER_AGENT}),
-                                   navigation_timeout=timedelta(seconds=cfg.timeout), **common)  # the client's own timeout is not what Crawlee applies
+            done_render.add(context.request.url)
+        crawler.failed_request_handler(handler_failed)
+        return crawler
 
-        @crawler.router.default_handler
-        async def bs(context: BeautifulSoupCrawlingContext) -> None:
-            r = context.http_response
-            ctype = r.headers.get("content-type")
-            if int(r.headers.get("content-length") or 0) > cfg.max_response_bytes:
-                raise ValueError("response too large")
-            await handle(context, context.soup, r.status_code, ctype)
+    if cfg.use_playwright:  # everything rendered (explicit opt-in)
+        await run(await playwright_crawler(failed, work), work)
+        return
 
-    @crawler.on_skipped_request
-    async def skipped(url: str, reason: SkippedReason) -> None:
-        if reason != "robots_txt":
-            return
-        # terminal state: without this the URL stays 'crawling', is released to 'pending' and is claimed again forever
-        with core.connect() as c:
-            c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='robots_txt', lease_owner=NULL, lease_expires=NULL"
-                      " WHERE normalized_url=? AND crawl_status IN ('crawling','recrawling')", (core.normalize_url(url),))
-        log.info("skipped %s | robots.txt", url)
+    crawler = BeautifulSoupCrawler(request_manager=await queue_for(work), navigation_timeout=timedelta(seconds=cfg.timeout), **common())
 
-    crawler.pre_navigation_hook(polite)
+    @crawler.router.default_handler
+    async def bs(context: BeautifulSoupCrawlingContext) -> None:
+        r = context.http_response
+        await handle(context, context.soup, r.status_code, r.headers.get("content-type"), defer=True)
+
     crawler.failed_request_handler(failed)
-    concurrent_robots(crawler)
-    await asyncio.gather(*(crawler._get_robots_txt_file_for_url(u) for u, _ in work))  # all sites at once, before add_requests checks them one by one
-    await crawler.run([req(u, d) for u, d in work])
+    await run(crawler, work)
+    if not deferred:
+        return
+    log.info("rendering %d page(s) that look JavaScript-driven", len(deferred))
+
+    async def render_failed(context, error: Exception) -> None:  # browser could not render it: keep the static result, never lose the page
+        log.warning("render failed for %s (%s); using the static HTML", context.request.url, error)
+        _http_done(context.request.url, failed=True)
+    try:
+        items = [(u, v[4]) for u, v in deferred.items()]
+        await run(await playwright_crawler(render_failed, items), items)
+    except Exception:  # noqa: BLE001 - e.g. browsers not installed: fall back to static for all
+        log.exception("Playwright pass failed; persisting static HTML")
+    for url, (soup, base, status, ctype, depth, t0) in deferred.items():
+        if url not in done_render:
+            await persist_page(url, base, depth, soup, status, ctype, t0)
+
+
+async def _guard(request: httpx.Request) -> None:
+    why = await asyncio.to_thread(core.blocked_reason, str(request.url))
+    if why:
+        log.warning("BLOCKED %s | %s", request.url, why)
+        raise httpx.RequestError(f"unsafe URL blocked ({why}): {request.url}")
+    real, extra = core.test_route(str(request.url))  # tests only
+    if extra:
+        request.url = httpx.URL(real)
+        request.headers["Host"] = extra["Host"]
 
 
 async def admit_domain(cfg: Config, job_id: str | None, domain: str, seed_url: str | None = None) -> bool:
@@ -341,12 +579,14 @@ async def admit_domain(cfg: Config, job_id: str | None, domain: str, seed_url: s
         return False
     sitemap = []
     if cfg.enable_sitemap_discovery:
-        async with httpx.AsyncClient(timeout=cfg.timeout, follow_redirects=True, headers={"User-Agent": core.USER_AGENT}) as client:
+        async with httpx.AsyncClient(timeout=cfg.timeout, follow_redirects=True, headers={"User-Agent": core.USER_AGENT},
+                                     proxy=egress_proxy.ensure(), event_hooks={"request": [_guard]}) as client:  # the hook also runs for every redirect hop
             sitemap = await core.discover_sitemaps(client, origin + "/")
     def save() -> None:
         with core.connect() as c:
             c.execute("INSERT OR IGNORE INTO discovered_domains (domain, discovery_source) VALUES (?, 'seed')", (domain,))
             c.execute("UPDATE discovered_domains SET discovery_status='admitted' WHERE domain=?", (domain,))
+            c.execute("INSERT OR IGNORE INTO discovery_jobs (domain_id, source) SELECT id, 'commoncrawl' FROM discovered_domains WHERE domain=?", (domain,))
             core.save_url(c, seed_url or origin + "/", None, "seed", 0, True)
             for u, mod in sitemap:
                 if core.registrable_domain(core.hostname(u)) == domain:
@@ -443,11 +683,11 @@ def claim_recrawl(limit: int, urls: list[str] | None = None, owner: str = "recra
 
 
 async def recrawl_due(cfg: Config, job_id: str | None = None, urls: list[str] | None = None, limit: int | None = None,
-                      owner: str = "recrawl") -> int:
+                      owner: str = "recrawl", lease_seconds: int = 900) -> int:
     """Re-fetch up to `limit` due pages (or the given URLs). Crawlee never revisits completed requests on its own, so each
     recrawl uses a fresh queue fed from SQLite. Success -> completed, failure -> mark_failed (retry_pending/failed);
     pages the round never reached return to their previous status. Newly found internal URLs are stored as pending."""
-    claimed = claim_recrawl(limit or cfg.max_pages, urls, owner)
+    claimed = claim_recrawl(limit or cfg.max_pages, urls, owner, lease_seconds)
     try:
         await crawl_round(cfg, job_id, [(u, d) for u, d, _ in claimed], set(), False, max(len(claimed), 1))
     finally:  # also runs on cancellation: nothing stays 'recrawling' because of a shutdown

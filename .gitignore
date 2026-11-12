@@ -94,3 +94,4 @@ backlink_results.json
 *.log
 Thumbs.db
 desktop.ini
+backups/
