@@ -11,32 +11,64 @@ Crawls the web, stores every URL, link and backlink in PostgreSQL. Crawling runs
    winget install Memurai.MemuraiDeveloper
    memurai-cli ping            # must print PONG  (if not: net start Memurai)
    ```
+   Or use Docker: `docker run -p 6379:6379 redis:7`.
 3. **Python packages**, inside the project venv:
    ```
    cd C:\Users\User\Desktop\Backlink-Crawling
+   python -m venv .venv
    .venv\Scripts\activate
    pip install -r requirements.txt
+   playwright install chromium     # browser for JavaScript-rendered pages
    ```
-4. **`.env`** (see `.env.example`). It must contain exactly ONE `DATABASE_URL` line (your real one) and:
+4. **`.env`**: copy `.env.example` to `.env` and edit. It must contain exactly ONE `DATABASE_URL` line (your real one) and:
    ```
+   DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/backlinks
    REDIS_URL=redis://localhost:6379/0
    CELERY_BROKER_URL=redis://localhost:6379/0
    CELERY_RESULT_BACKEND=redis://localhost:6379/1
    USE_CELERY=1
    ```
+5. **Only if Windows Application Control blocks files** (errors like `An Application Control policy has blocked this file`):
+   - `celery.exe` is blocked: always start Celery as `python -m celery ...` (the commands below already do).
+   - psycopg fails with `no pq wrapper available`: its bundled DLL is blocked, so use the `libpq.dll` of your PostgreSQL install. Run once
+     (change `18` to your PostgreSQL version), then close ALL terminals and restart VS Code:
+     ```
+     [Environment]::SetEnvironmentVariable("PSYCOPG_IMPL", "python", "User")
+     $p = [Environment]::GetEnvironmentVariable("PATH", "User")
+     if ($p -notlike "*PostgreSQL\18\bin*") { [Environment]::SetEnvironmentVariable("PATH", "C:\Program Files\PostgreSQL\18\bin;" + $p, "User") }
+     ```
+     Check: `python -c "import psycopg; print(psycopg.pq.__impl__)"` must print `python`.
+     If that file is blocked too, ask your admin to allow the project folder, or run in WSL/Docker.
 
-## Run (every command in its own terminal; in each, first run `cd` to the project and `.venv\Scripts\activate`)
+## Run (every command in its own terminal)
+
+First check Redis: `memurai-cli ping` must print `PONG`. Every terminal starts with:
+```
+cd C:\Users\User\Desktop\Backlink-Crawling
+.venv\Scripts\activate
+```
+Then, in this order:
 
 | # | Terminal | Command |
 |---|---|---|
-| 1 | Redis | nothing to do: Memurai runs as a Windows service |
-| 2-5 | Celery workers (4) | `celery -A celery_app worker -P solo -n w1@%h -l INFO` (then `w2`, `w3`, `w4`) |
-| 6 | Crawler engine | `python autonomous.py` |
-| 7 | Flower dashboard | `celery -A celery_app flower --port=5555 --inspect-timeout=10000` then open http://localhost:5555 |
-| 8 | API (optional) | `uvicorn backlink_api:app --port 8000` |
+| 1 | Celery worker 1 | `python -m celery -A celery_app worker -P solo -n w1@pc -l INFO` |
+| 2 | Celery worker 2 (optional, more = faster) | `python -m celery -A celery_app worker -P solo -n w2@pc -l INFO` (then `w3`, `w4`) |
+| 3 | Crawler engine | `$env:USE_CELERY=1; python autonomous.py` |
+| 4 | API | `python -m uvicorn backlink_api:app --port 8000` (docs: http://127.0.0.1:8000/docs) |
+| 5 | Flower dashboard (optional) | `python -m celery -A celery_app flower --port=5555 --inspect-timeout=10000` (http://localhost:5555) |
 
-Start order: Redis, workers, engine, then Flower and the API. Run only ONE `autonomous.py`.
+Start order: Redis, workers, engine, then the API and Flower. Run only ONE `autonomous.py`.
 `-P solo` is required on Windows (no prefork); one worker process = one crawl batch at a time, so start several.
+Give every worker its own name (`w1`, `w2`, ...). `%h` does not work in PowerShell, so the examples use `@pc`.
+
+The engine runs until you stop it: it keeps finding domains (Tranco, feeds, Common Crawl), keeps the Celery queue full and re-verifies known backlinks.
+It indexes backlinks to every site it crawls; look up a domain with `GET /backlinks/<domain>`. Coverage grows over time and is never complete.
+
+Useful extras (same venv terminal):
+```
+python autonomous.py seed example.com --directories      # queue domains/URLs first (--directories adds the agency directories)
+python backlink_checker.py codigix.co                    # one-off: check the default source sites for links to a domain
+```
 
 ## Stop
 Ctrl+C once in each terminal. A worker finishes its batch and returns unfinished URLs to the queue.
@@ -69,3 +101,5 @@ LIVE_BROKER=filesystem python tests/run_celery_live.py   # same without Redis
 - `password authentication failed for user "USER"`: `.env` has a second, placeholder `DATABASE_URL`. Delete it.
 - `No module named 'celery'`: you are not in the project venv (prompt must show `(crawlee)`), or skipped `pip install -r requirements.txt`.
 - `Connection refused ... 6379`: Redis is not running.
+- `celery.exe ... blocked` or `no pq wrapper available`: see setup step 5.
+- `/api/backlinks/*` and `POST /api/backlinks/discover` are not wired into the app yet; use `/backlinks/<domain>` and `/crawler/*`.
