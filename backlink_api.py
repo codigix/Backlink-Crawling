@@ -6,7 +6,8 @@ Docs: http://127.0.0.1:8000/docs
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Security
+from fastapi.security import APIKeyHeader
 
 import crawler_core
 from autonomous_api import router as discovery_router
@@ -25,6 +26,7 @@ with crawler_core.connect() as conn:
 
 
 
-app = FastAPI(title="Backlink Crawler")
+# Only adds an "Authorize" button to /docs so the X-API-Key can be typed once. auto_error=False: nginx does the real key check.
+app = FastAPI(title="Backlink Crawler", dependencies=[Security(APIKeyHeader(name="X-API-Key", auto_error=False))])
 app.include_router(crawler_router)
 app.include_router(discovery_router)
