@@ -80,6 +80,7 @@ def _http_done(url: str, failed: bool = False) -> None:
 
 
 _PL: dict = {}
+WRITERS = 8  # background database writers per crawl round (each holds one connection while storing a page)
 PERSIST_QUEUE_SECONDS = 300  # extra handler time for waiting in line behind pages of the same domain
 
 
@@ -132,8 +133,15 @@ def link_event(conn, source: str, dest: str, ddom: str, anchor: str, kind: str) 
                  (source, dest, ddom, anchor, kind))
 
 
+def page_facts(soup, base: str) -> tuple[list, str, str | None]:
+    """The CPU-bound DOM work for one page (links, content hash, title). Run it in a thread BEFORE the database transaction, so parsing
+    never happens while the domain advisory lock is held."""
+    return (extract_links(soup, base), hashlib.sha256(str(soup).encode()).hexdigest(),
+            soup.title.get_text(strip=True)[:300] if soup.title else None)
+
+
 def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: int | None, ctype: str | None,
-                 cfg: Config, approved: set[str], follow: bool, started: str) -> list[tuple[str, int]]:
+                 cfg: Config, approved: set[str], follow: bool, started: str, facts: tuple | None = None) -> list[tuple[str, int]]:
     """Persist one successfully fetched page in ONE transaction (all of it or none of it). Returns internal (url, depth) to crawl next.
 
     Concurrency: pages of the same source domain are serialized by a per-domain advisory lock (they share hot rows: the domain row,
@@ -142,7 +150,8 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
     PostgreSQL and the whole transaction is retried by the caller (core.retry_locked), so nothing is half-written."""
     src_dom = core.registrable_domain(core.hostname(key_url))
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", ("page:" + src_dom,))
-    links = extract_links(soup, base_url)
+    links, digest, title = facts or page_facts(soup, base_url)
+    links = list(links)  # a deadlock retry re-enters here; do not append the redirect twice
     if base_url != key_url:  # redirect
         links.append((base_url, "", None, "redirect", {}))
     prepared = {}
@@ -150,32 +159,51 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
         prepared.setdefault((dest, anchor), (core.registrable_domain(core.hostname(dest)), core.normalize_url(dest) or dest, rel, ltype, ex))
     ordered = sorted(prepared.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0][1]))
     targets = core.active_targets(conn)
-    seen_out: set[tuple[str, str]] = set()
-    found_backlinks: set[tuple[int, str]] = set()
-    domains: dict[str, int] = {src_dom: 0}
-    to_queue, new_links, canonical = [], 0, None
+    # Set-based writes: a page is ~12 statements however many links it has (it was ~2 per link, and every statement is a network round trip).
+    # Rows are still written in the same global (domain, URL) order, which is what keeps concurrent pages from deadlocking.
+    items, urls = [], {}  # urls: normalized -> discovered_urls row (first occurrence wins, as the sequential code did)
     for (dest, anchor), (ddom, ndest, rel, ltype, ex) in ordered:
         internal = ddom == src_dom
         ok = core.crawlable(dest) and ddom not in NO_CRAWL_DOMAINS
         too_deep = internal and depth + 1 > cfg.max_depth  # claim_urls never leases these, so "pending" would be forever
-        is_new = core.save_url(conn, dest, key_url, "forward_crawl", depth + 1 if internal else 0, internal,
-                               "pending" if ok and not too_deep else "skipped", reason="max_depth" if ok and too_deep else None,
-                               touch_domain=False)
+        norm = core.normalize_url(dest)
+        if norm and norm not in urls:
+            host = core.hostname(norm)
+            urls[norm] = (dest, norm, core.registrable_domain(host), host, depth + 1 if internal else 0, int(internal),
+                          "pending" if ok and not too_deep else "skipped", "max_depth" if ok and too_deep else None)
+        items.append((dest, anchor, ddom, ndest, norm, rel, ltype, ex, internal, ok))
+    new_norms: set[str] = set()
+    if urls:
+        rows = sorted(urls.values(), key=lambda r: (r[2], r[1]))
+        c = [list(x) for x in zip(*rows)]
+        new_norms = {r["normalized_url"] for r in conn.execute(
+            "INSERT INTO discovered_urls (url, normalized_url, domain, hostname, discovered_from, discovery_method, crawl_depth,"
+            " is_internal, is_external, crawl_status, skip_reason)"
+            " SELECT u, n, d, h, ?, 'forward_crawl', dp, i, 1-i, s, r FROM unnest(?::text[], ?::text[], ?::text[], ?::text[], ?::int[],"
+            " ?::int[], ?::text[], ?::text[]) AS t(u, n, d, h, dp, i, s, r) ORDER BY d, n ON CONFLICT DO NOTHING RETURNING normalized_url",
+            (key_url, *c)).fetchall()}
+        old = [r for r in rows if r[1] not in new_norms]
+        if old:  # a URL skipped only for max_depth comes back as pending when found again within reach; robots / security / not_html skips stay
+            c = [list(x) for x in zip(*old)]
+            react = "(u.crawl_status='skipped' AND u.skip_reason='max_depth' AND d.s='pending' AND d.dp<=u.crawl_depth)"
+            conn.execute(
+                "WITH d AS (SELECT * FROM unnest(?::text[], ?::int[], ?::text[]) AS t(n, dp, s)),"
+                " k AS (SELECT u.id FROM discovered_urls u JOIN d ON u.normalized_url=d.n ORDER BY u.domain, u.normalized_url FOR UPDATE OF u)"
+                f" UPDATE discovered_urls u SET last_seen=?, crawl_status=CASE WHEN {react} THEN 'pending' ELSE u.crawl_status END,"
+                f" skip_reason=CASE WHEN {react} THEN NULL ELSE u.skip_reason END, crawl_depth=LEAST(u.crawl_depth, d.dp)"
+                " FROM d, k WHERE u.normalized_url=d.n AND u.id=k.id",
+                (c[1], c[4], c[6], core.now()))
+    seen_out: set[tuple[str, str]] = set()
+    found_backlinks: set[tuple[int, str]] = set()
+    domains: dict[str, int] = {src_dom: 0}
+    to_queue, canonical, out = [], None, []
+    follow_norms: list[str] = []
+    for dest, anchor, ddom, ndest, norm, rel, ltype, ex, internal, ok in items:
+        is_new = norm in new_norms
+        new_norms.discard(norm)  # a second spelling of the same URL is not new again
         domains[ddom] = domains.get(ddom, 0) + int(is_new)
-        flags = (int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)), ex.get("img_alt"), ex.get("position"), ex.get("context"))
-        fresh = conn.execute(
-            "INSERT OR IGNORE INTO outgoing_links (source_url, destination_url, destination_domain, anchor_text,"
-            " rel_attributes, link_type, is_nofollow, is_sponsored, is_ugc, img_alt, position, context, source_domain)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (key_url, dest, ddom, anchor, rel, ltype, *flags, src_dom)).rowcount
-        new_links += fresh
-        if not fresh:  # existing row: refresh it and learn whether it was suspected/removed (one statement, row locked)
-            was = conn.execute(
-                "WITH o AS (SELECT id, is_active, lost_at FROM outgoing_links WHERE source_url=? AND destination_url=? AND anchor_text=? FOR UPDATE)"
-                " UPDATE outgoing_links l SET last_seen=?, is_active=1, lost_at=NULL, rel_attributes=?, is_nofollow=?, is_sponsored=?, is_ugc=?,"
-                " img_alt=?, position=?, context=? FROM o WHERE l.id=o.id RETURNING o.is_active AS was_active, o.lost_at AS was_lost",
-                (key_url, dest, anchor, core.now(), rel, *flags)).fetchone()
-            if was and ltype == "html" and (not was["was_active"] or was["was_lost"]):
-                link_event(conn, key_url, dest, ddom, anchor, "reappeared")
+        out.append((dest, ddom, anchor, rel, ltype, int(ex.get("nofollow", 0)), int(ex.get("sponsored", 0)), int(ex.get("ugc", 0)),
+                    ex.get("img_alt"), ex.get("position"), ex.get("context")))
         seen_out.add((dest, anchor))
         if ltype == "canonical":
             canonical = dest
@@ -187,21 +215,53 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
                     core.record_backlink(conn, tid, key_url, dest, anchor, rel)
                     found_backlinks.add((tid, dest))
                     vlog.info("backlink verified %s -> %s", key_url, dest)
-        if follow and internal and ok and ltype != "redirect" and depth + 1 <= cfg.max_depth and ddom in approved:
-            row = conn.execute("SELECT url, crawl_status, crawl_depth FROM discovered_urls WHERE normalized_url=?", (ndest,)).fetchone()
-            if row["crawl_status"] == "pending":
-                conn.execute("UPDATE discovered_urls SET crawl_status='crawling' WHERE normalized_url=?", (ndest,))
-                to_queue.append((row["url"], row["crawl_depth"]))
-    for dom in sorted(domains):  # one upsert per domain, in sorted order
-        core.upsert_domain(conn, dom, key_url, domains[dom])
+        if follow and internal and ok and ltype != "redirect" and depth + 1 <= cfg.max_depth and ddom in approved and norm:
+            follow_norms.append(norm)
+    new_links = 0
+    if out:  # one row per (destination, anchor); new ones are inserted, existing ones refreshed and checked for "reappeared"
+        c = [list(x) for x in zip(*out)]
+        fresh = {(r["destination_url"], r["anchor_text"]) for r in conn.execute(
+            "INSERT INTO outgoing_links (source_url, destination_url, destination_domain, anchor_text, rel_attributes, link_type,"
+            " is_nofollow, is_sponsored, is_ugc, img_alt, position, context, source_domain)"
+            " SELECT ?, d, dd, a, r, lt, nf, sp, ug, ia, p, cx, ? FROM unnest(?::text[], ?::text[], ?::text[], ?::text[], ?::text[],"
+            " ?::int[], ?::int[], ?::int[], ?::text[], ?::text[], ?::text[]) AS t(d, dd, a, r, lt, nf, sp, ug, ia, p, cx)"
+            " ON CONFLICT DO NOTHING RETURNING destination_url, anchor_text", (key_url, src_dom, *c)).fetchall()}
+        new_links = len(fresh)
+        old = [r for r in out if (r[0], r[2]) not in fresh]
+        if old:
+            c = [list(x) for x in zip(*old)]
+            was = conn.execute(
+                "WITH d AS (SELECT * FROM unnest(?::text[], ?::text[], ?::text[], ?::int[], ?::int[], ?::int[], ?::text[],"
+                " ?::text[], ?::text[]) AS t(dest, anchor, rel, nf, sp, ug, ia, p, cx)),"
+                " o AS (SELECT l.id, l.is_active, l.lost_at, d.* FROM outgoing_links l JOIN d ON l.destination_url=d.dest AND"
+                " l.anchor_text=d.anchor WHERE l.source_url=? ORDER BY l.id FOR UPDATE OF l)"
+                " UPDATE outgoing_links l SET last_seen=?, is_active=1, lost_at=NULL, rel_attributes=o.rel, is_nofollow=o.nf,"
+                " is_sponsored=o.sp, is_ugc=o.ug, img_alt=o.ia, position=o.p, context=o.cx FROM o WHERE l.id=o.id"
+                " RETURNING o.is_active AS was_active, o.lost_at AS was_lost, o.dest, o.anchor",
+                (c[0], c[2], c[3], c[5], c[6], c[7], c[8], c[9], c[10], key_url, core.now())).fetchall()
+            meta = {(r[0], r[2]): (r[1], r[4]) for r in old}  # (destination, anchor) -> (destination_domain, link_type)
+            conn.executemany("INSERT INTO link_history (source_url, destination_url, destination_domain, anchor_text, event_type) VALUES (?,?,?,?,?)",
+                             [(key_url, w["dest"], meta[(w["dest"], w["anchor"])][0], w["anchor"], "reappeared")
+                              for w in was if meta[(w["dest"], w["anchor"])][1] == "html" and (not w["was_active"] or w["was_lost"])])
+    if follow_norms:  # claim the internal URLs this page found so the caller can crawl them next (one statement; was one per link)
+        to_queue = [(r["url"], r["crawl_depth"]) for r in conn.execute(
+            "UPDATE discovered_urls SET crawl_status='crawling' WHERE normalized_url = ANY(?::text[]) AND crawl_status='pending'"
+            " RETURNING url, crawl_depth", (follow_norms,)).fetchall()]
+    conn.execute(  # one upsert per domain, in sorted order
+        "INSERT INTO discovered_domains (domain, discovery_source, pages_discovered, last_seen)"
+        " SELECT d, ?, n, ? FROM unnest(?::text[], ?::int[]) AS t(d, n) ORDER BY d ON CONFLICT (domain) DO UPDATE SET"
+        " last_seen=EXCLUDED.last_seen, pages_discovered=discovered_domains.pages_discovered+EXCLUDED.pages_discovered",
+        (key_url, core.now(), sorted(domains), [domains[d] for d in sorted(domains)]))
     # Same two-miss rule as backlinks, so the graph and the backlinks table never disagree: first successful miss sets lost_at
     # (suspected, still active); a second one deactivates. Seeing the link again clears lost_at (above). Rows are never deleted.
-    for r in conn.execute("SELECT id, destination_url, destination_domain, anchor_text, link_type, lost_at FROM outgoing_links"
-                          " WHERE source_url=? AND is_active=1 ORDER BY id FOR UPDATE", (key_url,)).fetchall():
-        if (r["destination_url"], r["anchor_text"]) not in seen_out:
-            conn.execute("UPDATE outgoing_links SET is_active=?, lost_at=? WHERE id=?", (int(not r["lost_at"]), core.now(), r["id"]))
-            if r["link_type"] == "html":
-                link_event(conn, key_url, r["destination_url"], r["destination_domain"], r["anchor_text"], "lost" if r["lost_at"] else "suspected_removed")
+    miss = [r for r in conn.execute("SELECT id, destination_url, destination_domain, anchor_text, link_type, lost_at FROM outgoing_links"
+                                    " WHERE source_url=? AND is_active=1 ORDER BY id FOR UPDATE", (key_url,)).fetchall()
+            if (r["destination_url"], r["anchor_text"]) not in seen_out]
+    if miss:
+        conn.executemany("UPDATE outgoing_links SET is_active=?, lost_at=? WHERE id=?", [(int(not r["lost_at"]), core.now(), r["id"]) for r in miss])
+        conn.executemany("INSERT INTO link_history (source_url, destination_url, destination_domain, anchor_text, event_type) VALUES (?,?,?,?,?)",
+                         [(key_url, r["destination_url"], r["destination_domain"], r["anchor_text"], "lost" if r["lost_at"] else "suspected_removed")
+                          for r in miss if r["link_type"] == "html"])
     suspected = False  # one miss is only a suspicion (soft blocks, layout changes); a second consecutive miss confirms
     for b in conn.execute("SELECT id, target_domain_id, destination_url, link_status FROM backlinks WHERE source_url=? AND"
                           " is_active=1 AND link_status IN ('verified','fetch_failed','suspected_removed') ORDER BY id FOR UPDATE", (key_url,)).fetchall():
@@ -221,8 +281,7 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
         " retry_count=0, next_crawl_at=?, canonical_url=?, last_successful_crawl=?, content_hash=?, title=?, lease_owner=NULL,"
         " lease_expires=NULL WHERE normalized_url=?",
         (status, ctype, core.now(), core.later(days=1 if suspected else cfg.recrawl_days), canonical, core.now(),
-         hashlib.sha256(str(soup).encode()).hexdigest(), (soup.title.get_text(strip=True)[:300] if soup.title else None),
-         core.normalize_url(key_url)))
+         digest, title, core.normalize_url(key_url)))
     conn.execute("UPDATE discovered_domains SET last_crawled=? WHERE domain=?", (core.now(), src_dom))
     conn.execute("INSERT INTO crawl_history (source_url, crawl_started, crawl_completed, http_status, links_found,"
                  " new_links_found) VALUES (?,?,?,?,?,?)", (key_url, started, core.now(), status, len(links), new_links))
@@ -382,11 +441,31 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
             HTTP["started"] += 1
         _T0[context.request.url] = time.monotonic()
 
-    async def persist_page(url, base, depth, soup, status, ctype, t0):
+    # follow=False rounds (autonomous, celery, recrawl) need nothing back from the write, so finished pages go to a bounded queue and
+    # writer tasks persist them while the crawler keeps fetching. follow=True needs the returned URLs, so it stays inline.
+    writes: asyncio.Queue | None = None if follow else asyncio.Queue(maxsize=cfg.concurrency * 4)  # bounded: soups held in memory
+
+    async def writer() -> None:
+        while True:
+            item = await writes.get()
+            try:
+                await persist_page(*item)
+            except Exception as e:  # noqa: BLE001 - same outcome the crawler handler's failure path gave before
+                log.warning("persist FAILED %s | %r", item[0], e)
+                def fail():
+                    with core.connect() as c:
+                        mark_failed(c, item[0], repr(e), None, cfg, item[6])
+                await asyncio.to_thread(fail)
+                finished.add(item[0])
+                _job_add(job_id, "pages_failed")
+            finally:
+                writes.task_done()
+
+    async def persist_page(url, base, depth, soup, status, ctype, t0, facts=None):
         def persist():
             def once():
                 with core.connect() as c:  # one transaction per page; a deadlock victim is rolled back whole and retried
-                    return process_page(c, url, base, depth, soup, status, ctype, cfg, approved, follow, t0)
+                    return process_page(c, url, base, depth, soup, status, ctype, cfg, approved, follow, t0, facts)
             return core.retry_locked(once)
         async with _persist_lock(core.registrable_domain(core.hostname(url))):  # waiting here holds no thread or connection
             nxt = await asyncio.to_thread(persist)
@@ -421,10 +500,14 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
             finished.add(url)
             return
         depth = context.request.user_data["depth"]
-        if defer and cfg.js_fallback and len(deferred) < cfg.max_js_pages and needs_js(soup):
+        if defer and cfg.js_fallback and len(deferred) < cfg.max_js_pages and await asyncio.to_thread(needs_js, soup):
             deferred[url] = (soup, base, status, ctype, depth, t0)  # persisted after the rendered pass (or, if that fails, as fetched)
             return
-        nxt = await persist_page(url, base, depth, soup, status, ctype, t0)
+        facts = await asyncio.to_thread(page_facts, soup, base)  # DOM traversal off the event loop
+        if writes is not None:
+            await writes.put((url, base, depth, soup, status, ctype, t0, facts))  # returns at once unless the queue is full
+            return
+        nxt = await persist_page(url, base, depth, soup, status, ctype, t0, facts)
         if nxt:
             await context.add_requests([req(u, d) for u, d in nxt])
 
@@ -464,16 +547,25 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         crawler.pre_navigation_hook(polite)
         concurrent_robots(crawler)
         await asyncio.gather(*(crawler._get_robots_txt_file_for_url(u) for u, _ in items))  # all sites at once, before add_requests checks them one by one
+        workers = [asyncio.create_task(writer()) for _ in range(WRITERS)] if writes is not None else []
         try:
-            await crawler.run([req(u, d) for u, d in items])
-        except PersistentRateLimitError as e:  # a host answered 429 for the whole stall window: reschedule what never finished
-            log.warning("rate limited: %s", e)
-            def resched():
-                with core.connect() as c:
-                    for u, _ in items:
-                        if u not in finished:
-                            mark_failed(c, u, "HTTP 429 (persistent rate limit)", 429, cfg, started.get(u, core.now()))
-            await asyncio.to_thread(resched)
+            try:
+                await crawler.run([req(u, d) for u, d in items])
+            except PersistentRateLimitError as e:  # a host answered 429 for the whole stall window: reschedule what never finished
+                log.warning("rate limited: %s", e)
+                if writes is not None:
+                    await writes.join()  # queued pages count as finished, not as unreached
+                def resched():
+                    with core.connect() as c:
+                        for u, _ in items:
+                            if u not in finished:
+                                mark_failed(c, u, "HTTP 429 (persistent rate limit)", 429, cfg, started.get(u, core.now()))
+                await asyncio.to_thread(resched)
+            if writes is not None:
+                await writes.join()  # callers release leases right after the round, so every queued page must be stored first
+        finally:  # on cancellation the queue is abandoned; leases expire / the callers' release() returns the URLs
+            for w in workers:
+                w.cancel()
 
     async def queue(*, alias=None, storage_client=None, configuration=None):  # also the opener for the per-host sub-queues
         # always a fresh alias: the throttler's own per-host aliases are fixed names, and a reused queue remembers URLs as already handled
@@ -520,7 +612,7 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
                 pass
             html = await context.page.content()
             resp = context.response
-            await handle(context, BeautifulSoup(html, "html.parser"), resp.status if resp else None,
+            await handle(context, await asyncio.to_thread(BeautifulSoup, html, "html.parser"), resp.status if resp else None,
                          (resp.headers.get("content-type") if resp else None))
             done_render.add(context.request.url)
         crawler.failed_request_handler(handler_failed)

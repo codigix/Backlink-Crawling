@@ -94,6 +94,8 @@ def test_dispatch_is_noop_when_queue_is_full_and_resumes_after_drain(env, monkey
     r.flushdb()
     monkeypatch.setattr(tasks, "_redis", r)
     monkeypatch.setattr(tasks.crawl_batch, "delay", lambda: r.lpush("celery", "task"))
+    real = autonomous.AutoConfig
+    monkeypatch.setattr(autonomous, "AutoConfig", lambda: real(claim_batch=100))  # the default batch (500) would want only 2 tasks
     assert tasks.dispatch(force=True) == tasks.MAX_QUEUED
     assert tasks.dispatch(force=True) == 0
     r.lpop("celery")  # a worker took one

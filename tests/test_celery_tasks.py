@@ -95,6 +95,8 @@ def test_dispatch_is_bounded_and_respects_pause(env, monkeypatch):
     sent = []
     monkeypatch.setattr(tasks.crawl_batch, "delay", lambda: sent.append(1))
     monkeypatch.setattr(tasks, "queue_length", lambda: 1)
+    real = autonomous.AutoConfig
+    monkeypatch.setattr(autonomous, "AutoConfig", lambda: real(claim_batch=20))  # the default batch (500) is larger than this fixture
     assert tasks.dispatch() == tasks.MAX_QUEUED - 1 == len(sent)
     monkeypatch.setattr(tasks, "queue_length", lambda: tasks.MAX_QUEUED)
     assert tasks.dispatch() == 0  # queue full: no pile-up

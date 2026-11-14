@@ -10,6 +10,7 @@ shortcut: HTTP/1.1 with Connection: close per plain-HTTP request, no keep-alive/
 import asyncio
 import socket
 import threading
+import time
 from urllib.parse import urlsplit
 
 import crawler_core as core
@@ -18,11 +19,23 @@ _lock = threading.Lock()
 _url: str | None = None
 
 
-async def resolve(host: str) -> list[str]:  # one lookup per connection; tests replace this to stage a rebinding attack
+DNS_TTL = 300  # seconds; the cache only ever holds answers, _handle still validates every cached address on every request
+_dns: dict[str, tuple[float, list[str]]] = {}  # touched only from the proxy's single event loop, so no lock needed
+# shortcut: fixed TTL, ignores the DNS record's own TTL; entries are evicted only when read stale or when 10k are held
+
+
+async def resolve(host: str) -> list[str]:  # one lookup per TTL; tests replace this to stage a rebinding attack
     if core.ALLOW_PRIVATE and host.endswith(".localhost"):  # tests only: Windows cannot resolve *.localhost
         return [core.test_ip(host)]
+    hit = _dns.get(host)
+    if hit and hit[0] > time.monotonic():
+        return list(hit[1])
     infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    return list(dict.fromkeys(i[4][0] for i in infos))
+    addrs = list(dict.fromkeys(i[4][0] for i in infos))
+    if len(_dns) >= 10_000:
+        _dns.clear()
+    _dns[host] = (time.monotonic() + DNS_TTL, addrs)  # failures raise above and are never cached
+    return addrs
 
 
 async def _pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
