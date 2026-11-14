@@ -24,10 +24,12 @@ from dataclasses import dataclass, field
 
 import httpx
 
+import cc_lookup
 import crawler_core as core
 import crawler_engine as engine
 
 log = logging.getLogger("crawler.autonomous")
+CC_MAX_SEEDS = int(os.environ.get("CC_MAX_SEEDS", "200"))  # referring domains seeded per looked-up domain
 DEFAULT_FEEDS = ("https://news.ycombinator.com/rss", "https://lobste.rs/rss", "https://hnrss.org/newest")
 
 
@@ -566,7 +568,33 @@ class Engine:
         await bootstrap(self.cfg, force=bool(asked))
         return False
 
+    async def cc_lookups(self) -> None:
+        """GET /backlinks/<d> with nothing in the graph leaves cc_lookup:<d>. Ask Common Crawl who links to <d>, seed those
+        domains at top priority (the crawler then finds the linking pages), and record the outcome in cc_done:<d>."""
+        with core.connect() as c:
+            keys = [r["key"] for r in c.execute("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'")]
+        for k in keys:
+            dom = k.removeprefix("cc_lookup:")
+            log.info(">>> CC-LOOKUP %s: not in our database, asking Common Crawl who links to it ...", dom)
+            try:
+                found = await asyncio.to_thread(cc_lookup.referring_domains, dom)
+                log.info(">>> CC-LOOKUP %s: Common Crawl returned %d referring domain(s); seeding %d at TOP priority, e.g. %s",
+                         dom, len(found or []), min(len(found or []), CC_MAX_SEEDS), (found or [])[:10])
+                # shortcut: first CC_MAX_SEEDS domains in graph order, not ranked; rank by authority when a big domain needs it
+                seeds = (found or [])[:CC_MAX_SEEDS]
+                if seeds:
+                    await seed(seeds, self.cfg)
+                result = f"ok:{len(found or [])}:{len(seeds)}" if found is not None else "not_in_common_crawl"
+            except Exception as e:  # noqa: BLE001 - one bad lookup (no Java/data) must not stop the engine or retry forever
+                log.error("CC lookup for %s failed: %r", dom, e)
+                result = f"error:{e}"[:300]
+            log.info(">>> CC-LOOKUP %s -> %s", dom, result)
+            with core.connect() as c:
+                c.execute("INSERT INTO engine_state (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (f"cc_done:{dom}", result))
+                c.execute("DELETE FROM engine_state WHERE key=?", (k,))
+
     async def scheduler(self) -> bool:
+        await self.cc_lookups()
         with core.connect() as c:  # POST /crawler/seed leaves seed:<url> flags; admit them at top priority, then clear them
             keys = [r["key"] for r in c.execute("SELECT key FROM engine_state WHERE key LIKE 'seed:%'")]
         if keys:

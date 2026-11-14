@@ -89,16 +89,27 @@ def _graph(c, target: str, active_only: bool = True, limit: int | None = None, o
 
 @router.get("/backlinks/{target_domain}")
 def backlinks(target_domain: str, include_removed: bool = False, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
-    """Backlinks for ANY domain, read from our own link graph. Never starts a crawl or calls an external service."""
+    """Backlinks for ANY domain, read from our own link graph; no network call here. A domain with nothing yet is queued for the
+    engine, which looks it up in Common Crawl and crawls the linking sites: call again later (status 'discovering')."""
     target = _clean(target_domain)
+    reg = core.registrable_domain(target)
     with core.connect() as c:
         total, rows = _graph(c, target, not include_removed, limit, offset)
         every = _graph(c, target, not include_removed)[1]
         active = sum(link_status(r) == "verified" for r in every)
         refs = len({r["source_domain"] for r in every})
+        state = None
+        if total == 0:
+            done = c.execute("SELECT value FROM engine_state WHERE key=?", (f"cc_done:{reg}",)).fetchone()
+            if done is None:  # never looked up yet (or lookup pending): make sure the engine has the request
+                c.execute("INSERT INTO engine_state (key, value) VALUES (?, '1') ON CONFLICT (key) DO NOTHING", (f"cc_lookup:{reg}",))
+            state = done[0] if done else None
     if total == 0:
+        crawling = state is None or state.startswith("ok:")  # lookup pending, or sources seeded and the crawler is on them
         return {"domain": target, "target_domain": target, "total_backlinks": 0, "referring_domains": 0, "total_referring_domains": 0,
-                "status": "not_found_in_current_index", "message": "No discovered backlinks are currently available.", "backlinks": []}
+                "status": "discovering" if crawling else "not_found_in_current_index",
+                "message": "Discovery started: Common Crawl lookup and crawl in progress, check again shortly." if crawling
+                else f"No backlinks found ({state}).", "backlinks": []}
     return {
         "domain": target, "target_domain": target, "status": "ok", "total_backlinks": total, "verified_backlinks": active,
         "referring_domains": refs, "total_referring_domains": refs, "limit": limit, "offset": offset,

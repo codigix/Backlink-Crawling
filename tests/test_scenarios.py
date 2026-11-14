@@ -131,6 +131,18 @@ def test_crawl_round_refuses_unsafe_seed_and_records_reason(env, monkeypatch, po
     assert not HITS  # nothing reached the server
 
 
+JUNK = "https://a.test|b.test|c.test/x"  # stored by an older build; crawlee rejects it, which used to fail the whole batch
+
+
+def test_junk_url_is_rejected_and_stored_junk_does_not_fail_the_batch(env):
+    with core.connect() as c:
+        assert core.save_url(c, JUNK, None, "t", 0, True) is False  # no longer stored
+        c.execute("INSERT INTO discovered_urls (url, normalized_url, domain, hostname, discovery_method, crawl_depth, is_internal, is_external,"
+                  " crawl_status) VALUES (?,?,?,?,?,?,?,?,?)", (JUNK, JUNK, "a.test", "a.test", "t", 0, 1, 0, "crawling"))
+    asyncio.run(engine.crawl_round(cfg(), None, [(JUNK, 0)], set(), False, 1))  # must not raise
+    assert status(JUNK)["crawl_status"] == "skipped"
+
+
 def test_unsafe_domain_is_never_admitted(env, monkeypatch):
     monkeypatch.setattr(core, "ALLOW_PRIVATE", False)
     assert asyncio.run(engine.admit_domain(cfg(), None, "localhost", "http://localhost:80/")) is False

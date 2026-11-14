@@ -8,6 +8,7 @@ shortcut: HTTP/1.1 with Connection: close per plain-HTTP request, no keep-alive/
 """
 
 import asyncio
+import logging
 import socket
 import threading
 import time
@@ -15,8 +16,11 @@ from urllib.parse import urlsplit
 
 import crawler_core as core
 
+log = logging.getLogger("crawler.egress")
 _lock = threading.Lock()
 _url: str | None = None
+_thread: threading.Thread | None = None
+_loop: asyncio.AbstractEventLoop | None = None  # the proxy thread's loop; tests stop it to simulate a crash
 
 
 DNS_TTL = 300  # seconds; the cache only ever holds answers, _handle still validates every cached address on every request
@@ -102,23 +106,44 @@ async def _handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
             up.close()
 
 
+def _listening(url: str) -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", int(url.rsplit(":", 1)[1])), timeout=1).close()
+        return True
+    except OSError:
+        return False
+
+
 def ensure() -> str:
-    """Start the proxy in this process (once) and return its URL, e.g. http://127.0.0.1:53211."""
-    global _url
+    """Start the proxy in this process and return its URL, e.g. http://127.0.0.1:53211. If its thread died (the listener is gone and every
+    request would fail with "connection refused" until the process restarts), start a new one on a new port; clients ask here per request."""
+    global _url, _thread, _loop
     with _lock:
-        if _url:
+        if _url and _thread and _thread.is_alive() and _listening(_url):
             return _url
+        if _url:
+            log.error("egress proxy at %s is dead (thread alive=%s); restarting it", _url, bool(_thread and _thread.is_alive()))
         ready = threading.Event()
         box: dict = {}
 
         def run() -> None:
-            loop = asyncio.new_event_loop()
-            srv = loop.run_until_complete(asyncio.start_server(_handle, "127.0.0.1", 0, backlog=512))
-            box["port"] = srv.sockets[0].getsockname()[1]
-            ready.set()
-            loop.run_forever()
+            global _loop
+            _loop = loop = asyncio.new_event_loop()
+            try:
+                srv = loop.run_until_complete(asyncio.start_server(_handle, "127.0.0.1", 0, backlog=512))
+                box["port"] = srv.sockets[0].getsockname()[1]
+                ready.set()
+                loop.run_forever()
+            except BaseException:  # noqa: BLE001 - say why the proxy went away, then let the thread end
+                log.exception("egress proxy loop crashed")
+                raise
+            finally:
+                ready.set()
 
-        threading.Thread(target=run, name="egress-proxy", daemon=True).start()
+        _thread = threading.Thread(target=run, name="egress-proxy", daemon=True)
+        _thread.start()
         ready.wait(10)
+        if "port" not in box:
+            raise RuntimeError("egress proxy failed to start")
         _url = f"http://127.0.0.1:{box['port']}"
         return _url

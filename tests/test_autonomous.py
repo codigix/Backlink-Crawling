@@ -58,9 +58,25 @@ def test_autonomous_pipeline_and_database_first_search(env, monkeypatch):
     assert crawler_api.referring_domains("codigix.co")["total_referring_domains"] == 2
     assert {x["anchor_text"]: x["count"] for x in crawler_api.backlink_anchors("codigix.co")["anchors"]}["Codigix"] == 2
     miss = bl("never-seen.org")
-    assert miss["status"] == "not_found_in_current_index" and miss["total_backlinks"] == 0
+    assert miss["status"] == "discovering" and miss["total_backlinks"] == 0  # queued for the engine's Common Crawl lookup
+    assert rows("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'") == [{"key": "cc_lookup:never-seen.org"}]
     assert rows("SELECT COUNT(*) n FROM crawl_history")[0]["n"] == before  # a search never crawls
     assert rows("SELECT COUNT(*) n FROM target_domains")[0]["n"] == 0  # ...and never registers anything
+
+
+def test_cc_lookup_seeds_referrers_and_reports_done(env, monkeypatch):
+    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: ["src1.localhost", "src2.localhost"])
+    eng = autonomous.Engine(acfg())
+    assert bl("target-x.org")["status"] == "discovering"
+    asyncio.run(eng.cc_lookups())
+    assert rows("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'") == []  # request consumed
+    assert rows("SELECT value FROM engine_state WHERE key='cc_done:target-x.org'")[0]["value"] == "ok:2:2"
+    assert {r["domain"] for r in rows("SELECT domain FROM discovered_domains WHERE priority=0")} == {"src1.localhost", "src2.localhost"}
+    assert bl("target-x.org")["status"] == "discovering"  # sources seeded, crawler still on them
+    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: None)
+    bl("other-y.org")
+    asyncio.run(eng.cc_lookups())
+    assert bl("other-y.org")["status"] == "not_found_in_current_index"  # CC has never heard of it: final answer
 
 
 def test_lost_backlink_shows_in_history(env, monkeypatch):
@@ -78,7 +94,7 @@ def test_lost_backlink_shows_in_history(env, monkeypatch):
     asyncio.run(engine.recrawl_due(cfg.crawl, None, [u("a")]))  # second successful miss confirms
     h = crawler_api.backlink_history("codigix.co", limit=200)["events"]
     assert {e["event"] for e in h} == {"new", "suspected_removed", "lost"}
-    assert bl("codigix.co")["status"] == "not_found_in_current_index"
+    assert bl("codigix.co")["status"] == "discovering"  # nothing active left: handed to Common Crawl discovery
     assert bl("codigix.co", include_removed=True)["total_backlinks"] == 1
 
 

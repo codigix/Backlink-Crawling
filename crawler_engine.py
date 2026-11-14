@@ -422,6 +422,22 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
     def req(url: str, depth: int) -> Request:
         return Request.from_url(url, unique_key=core.normalize_url(url) or url, user_data={"depth": depth})
 
+    def valid_reqs(items) -> list[Request]:
+        """Requests crawlee accepts. Junk URLs already stored (e.g. "a.com|b.com") are marked skipped, so one bad URL never fails the batch."""
+        ok, bad = [], []
+        for u, d in items:
+            try:
+                ok.append(req(u, d))
+            except Exception:  # noqa: BLE001 - pydantic ValidationError and friends
+                bad.append(u)
+        if bad:
+            with core.connect() as c:
+                c.executemany("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='invalid_url', lease_owner=NULL, lease_expires=NULL"
+                              " WHERE url=? AND crawl_status IN ('pending','crawling','recrawling')", [(u,) for u in bad])
+            finished.update(bad)
+            log.warning("skipped %d invalid URL(s), e.g. %s", len(bad), bad[0][:120])
+        return ok
+
     async def slot_wait(url: str) -> None:  # one shared per-domain schedule for static fetches, browser navigations and redirect hops
         dom = core.registrable_domain(core.hostname(url))
         async with slot_lock:
@@ -509,7 +525,7 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
             return
         nxt = await persist_page(url, base, depth, soup, status, ctype, t0, facts)
         if nxt:
-            await context.add_requests([req(u, d) for u, d in nxt])
+            await context.add_requests(valid_reqs(nxt))
 
     async def failed(context, error: Exception) -> None:
         log.warning("FAILED %s | %s", context.request.url, error)
@@ -550,7 +566,7 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         workers = [asyncio.create_task(writer()) for _ in range(WRITERS)] if writes is not None else []
         try:
             try:
-                await crawler.run([req(u, d) for u, d in items])
+                await crawler.run(valid_reqs(items))
             except PersistentRateLimitError as e:  # a host answered 429 for the whole stall window: reschedule what never finished
                 log.warning("rate limited: %s", e)
                 if writes is not None:

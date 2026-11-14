@@ -54,6 +54,8 @@ def normalize_url(url: str) -> str | None:
         host = idna(p.hostname or "")
         if p.scheme not in ("http", "https") or not host:
             return None
+        if not re.fullmatch(r"[a-z0-9._-]+|[0-9a-f:.]+", host):  # junk like "a.com|b.com" or "*.x.com" (IPv6 is the second form)
+            return None
         port = p.port
     except ValueError:
         return None

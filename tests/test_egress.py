@@ -79,3 +79,13 @@ def test_real_policy_blocks_loopback_and_private(monkeypatch):
     for bad in ("127.0.0.1", "10.1.2.3", "169.254.169.254", "::1", "::ffff:127.0.0.1", "100.64.0.1", "0.0.0.0", "224.0.0.1"):
         assert not core.ip_allowed(bad), bad
     assert core.ip_allowed("93.184.216.34")
+
+
+def test_proxy_restarts_when_its_thread_dies():
+    first = egress_proxy.ensure()
+    assert egress_proxy.ensure() == first  # healthy: same proxy, no restart
+    egress_proxy._loop.call_soon_threadsafe(egress_proxy._loop.stop)  # what a crash does: the thread ends, the listener goes away
+    egress_proxy._thread.join(5)
+    assert not egress_proxy._thread.is_alive()
+    second = egress_proxy.ensure()
+    assert second != first and egress_proxy._listening(second)

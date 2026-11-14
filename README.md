@@ -3,6 +3,16 @@
 Crawls the web, stores every URL, link and backlink in PostgreSQL. Crawling runs in Celery workers (Redis is the queue);
 `autonomous.py` finds new domains and keeps the queue fed. More detail on the design: [CELERY.md](CELERY.md).
 
+## Common Crawl setup (one command)
+After pulling the branch and installing the Python packages (`pip install -r requirements.txt`), run once:
+```
+python fetch_cc_data.py
+```
+It installs Java 21 if missing, asks for your Kaggle token (https://www.kaggle.com/settings/api) if none is set, downloads the
+cc-webgraph jar and the domain graph (~10 GB, 25 GB free disk needed; rerun to resume after an interruption) and checks a lookup works.
+Afterwards the engine uses it automatically: `GET /backlinks/<domain>` for a domain with no stored backlinks queues a Common Crawl
+lookup, and the engine seeds the linking sites into the crawler. Try a lookup by hand: `python backlinks_cli.py <domain>`.
+
 ## One-time setup (Windows)
 
 1. **PostgreSQL** must be running, with a database (default name `backlinks`).
