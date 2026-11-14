@@ -11,6 +11,7 @@ a backlink only after OUR live fetch of the source page saw it.
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -29,7 +30,14 @@ import crawler_core as core
 import crawler_engine as engine
 
 log = logging.getLogger("crawler.autonomous")
-CC_MAX_SEEDS = int(os.environ.get("CC_MAX_SEEDS", "200"))  # referring domains seeded per looked-up domain
+CC_MAX_SEEDS = int(os.environ.get("CC_MAX_SEEDS", "200"))  # referring domains crawled per looked-up domain
+CC_FOCUS_PAGES = int(os.environ.get("CC_FOCUS_PAGES", "1000"))  # page cap of one focused crawl
+FOCUS_PRIORITY = -1  # domains owned by a focused crawl: claim_urls skips them so the two crawlers never fetch the same URL
+NORMAL_PRIORITY = 5
+
+
+def cc_seed_url(domain: str) -> str:
+    return f"https://{domain}/"  # tests point this at their local http servers
 DEFAULT_FEEDS = ("https://news.ycombinator.com/rss", "https://lobste.rs/rss", "https://hnrss.org/newest")
 
 
@@ -292,7 +300,7 @@ def claim_urls(owner: str, cfg: AutoConfig) -> list[tuple[str, int]]:
             "  LEFT JOIN (SELECT domain, COUNT(*) n FROM discovered_urls WHERE crawl_status IN ('completed','crawling')"
             "   GROUP BY domain) k ON k.domain=u.domain"  # counted once per domain, not once per pending URL
             "  WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?))"
-            "   AND d.discovery_status='admitted' AND u.crawl_depth<=?) t1"
+            "   AND d.discovery_status='admitted' AND d.priority>=0 AND u.crawl_depth<=?) t1"
             "  WHERE rn<=? AND rn+used<=?) t2"  # seeded domains (priority 0) first, at most seed_batch URLs; the rest round-robin
             " ORDER BY CASE WHEN priority=0 AND sr<=? THEN 0 ELSE 1 END, rn, priority, id LIMIT ?) FOR UPDATE SKIP LOCKED)"
             " AND crawl_status IN ('pending','retry_pending') RETURNING url, crawl_depth,"
@@ -470,6 +478,7 @@ class Engine:
         self.recrawl_lock = asyncio.Lock()
         self.tasks: dict[str, asyncio.Task] = {}  # strong references: an unreferenced task can be garbage collected mid-run
         self.specs: dict[str, tuple] = {}
+        self.focus: set[asyncio.Task] = set()  # running focused Common Crawl crawls (strong references, see tasks)
 
     def _status(self, name: str, status: str, error: str | None = None) -> None:
         try:
@@ -569,22 +578,21 @@ class Engine:
         return False
 
     async def cc_lookups(self) -> None:
-        """GET /backlinks/<d> with nothing in the graph leaves cc_lookup:<d>. Ask Common Crawl who links to <d>, seed those
-        domains at top priority (the crawler then finds the linking pages), and record the outcome in cc_done:<d>."""
+        """GET /backlinks/<d> with nothing in the graph leaves cc_lookup:<d>. Ask Common Crawl who links to <d>, then start a focused
+        crawl of just those domains (it finds the linking pages) and record the outcome in cc_done:<d>."""
         with core.connect() as c:
             keys = [r["key"] for r in c.execute("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'")]
         for k in keys:
             dom = k.removeprefix("cc_lookup:")
             log.info(">>> CC-LOOKUP %s: not in our database, asking Common Crawl who links to it ...", dom)
+            seeds: list[str] = []
             try:
                 found = await asyncio.to_thread(cc_lookup.referring_domains, dom)
-                log.info(">>> CC-LOOKUP %s: Common Crawl returned %d referring domain(s); seeding %d at TOP priority, e.g. %s",
-                         dom, len(found or []), min(len(found or []), CC_MAX_SEEDS), (found or [])[:10])
                 # shortcut: first CC_MAX_SEEDS domains in graph order, not ranked; rank by authority when a big domain needs it
                 seeds = (found or [])[:CC_MAX_SEEDS]
-                if seeds:
-                    await seed(seeds, self.cfg)
-                result = f"ok:{len(found or [])}:{len(seeds)}" if found is not None else "not_in_common_crawl"
+                log.info(">>> CC-LOOKUP %s: Common Crawl returned %d referring domain(s); crawling %d of them in a focused crawl, e.g. %s",
+                         dom, len(found or []), len(seeds), seeds[:10])
+                result = "not_in_common_crawl" if found is None else (f"ok:{len(found)}:{len(seeds)}" if seeds else "done:0:0")
             except Exception as e:  # noqa: BLE001 - one bad lookup (no Java/data) must not stop the engine or retry forever
                 log.error("CC lookup for %s failed: %r", dom, e)
                 result = f"error:{e}"[:300]
@@ -592,6 +600,46 @@ class Engine:
             with core.connect() as c:
                 c.execute("INSERT INTO engine_state (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (f"cc_done:{dom}", result))
                 c.execute("DELETE FROM engine_state WHERE key=?", (k,))
+            if seeds:  # its own task: neither the scheduler nor the shared crawl waits for it
+                t = asyncio.create_task(self.focused(dom, seeds), name=f"cc-focus-{dom}")
+                self.focus.add(t)
+                t.add_done_callback(self.focus.discard)
+
+    async def focused(self, target: str, domains: list[str]) -> None:
+        """Crawl only `domains` (the sites Common Crawl says link to `target`), starting at their homepages. The links it finds are stored
+        in the shared graph, so GET /backlinks/<target> shows them as they appear. When it ends, cc_done becomes done:<pages>:<links>."""
+        only = {core.registrable_domain(d) for d in domains}
+        # shortcut: no sitemap discovery here: saving up to 5000 sitemap URLs per domain one by one takes ~20 min each over a slow database link;
+        # pages are reached by following links from the homepage (depth 3), so a page listed only in a sitemap can be missed
+        cfg = dataclasses.replace(self.cfg.crawl, max_pages=CC_FOCUS_PAGES, enable_sitemap_discovery=False,
+                                  enable_external_domain_discovery=False, target_domain=None)
+        reg = core.registrable_domain(target)
+
+        def owned(priority: int) -> None:
+            with core.connect() as c:
+                for d in only:
+                    c.execute("INSERT INTO discovered_domains (domain, discovery_source, priority) VALUES (?, 'common_crawl', ?)"
+                              " ON CONFLICT (domain) DO UPDATE SET priority=?", (d, priority, priority))
+        pages = links = 0
+        try:
+            await asyncio.to_thread(owned, FOCUS_PRIORITY)  # before admission, so the shared crawl never sees these URLs
+            log.info(">>> CC-FOCUS %s: crawling %d domain(s) on their own (max %d pages)", target, len(only), CC_FOCUS_PAGES)
+            await engine.run_crawl(cfg, [cc_seed_url(d) for d in sorted(only)], None, only=only)
+        except Exception:  # noqa: BLE001
+            log.exception(">>> CC-FOCUS %s: crawl failed", target)
+        finally:
+            def finish() -> tuple[int, int]:
+                with core.connect() as c:
+                    ph = ",".join("?" * len(only))
+                    n = c.execute(f"SELECT COUNT(*) FROM discovered_urls WHERE crawl_status='completed' AND domain IN ({ph})", tuple(only)).fetchone()[0]
+                    m = c.execute(f"SELECT COUNT(DISTINCT source_url) FROM outgoing_links WHERE destination_domain=? AND source_domain IN ({ph})",
+                                  (reg, *only)).fetchone()[0]
+                    c.execute(f"UPDATE discovered_domains SET priority=? WHERE priority=? AND domain IN ({ph})", (NORMAL_PRIORITY, FOCUS_PRIORITY, *only))
+                    c.execute("INSERT INTO engine_state (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                              (f"cc_done:{target}", f"done:{n}:{m}"))
+                return n, m
+            pages, links = finish()  # blocking on purpose: must also run when the task is cancelled at shutdown
+            log.info(">>> CC-FOCUS %s: finished | %d page(s) crawled on %d domain(s) | %d linking page(s) to %s found", target, pages, len(only), links, reg)
 
     async def scheduler(self) -> bool:
         await self.cc_lookups()
@@ -640,6 +688,8 @@ class Engine:
     async def run(self) -> None:
         with core.connect() as c:
             core.migrate(c)  # also resets URLs a dead process left 'crawling'/'recrawling'
+            c.execute("UPDATE discovered_domains SET priority=? WHERE priority=?", (NORMAL_PRIORITY, FOCUS_PRIORITY))  # a focused crawl died with the old process
+            c.execute("DELETE FROM engine_state WHERE key LIKE 'cc_done:%' AND value LIKE 'ok:%'")  # ...so the next request re-runs its lookup
         with core.connect() as c:
             n = {k: c.execute(q).fetchone()[0] for k, q in (
                 ("crawled", "SELECT COUNT(*) FROM discovered_urls WHERE crawl_status='completed'"),

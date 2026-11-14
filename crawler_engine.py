@@ -721,8 +721,9 @@ def _approved() -> set[str]:
         return {r["domain"] for r in c.execute("SELECT domain FROM discovered_domains WHERE discovery_status='admitted'")}
 
 
-async def run_crawl(cfg: Config, source_urls: list[str], job_id: str | None = None) -> None:
-    """Seed -> crawl approved domains -> admit new external domains (bounded) -> repeat. Resumes from SQLite."""
+async def run_crawl(cfg: Config, source_urls: list[str], job_id: str | None = None, only: set[str] | None = None) -> None:
+    """Seed -> crawl approved domains -> admit new external domains (bounded) -> repeat. Resumes from SQLite.
+    `only`: crawl just these domains instead of every admitted one (a focused crawl that leaves the global backlog alone)."""
     with core.connect() as c:
         if cfg.target_domain:
             core.add_target(c, cfg.target_domain)
@@ -733,7 +734,7 @@ async def run_crawl(cfg: Config, source_urls: list[str], job_id: str | None = No
             await admit_domain(cfg, job_id, core.registrable_domain(core.hostname(u)), u)
     done = 0
     while done < cfg.max_pages:
-        approved = _approved()
+        approved = set(only) if only is not None else _approved()
         work = _pending(cfg, approved, cfg.max_pages - done)
         if work:
             with core.connect() as c:

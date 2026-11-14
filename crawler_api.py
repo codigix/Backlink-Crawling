@@ -109,7 +109,8 @@ def backlinks(target_domain: str, include_removed: bool = False, limit: int = Qu
         return {"domain": target, "target_domain": target, "total_backlinks": 0, "referring_domains": 0, "total_referring_domains": 0,
                 "status": "discovering" if crawling else "not_found_in_current_index",
                 "message": "Discovery started: Common Crawl lookup and crawl in progress, check again shortly." if crawling
-                else f"No backlinks found ({state}).", "backlinks": []}
+                else (f"Common Crawl's referring sites were crawled ({state.split(':')[1]} pages) and no link to this domain was found."
+                      if state.startswith("done:") and state != "done:0:0" else f"No backlinks found ({state})."), "backlinks": []}
     return {
         "domain": target, "target_domain": target, "status": "ok", "total_backlinks": total, "verified_backlinks": active,
         "referring_domains": refs, "total_referring_domains": refs, "limit": limit, "offset": offset,

@@ -64,19 +64,46 @@ def test_autonomous_pipeline_and_database_first_search(env, monkeypatch):
     assert rows("SELECT COUNT(*) n FROM target_domains")[0]["n"] == 0  # ...and never registers anything
 
 
-def test_cc_lookup_seeds_referrers_and_reports_done(env, monkeypatch):
-    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: ["src1.localhost", "src2.localhost"])
+def test_cc_lookup_runs_a_focused_crawl_and_reports_done(env, monkeypatch):
+    u = env
+    SITES["src1.localhost"] = {"/": page(a("/p2"), a("https://target-x.org/", "Target X"))}
+    SITES["src1.localhost"]["/p2"] = page(a("https://target-x.org/deep", "Deep"))
+    SITES["src2.localhost"] = {"/": page(a("https://example.com/", "Other"))}
+    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: [u("src1").split("//")[1].split(":")[0], u("src2").split("//")[1].split(":")[0]])
+    monkeypatch.setattr(autonomous, "cc_seed_url", lambda d: u(d.split(".")[0]))  # local test sites speak http on a port
     eng = autonomous.Engine(acfg())
+    # a busy shared crawler: this domain is admitted, with work waiting, but it is not part of the focused crawl
+    with core.connect() as c:
+        c.execute("INSERT INTO discovered_domains (domain, discovery_status, priority) VALUES ('other.localhost', 'admitted', 5)")
+        core.save_url(c, "http://other.localhost/x", None, "t", 0, True)
     assert bl("target-x.org")["status"] == "discovering"
+
+    async def go():
+        await eng.cc_lookups()
+        assert rows("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'") == []  # request consumed
+        assert rows("SELECT value FROM engine_state WHERE key='cc_done:target-x.org'")[0]["value"] == "ok:2:2"
+        await asyncio.sleep(0.2)  # the focused crawl has started: its domains are hidden from the shared crawler
+        assert {r["priority"] for r in rows("SELECT priority FROM discovered_domains WHERE domain LIKE 'src%'")} <= {autonomous.FOCUS_PRIORITY}
+        claimed = {url for url, _ in autonomous.claim_urls("w", eng.cfg)}
+        assert not any("src" in c for c in claimed)  # shared crawler leaves focus-owned domains alone
+        autonomous.release("w")
+        await asyncio.gather(*eng.focus)
+    asyncio.run(go())
+    done = rows("SELECT value FROM engine_state WHERE key='cc_done:target-x.org'")[0]["value"]
+    assert done.startswith("done:") and not done.endswith(":0")  # finished, with the linking pages counted
+    r = bl("target-x.org")
+    assert r["status"] == "ok" and r["total_backlinks"] == 2 and r["referring_domains"] == 1  # both links found by the focused crawl
+    assert rows("SELECT priority FROM discovered_domains WHERE domain='src1.localhost'")[0]["priority"] == autonomous.NORMAL_PRIORITY  # handed back
+    assert rows("SELECT crawl_status FROM discovered_urls WHERE url LIKE '%other.localhost%'")[0]["crawl_status"] == "pending"  # backlog untouched
+
+    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: [])  # in the graph, nobody links to it
+    bl("lonely-y.org")
     asyncio.run(eng.cc_lookups())
-    assert rows("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'") == []  # request consumed
-    assert rows("SELECT value FROM engine_state WHERE key='cc_done:target-x.org'")[0]["value"] == "ok:2:2"
-    assert {r["domain"] for r in rows("SELECT domain FROM discovered_domains WHERE priority=0")} == {"src1.localhost", "src2.localhost"}
-    assert bl("target-x.org")["status"] == "discovering"  # sources seeded, crawler still on them
-    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: None)
+    assert bl("lonely-y.org")["status"] == "not_found_in_current_index"  # final answer, not "discovering" forever
+    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: None)  # Common Crawl has never heard of it
     bl("other-y.org")
     asyncio.run(eng.cc_lookups())
-    assert bl("other-y.org")["status"] == "not_found_in_current_index"  # CC has never heard of it: final answer
+    assert bl("other-y.org")["status"] == "not_found_in_current_index"
 
 
 def test_lost_backlink_shows_in_history(env, monkeypatch):
