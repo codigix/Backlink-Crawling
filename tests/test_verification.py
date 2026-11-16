@@ -105,7 +105,7 @@ def test_five_workers_end_to_end(env, monkeypatch):
             pass
         return alive, recrawled
     alive, recrawled = asyncio.run(go())
-    assert set(alive) == {"discovery", "scheduler", "crawler", "indexer", "verifier"} and all(alive.values())
+    assert set(alive) == {"discovery", "scheduler", "crawler", "indexer", "verifier", "lookups", "business"} and all(alive.values())
     assert recrawled == 1
     by = {r["url"].rsplit("/", 1)[-1] or "root": r for r in rows("SELECT * FROM discovered_urls WHERE domain='a.localhost'")}
     assert by["services"]["crawl_status"] == "completed" and by["x"]["crawl_status"] == "skipped" and by["x"]["skip_reason"] == "robots_txt"

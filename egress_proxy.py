@@ -42,6 +42,15 @@ async def resolve(host: str) -> list[str]:  # one lookup per TTL; tests replace 
     return addrs
 
 
+def _close(w: asyncio.StreamWriter) -> None:
+    """Close a stream; at process shutdown the proxy's loop is already closed and close() raises, which only floods the log."""
+    try:
+        w.close()
+    except RuntimeError as e:
+        if "closed" not in str(e):
+            raise
+
+
 async def _pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
     try:
         while data := await r.read(65536):
@@ -50,7 +59,7 @@ async def _pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
     except (ConnectionError, OSError):
         pass
     finally:
-        w.close()
+        _close(w)
 
 
 async def _deny(w: asyncio.StreamWriter, code: int, why: str) -> None:
@@ -101,9 +110,9 @@ async def _handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ValueError, ConnectionError, OSError):
         pass
     finally:
-        w.close()
+        _close(w)
         if up:
-            up.close()
+            _close(up)
 
 
 def _listening(url: str) -> bool:

@@ -52,6 +52,8 @@ def _dispatch() -> int:
         avail = c.execute("SELECT COUNT(*) n FROM (SELECT 1 FROM discovered_urls u JOIN discovered_domains d ON d.domain=u.domain"
                           " WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?))"
                           " AND d.discovery_status='admitted' LIMIT 1000) t", (core.now(),)).fetchone()["n"]
+        avail += c.execute("SELECT COUNT(*) n FROM (SELECT 1 FROM job_urls ju JOIN business_jobs j ON j.id=ju.job_id AND j.status='crawling'"
+                           " JOIN discovered_urls u ON u.id=ju.url_id WHERE u.crawl_status='pending' LIMIT 1000) t").fetchone()["n"]
     queued = queue_length()
     n = min(max(0, MAX_QUEUED - queued), -(-avail // autonomous.AutoConfig().claim_batch))
     for _ in range(n):
@@ -70,7 +72,7 @@ def crawl_batch(self) -> int:
     cfg.lease_seconds = TASK_TIME_LIMIT  # a lease outlives its task only if the worker died
     work = []
     try:
-        work = autonomous.claim_urls(owner, cfg)
+        work = autonomous.claim_work(owner, cfg)  # business onboarding first, then autonomous within the reserved-capacity rules
         if work:
             # The pool may not enforce time limits (Windows solo), so enforce the soft limit here, on every platform.
             asyncio.run(asyncio.wait_for(autonomous.with_lease(  # lease renewal: a slow batch keeps its URLs

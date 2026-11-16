@@ -1,4 +1,4 @@
-"""Scenario tests for the hardening work: large sites, HTTP failures, SSRF on every hop, JavaScript rendering, Common Crawl
+"""Scenario tests for the hardening work: large sites, HTTP failures, SSRF on every hop, JavaScript rendering,
 paging, backlink history, concurrent persistence, API consistency. Real PostgreSQL (isolated schema per test), local test server."""
 
 import asyncio
@@ -175,64 +175,6 @@ def test_needs_js_heuristic():
     assert engine.needs_js(soup("<body><noscript>Please enable JavaScript</noscript></body>"))
     assert not engine.needs_js(soup("<body><a href='/a'>1</a><a href='/b'>2</a><a href='/c'>3</a></body>"))
     assert not engine.needs_js(soup("<body><p>" + "text " * 200 + "</p></body>"))
-
-
-# ---- 21: Common Crawl paging, index id, rediscovery ----
-def cc_transport(pages=3, index="CC-MAIN-2026-01", log=None):
-    def handler(req: httpx.Request) -> httpx.Response:
-        q = dict(req.url.params)
-        if str(req.url).endswith("collinfo.json"):
-            return httpx.Response(200, json=[{"id": index, "cdx-api": "https://cc.test/idx"}])
-        log is not None and log.append(q)
-        if "showNumPages" in q:
-            return httpx.Response(200, text=json.dumps({"pages": pages, "pageSize": 5, "blocks": 9}))
-        return httpx.Response(200, text="".join(json.dumps({"url": f"https://site.org/p{q['page']}-{i}"}) + "\n" for i in range(2)))
-    return httpx.MockTransport(handler)
-
-
-def run_cc(transport, cfg_):
-    async def go():
-        async with httpx.AsyncClient(transport=transport) as cl:
-            return await autonomous.run_source("commoncrawl", cfg_, cl, force=True)
-    return asyncio.run(go())
-
-
-def test_commoncrawl_pages_resume_complete_and_rediscover_on_new_index(env):
-    with core.connect() as c:
-        c.execute("INSERT INTO discovered_domains (domain, discovery_status) VALUES ('site.org','crawled')")  # retired domains are included
-    cfg_ = autonomous.AutoConfig(sources=("commoncrawl",), cc_delay=0, cc_pages_per_run=2)
-    log = []
-    assert run_cc(cc_transport(log=log), cfg_) == 4  # probe + pages 0,1
-    job = rows("SELECT * FROM discovery_jobs")[0]
-    assert (job["status"], job["page_cursor"], job["total_pages"], job["index_id"]) == ("pending", 2, 3, "CC-MAIN-2026-01")
-    assert run_cc(cc_transport(log=log), cfg_) == 2  # page 2 -> done
-    job = rows("SELECT * FROM discovery_jobs")[0]
-    assert (job["status"], job["page_cursor"]) == ("completed", 3) and job["last_error"] is None
-    assert [q["page"] for q in log if "page" in q] == ["0", "1", "2"]  # each page fetched exactly once
-    assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE discovery_method='commoncrawl' AND crawl_status='pending'")[0]["n"] == 6
-    assert rows("SELECT COUNT(*) n FROM backlinks")[0]["n"] == 0 and rows("SELECT COUNT(*) n FROM outgoing_links")[0]["n"] == 0  # URLs only, never backlinks
-    assert run_cc(cc_transport(), cfg_) == 0  # same index: nothing to do (and no duplicate job)
-    assert len(rows("SELECT * FROM discovery_jobs")) == 1
-    cfg_._cc_api = (0, None, None)  # cache expired; a newer index is published
-    run_cc(cc_transport(index="CC-MAIN-2026-05"), cfg_)  # job reset to pending ...
-    assert run_cc(cc_transport(index="CC-MAIN-2026-05"), cfg_) >= 0  # ... and worked again
-    assert rows("SELECT index_id FROM discovery_jobs")[0]["index_id"] == "CC-MAIN-2026-05"
-
-
-def test_commoncrawl_failed_job_gets_a_fresh_start_later_and_keeps_its_error(env):
-    with core.connect() as c:
-        c.execute("INSERT INTO discovered_domains (domain, discovery_status) VALUES ('site.org','admitted')")
-        c.execute("INSERT INTO discovery_jobs (domain_id, source, status, attempts, last_error, updated_at) VALUES (1,'commoncrawl','failed',9,'HTTP 500','2000-01-01 00:00:00')")
-    run_cc(cc_transport(pages=1), autonomous.AutoConfig(sources=("commoncrawl",), cc_delay=0))
-    job = rows("SELECT * FROM discovery_jobs")[0]
-    assert job["status"] == "completed" and job["attempts"] >= 1
-
-
-def test_admission_creates_the_commoncrawl_job(env):
-    assert asyncio.run(engine.admit_domain(cfg(enable_sitemap_discovery=False), None, "a.localhost", "http://a.localhost/"))
-    assert rows("SELECT source, status FROM discovery_jobs") == [{"source": "commoncrawl", "status": "pending"}]
-    asyncio.run(engine.admit_domain(cfg(enable_sitemap_discovery=False), None, "a.localhost", "http://a.localhost/"))
-    assert len(rows("SELECT * FROM discovery_jobs")) == 1  # no duplicate job on re-admission
 
 
 # ---- 15-17: repeated removal / reappearance keeps every event ----

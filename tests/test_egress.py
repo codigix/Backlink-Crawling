@@ -89,3 +89,14 @@ def test_proxy_restarts_when_its_thread_dies():
     assert not egress_proxy._thread.is_alive()
     second = egress_proxy.ensure()
     assert second != first and egress_proxy._listening(second)
+
+
+def test_closing_a_stream_after_the_loop_is_closed_is_silent_but_other_errors_are_not():
+    import egress_proxy
+
+    class W:
+        def __init__(self, err): self.err = err
+        def close(self): raise self.err
+    egress_proxy._close(W(RuntimeError("Event loop is closed")))  # process shutdown: no "Exception ignored" flood
+    with pytest.raises(RuntimeError):
+        egress_proxy._close(W(RuntimeError("something else")))

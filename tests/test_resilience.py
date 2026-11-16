@@ -1,5 +1,5 @@
-"""Regression tests for the long-running failures: recrawl starvation/state corruption, supervisor crashes, Common Crawl
-job queue, rolling admission, shutdown. Network is mocked; the local test server comes from test_crawler."""
+"""Regression tests for the long-running failures: recrawl starvation/state corruption, supervisor crashes, rolling admission, shutdown.
+Network is mocked; the local test server comes from test_crawler."""
 
 import asyncio
 import httpx
@@ -100,7 +100,10 @@ def test_forward_crawl_progresses_during_recrawl(env, monkeypatch):
 
     async def go():
         slow = asyncio.create_task(eng.verifier())
-        await asyncio.sleep(0.1)
+        for _ in range(100):  # the verifier first asks the DB whether business work waits (a round trip), then takes the lock
+            if eng.recrawl_lock.locked():
+                break
+            await asyncio.sleep(0.1)
         assert eng.recrawl_lock.locked()
         assert await asyncio.wait_for(eng.crawler(), 5)  # not queued behind the recrawl
         release_recrawl.set()
@@ -203,7 +206,10 @@ def test_shutdown_keeps_unfinished_work_recoverable(env, monkeypatch):
 
     async def go():
         t = asyncio.create_task(eng.run())
-        await asyncio.sleep(1.5)
+        for _ in range(100):
+            await asyncio.sleep(0.1)
+            if rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status IN ('crawling','recrawling')")[0]["n"] == 4:
+                break
         assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status IN ('crawling','recrawling')")[0]["n"] == 4
         t.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -211,106 +217,6 @@ def test_shutdown_keeps_unfinished_work_recoverable(env, monkeypatch):
     asyncio.run(go())
     st = {r["crawl_status"]: r["n"] for r in rows("SELECT crawl_status, COUNT(*) n FROM discovered_urls GROUP BY 1")}
     assert st == {"pending": 2, "completed": 2}  # nothing lost, nothing falsely finished, no leases left
-
-
-# ---- Common Crawl job queue ----
-def cc_run(handler, cfg=None):
-    cfg = cfg or autonomous.AutoConfig(sources=("commoncrawl",), cc_delay=0)
-
-    async def go():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as cl:
-            return await autonomous.run_source("commoncrawl", cfg, cl, force=True)
-    return asyncio.run(go())
-
-
-def cc_handler(code, text="", headers=None):
-    def h(req):
-        if req.url.path.endswith("collinfo.json"):
-            return httpx.Response(200, json=[{"cdx-api": "https://cc.test/idx"}])
-        return httpx.Response(code, text=text, headers=headers or {})
-    return h
-
-
-def add_admitted(domain, id_):
-    with core.connect() as c:
-        c.execute("INSERT INTO discovered_domains (id, domain, discovery_status) VALUES (?,?,'admitted')", (id_, domain))
-        c.execute("SELECT setval(pg_get_serial_sequence('discovered_domains','id'), (SELECT MAX(id) FROM discovered_domains))")  # explicit id: keep the sequence ahead
-
-
-def job():
-    return rows("SELECT * FROM discovery_jobs")[0]
-
-
-@pytest.mark.parametrize("code", [500, 502, 503, 504])
-def test_cc_server_errors_retry(env, code):
-    add_admitted("site.org", 1)
-    cc_run(cc_handler(code))
-    j = job()
-    assert (j["status"], j["attempts"]) == ("retry_pending", 1) and j["next_retry_at"] > core.now() and str(code) in j["last_error"]
-
-
-def test_cc_zero_results_completes_and_404_is_not_retried(env):
-    add_admitted("site.org", 1)
-    assert cc_run(cc_handler(200, "")) == 0 and job()["status"] == "completed"
-    with core.connect() as c:
-        c.execute("DELETE FROM discovery_jobs")
-    cc_run(cc_handler(404, "No Captures found"))
-    assert job()["status"] == "completed"
-    cc_run(cc_handler(200, ""))  # a completed job is never queried again
-    assert job()["attempts"] == 1
-
-
-def test_cc_429_honors_retry_after_and_400_fails_permanently(env):
-    add_admitted("site.org", 1)
-    add_admitted("two.org", 2)
-    cc_run(cc_handler(429, "", {"Retry-After": "7200"}))
-    first, second = rows("SELECT * FROM discovery_jobs ORDER BY id")
-    assert first["status"] == "retry_pending" and first["next_retry_at"] > core.later(seconds=5000)
-    assert (second["status"], second["attempts"]) == ("pending", 0)  # slowed down: the rest were handed back untouched
-    with core.connect() as c:
-        c.execute("DELETE FROM discovery_jobs")
-    cc_run(cc_handler(400, "bad"))
-    assert {r["status"] for r in rows("SELECT * FROM discovery_jobs")} == {"failed"}
-
-
-def test_cc_retries_stop_after_the_last_delay(env):
-    add_admitted("site.org", 1)
-    with core.connect() as c:
-        c.execute("INSERT INTO discovery_jobs (domain_id, source, attempts) VALUES (1,'commoncrawl',?)", (len(autonomous.RETRY_DELAYS),))
-    cc_run(cc_handler(504))
-    assert job()["status"] == "failed" and "504" in job()["last_error"]  # kept with its error, not silently dropped
-
-
-def test_cc_lower_id_domain_admitted_later_still_gets_queried(env):
-    add_admitted("late-high.org", 300)
-    cc_run(cc_handler(200, '{"url": "https://late-high.org/a"}\n'))
-    add_admitted("late-low.org", 50)  # an id far below everything processed so far (the old cursor skipped it forever)
-    assert cc_run(cc_handler(200, '{"url": "https://late-low.org/a"}\n')) == 1
-    assert {r["status"] for r in rows("SELECT * FROM discovery_jobs")} == {"completed"} and len(rows("SELECT * FROM discovery_jobs")) == 2
-
-
-def test_cc_expired_processing_job_recovers_and_failure_does_not_stop_other_sources(env):
-    add_admitted("site.org", 1)
-    with core.connect() as c:
-        c.execute("INSERT INTO discovery_jobs (domain_id, source, status, updated_at) VALUES (1,'commoncrawl','processing',?)", (PAST,))
-    cc_run(cc_handler(200, ""))
-    assert job()["status"] == "completed"
-
-    async def feed(client, cfg, cursor):
-        return [("https://blog.example.org/p", None, 0)], cursor
-    boom = cc_handler(500)
-    cfg = autonomous.AutoConfig(sources=("commoncrawl", "feeds"), cc_delay=0)
-    add_admitted("two.org", 2)
-
-    async def go():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(boom)) as cl:
-            old = autonomous.SOURCES
-            autonomous.SOURCES = {**old, "feeds": feed}
-            try:
-                return [await autonomous.run_source(n, cfg, cl, force=True) for n in ("commoncrawl", "feeds")]
-            finally:
-                autonomous.SOURCES = old
-    assert asyncio.run(go()) == [0, 1]
 
 
 # ---- rolling admission ----

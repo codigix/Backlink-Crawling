@@ -389,6 +389,50 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_backlinks_source ON backlinks(source_url)",
         "CREATE INDEX IF NOT EXISTS idx_discovered_lease ON discovered_urls(lease_owner) WHERE lease_owner IS NOT NULL",
     ]),
+    # 3 and 4 are taken by the 2-common_crawl branch in databases migrated from it: never reuse a version number across branches
+    (5, "business onboarding jobs, per-job URL association and depth, lease fencing token", [
+        # one row per onboarded business; the partial unique index makes a second onboarding of the same domain idempotent
+        "CREATE TABLE IF NOT EXISTS business_jobs (id BIGSERIAL PRIMARY KEY, target_domain TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,"
+        " status TEXT NOT NULL DEFAULT 'pending', max_depth INTEGER NOT NULL, max_pages INTEGER NOT NULL, search_results INTEGER NOT NULL DEFAULT 0,"
+        " pages_discovered INTEGER NOT NULL DEFAULT 0, pages_crawled INTEGER NOT NULL DEFAULT 0, pages_failed INTEGER NOT NULL DEFAULT 0,"
+        " backlinks_found INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT, last_error TEXT,"
+        " created_at TEXT DEFAULT " + TS + ", updated_at TEXT DEFAULT " + TS + ", finished_at TEXT)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_business_jobs_active ON business_jobs(target_domain) WHERE status IN ('pending','searching','crawling')",
+        "CREATE INDEX IF NOT EXISTS idx_business_jobs_status ON business_jobs(status, priority, id)",
+        # a URL may belong to many jobs; depth is per association, never a property of the shared URL row
+        "CREATE TABLE IF NOT EXISTS job_urls (job_id BIGINT NOT NULL REFERENCES business_jobs(id) ON DELETE CASCADE,"
+        " url_id BIGINT NOT NULL REFERENCES discovered_urls(id) ON DELETE CASCADE, depth INTEGER NOT NULL, expanded INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (job_id, url_id))",
+        "CREATE INDEX IF NOT EXISTS idx_job_urls_url ON job_urls(url_id)",
+        "ALTER TABLE discovered_urls ADD COLUMN IF NOT EXISTS lease_gen INTEGER NOT NULL DEFAULT 0",  # bumped by every claim: the fencing token
+    ]),
+    (6, "per-business recurring discovery schedule, run provenance", [
+        # one row per onboarded business; the engine turns a due next_run_at into a (P2) business_jobs row
+        "CREATE TABLE IF NOT EXISTS businesses (domain TEXT PRIMARY KEY, business_name TEXT, search_interval_seconds INTEGER NOT NULL,"
+        " active INTEGER NOT NULL DEFAULT 1, next_run_at TEXT NOT NULL, last_run_at TEXT, last_success_at TEXT, created_at TEXT DEFAULT " + TS + ")",
+        "CREATE INDEX IF NOT EXISTS idx_businesses_due ON businesses(next_run_at) WHERE active=1",
+        "ALTER TABLE business_jobs ADD COLUMN IF NOT EXISTS duplicate_candidates INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE business_jobs ADD COLUMN IF NOT EXISTS started_at TEXT",
+    ]),
+    (7, "competitors: owner relation and target classification", [
+        "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS target_type TEXT NOT NULL DEFAULT 'own_business'",  # own_business | competitor
+        "CREATE TABLE IF NOT EXISTS business_competitors (id BIGSERIAL PRIMARY KEY, business_domain TEXT NOT NULL, competitor_domain TEXT NOT NULL,"
+        " competitor_name TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT " + TS + ", updated_at TEXT DEFAULT " + TS + ","
+        " UNIQUE (business_domain, competitor_domain))",
+        "CREATE INDEX IF NOT EXISTS idx_business_competitors_target ON business_competitors(competitor_domain)",
+    ]),
+    (8, "worker_status: cycle outcomes (completed / completed_with_errors / failed / skipped)", [
+        # last_success_at keeps meaning "a cycle with NO failed operation"; these say what the other cycles were
+        "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS last_cycle_at TEXT",
+        "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS last_cycle_status TEXT",
+        "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS last_partial_at TEXT",
+        "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS last_failed_at TEXT",
+        "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS last_cycle_detail TEXT",
+    ]),
+    (9, "business_jobs.search_gen: fencing token of a DuckDuckGo search", [
+        # bumped by every claim of the search phase: a result from a search that was reset/re-claimed meanwhile (engine restart, second engine) is discarded
+        "ALTER TABLE business_jobs ADD COLUMN IF NOT EXISTS search_gen INTEGER NOT NULL DEFAULT 0",
+    ]),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 

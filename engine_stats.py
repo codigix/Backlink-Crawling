@@ -28,7 +28,6 @@ def metrics() -> dict:
             "recrawl_backlog": one("SELECT COUNT(*) FROM discovered_urls WHERE crawl_status='completed' AND next_crawl_at<=?", core.now()),
             "repeat_fetches": one("SELECT COUNT(*)-COUNT(DISTINCT source_url) FROM crawl_history"),
             "backlinks": by("SELECT link_status, COUNT(*) FROM backlinks GROUP BY 1"),
-            "cc_jobs": by("SELECT status, COUNT(*) FROM discovery_jobs WHERE source='commoncrawl' GROUP BY 1"),
             "pages_per_min": one("SELECT COUNT(*) FROM crawl_history WHERE crawl_completed>=? AND error_message IS NULL", minute),
             "urls_discovered_per_min": one("SELECT COUNT(*) FROM discovered_urls WHERE first_seen>=?", minute),
             "workers": {r["name"]: [r["status"], r["last_heartbeat_at"], r["restart_count"]] for r in c.execute("SELECT * FROM worker_status")},

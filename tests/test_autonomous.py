@@ -57,53 +57,51 @@ def test_autonomous_pipeline_and_database_first_search(env, monkeypatch):
     assert {b["source_domain"] for b in r["backlinks"]} == {"a.localhost", "b.localhost"}
     assert crawler_api.referring_domains("codigix.co")["total_referring_domains"] == 2
     assert {x["anchor_text"]: x["count"] for x in crawler_api.backlink_anchors("codigix.co")["anchors"]}["Codigix"] == 2
+    assert bl("never-seen.org")["status"] == "not_started" and not rows("SELECT * FROM business_jobs")  # a GET never starts discovery
+    crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="never-seen.org"))
     miss = bl("never-seen.org")
-    assert miss["status"] == "discovering" and miss["total_backlinks"] == 0  # queued for the engine's Common Crawl lookup
-    assert rows("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'") == [{"key": "cc_lookup:never-seen.org"}]
+    assert miss["status"] == "discovering" and miss["total_backlinks"] == 0  # onboarded: the engine searches DuckDuckGo for it
+    assert [(r["target_domain"], r["status"]) for r in rows("SELECT * FROM business_jobs")] == [("never-seen.org", "pending")]
     assert rows("SELECT COUNT(*) n FROM crawl_history")[0]["n"] == before  # a search never crawls
     assert rows("SELECT COUNT(*) n FROM target_domains")[0]["n"] == 0  # ...and never registers anything
 
 
-def test_cc_lookup_runs_a_focused_crawl_and_reports_done(env, monkeypatch):
+def test_lookup_job_crawls_search_results_and_reports_done(env, monkeypatch):
     u = env
     SITES["src1.localhost"] = {"/": page(a("/p2"), a("https://target-x.org/", "Target X"))}
     SITES["src1.localhost"]["/p2"] = page(a("https://target-x.org/deep", "Deep"))
     SITES["src2.localhost"] = {"/": page(a("https://example.com/", "Other"))}
-    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: [u("src1").split("//")[1].split(":")[0], u("src2").split("//")[1].split(":")[0]])
-    monkeypatch.setattr(autonomous, "cc_seed_url", lambda d: u(d.split(".")[0]))  # local test sites speak http on a port
-    eng = autonomous.Engine(acfg())
-    # a busy shared crawler: this domain is admitted, with work waiting, but it is not part of the focused crawl
-    with core.connect() as c:
+    monkeypatch.setattr(autonomous.ddg_lookup, "search_urls", lambda d, n, **_: [u("src1"), u("src2")])  # local test sites speak http on a port
+    cfg = acfg(claim_batch=10)
+    with core.connect() as c:  # a busy shared crawler: admitted domain with work waiting, which the business job must not disturb
         c.execute("INSERT INTO discovered_domains (domain, discovery_status, priority) VALUES ('other.localhost', 'admitted', 5)")
         core.save_url(c, "http://other.localhost/x", None, "t", 0, True)
+    crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="target-x.org"))
     assert bl("target-x.org")["status"] == "discovering"
 
     async def go():
-        await eng.cc_lookups()
-        assert rows("SELECT key FROM engine_state WHERE key LIKE 'cc_lookup:%'") == []  # request consumed
-        assert rows("SELECT value FROM engine_state WHERE key='cc_done:target-x.org'")[0]["value"] == "ok:2:2"
-        await asyncio.sleep(0.2)  # the focused crawl has started: its domains are hidden from the shared crawler
-        assert {r["priority"] for r in rows("SELECT priority FROM discovered_domains WHERE domain LIKE 'src%'")} <= {autonomous.FOCUS_PRIORITY}
-        claimed = {url for url, _ in autonomous.claim_urls("w", eng.cfg)}
-        assert not any("src" in c for c in claimed)  # shared crawler leaves focus-owned domains alone
-        autonomous.release("w")
-        await asyncio.gather(*eng.focus)
+        eng = autonomous.Engine(cfg)
+        for _ in range(8):
+            await eng.lookups()
+            await eng.business()
+            if rows("SELECT 1 FROM business_jobs WHERE status<>'done'") == []:
+                break  # job finished: from here autonomous crawling legitimately takes the capacity, so the backlog assertion below is about the job's lifetime
+            work = autonomous.claim_work("w", cfg)
+            if work:
+                await engine.crawl_round(cfg.crawl, None, work, set(), False, len(work))
+            autonomous.release("w")
     asyncio.run(go())
-    done = rows("SELECT value FROM engine_state WHERE key='cc_done:target-x.org'")[0]["value"]
-    assert done.startswith("done:") and not done.endswith(":0")  # finished, with the linking pages counted
+    job = rows("SELECT * FROM business_jobs")[0]
+    assert job["status"] == "done" and job["pages_crawled"] >= 3 and job["backlinks_found"] == 2
     r = bl("target-x.org")
-    assert r["status"] == "ok" and r["total_backlinks"] == 2 and r["referring_domains"] == 1  # both links found by the focused crawl
-    assert rows("SELECT priority FROM discovered_domains WHERE domain='src1.localhost'")[0]["priority"] == autonomous.NORMAL_PRIORITY  # handed back
+    assert r["status"] == "ok" and r["total_backlinks"] == 2 and r["referring_domains"] == 1  # both links found by the job's crawl
     assert rows("SELECT crawl_status FROM discovered_urls WHERE url LIKE '%other.localhost%'")[0]["crawl_status"] == "pending"  # backlog untouched
 
-    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: [])  # in the graph, nobody links to it
-    bl("lonely-y.org")
-    asyncio.run(eng.cc_lookups())
-    assert bl("lonely-y.org")["status"] == "not_found_in_current_index"  # final answer, not "discovering" forever
-    monkeypatch.setattr(autonomous.cc_lookup, "referring_domains", lambda d: None)  # Common Crawl has never heard of it
-    bl("other-y.org")
-    asyncio.run(eng.cc_lookups())
-    assert bl("other-y.org")["status"] == "not_found_in_current_index"
+    monkeypatch.setattr(autonomous.ddg_lookup, "search_urls", lambda d, n, **_: [])  # the search found nothing
+    crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="lonely-y.org"))
+    asyncio.run(autonomous.Engine(cfg).lookups())
+    asyncio.run(autonomous.Engine(cfg).business())
+    assert bl("lonely-y.org")["status"] == "completed_no_results"  # final answer, not "discovering" forever
 
 
 def test_lost_backlink_shows_in_history(env, monkeypatch):
@@ -112,7 +110,13 @@ def test_lost_backlink_shows_in_history(env, monkeypatch):
     use_source(monkeypatch, lambda: [(u("a"), 1, 0)])
     cfg = acfg(max_admitted=1)
     asyncio.run(autonomous.bootstrap(cfg))
-    cycle(autonomous.Engine(cfg), 1)
+    eng = autonomous.Engine(cfg)
+    for _ in range(6):  # one pass is not guaranteed to finish the first fetch (retry/timeout on a loaded machine): wait for it, never assume it
+        cycle(eng, 1)
+        if rows("SELECT 1 FROM discovered_urls WHERE url=? AND crawl_status='completed'", u("a")):
+            break
+    st = rows("SELECT crawl_status, crawl_error FROM discovered_urls WHERE url=?", u("a"))
+    assert st and st[0]["crawl_status"] == "completed", f"the first crawl never completed (precondition, not the behaviour under test): {st}"
     SITES["a.localhost"] = {"/": page()}
     asyncio.run(engine.recrawl_due(cfg.crawl, None, [u("a")]))
     first = bl("codigix.co")  # one miss = suspected, still listed, not yet a lost event
@@ -121,7 +125,7 @@ def test_lost_backlink_shows_in_history(env, monkeypatch):
     asyncio.run(engine.recrawl_due(cfg.crawl, None, [u("a")]))  # second successful miss confirms
     h = crawler_api.backlink_history("codigix.co", limit=200)["events"]
     assert {e["event"] for e in h} == {"new", "suspected_removed", "lost"}
-    assert bl("codigix.co")["status"] == "discovering"  # nothing active left: handed to Common Crawl discovery
+    assert bl("codigix.co")["status"] == "not_started"  # nothing active left, and a GET never starts a search
     assert bl("codigix.co", include_removed=True)["total_backlinks"] == 1
 
 
@@ -148,15 +152,15 @@ def test_claims_are_atomic_and_recoverable(env):
     assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status='crawling'")[0]["n"] == 0
 
 
-# Common Crawl disabled; failing sources never break the engine
+# a disabled source is never run; failing sources never break the engine
 def test_disabled_and_failing_sources(env, monkeypatch):
     async def boom(client, cfg, cursor):
         raise httpx.ConnectError("down")
-    monkeypatch.setattr(autonomous, "SOURCES", {"commoncrawl": boom, "tranco": boom})
+    monkeypatch.setattr(autonomous, "SOURCES", {"feeds": boom, "tranco": boom})
     out = asyncio.run(autonomous.bootstrap(autonomous.AutoConfig(sources=("tranco",))))
-    assert out == {"commoncrawl": 0, "tranco": 0}
+    assert out == {"feeds": 0, "tranco": 0}
     st = {r["name"]: r for r in rows("SELECT * FROM discovery_sources")}
-    assert st["commoncrawl"]["enabled"] == 0 and st["commoncrawl"]["runs"] == 0  # disabled: never even attempted
+    assert st["feeds"]["enabled"] == 0 and st["feeds"]["runs"] == 0  # disabled: never even attempted
     assert st["tranco"]["status"] == "error" and "down" in st["tranco"]["last_error"]
 
 
@@ -167,25 +171,16 @@ def test_real_adapters_against_mock_servers(env):
             return httpx.Response(200, json={"list_id": "ABC"})
         if "tranco-list.eu/download" in u:
             return httpx.Response(200, text="1,google.com\n2,wikipedia.org\n3,example.net\n")
-        if u.endswith("collinfo.json"):
-            return httpx.Response(200, json=[{"cdx-api": "https://cc.test/idx"}])
-        if "cc.test" in u:
-            return httpx.Response(200, text='{"url": "https://site.org/a"}\n{"url": "https://other.com/z"}\n')
         return httpx.Response(200, text="<rss><channel><item><link>https://blog.example.org/post</link></item></channel></rss>")
-    cfg = autonomous.AutoConfig(sources=("tranco", "feeds", "commoncrawl"), tranco_limit=3, tranco_batch=2, feeds=("https://feed.test/rss",))
+    cfg = autonomous.AutoConfig(sources=("tranco", "feeds"), tranco_limit=3, tranco_batch=2, feeds=("https://feed.test/rss",))
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as cl:
             r = [await autonomous.run_source(n, cfg, cl, force=True) for n in ("tranco", "feeds")]
-            with core.connect() as c:
-                c.execute("INSERT INTO discovered_domains (domain, discovery_status) VALUES ('site.org','admitted')")
-            r.append(await autonomous.run_source("commoncrawl", cfg, cl, force=True))
             r.append(await autonomous.run_source("tranco", cfg, cl, force=True))  # second batch resumes from cursor 2
         return r
-    assert asyncio.run(go()) == [2, 1, 1, 1]
+    assert asyncio.run(go()) == [2, 1, 1]
     got = {r["normalized_url"]: r for r in rows("SELECT * FROM discovered_urls")}
-    assert "https://site.org/a" in got and "https://other.com/z" not in got  # CC rows are filtered to the admitted domain
-    assert got["https://site.org/a"]["discovery_method"] == "commoncrawl"
     assert rows("SELECT priority FROM discovered_domains WHERE domain='google.com'")[0]["priority"] == 1
     assert not rows("SELECT * FROM outgoing_links")  # imported URLs are never links, let alone backlinks
 

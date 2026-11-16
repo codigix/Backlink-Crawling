@@ -1,0 +1,5667 @@
+{
+ "checks": [
+  {
+   "check": "onboard customer A",
+   "pass": true,
+   "evidence": {
+    "domain": "realpython.com",
+    "job_id": 1,
+    "status": "queued",
+    "priority": "P0",
+    "created": true
+   }
+  },
+  {
+   "check": "1 register competitors of an existing customer",
+   "pass": true,
+   "evidence": {
+    "business_domain": "realpython.com",
+    "results": [
+     {
+      "domain": "djangoproject.com",
+      "status": "registered",
+      "job_id": 2,
+      "priority": "P3",
+      "target_type": "competitor",
+      "known_backlinks": 0,
+      "discovery": "queued"
+     },
+     {
+      "domain": "palletsprojects.com",
+      "status": "registered",
+      "job_id": 3,
+      "priority": "P3",
+      "target_type": "competitor",
+      "known_backlinks": 0,
+      "discovery": "queued"
+     },
+     {
+      "domain": "tiangolo.com",
+      "status": "registered",
+      "job_id": 4,
+      "priority": "P3",
+      "target_type": "competitor",
+      "known_backlinks": 0,
+      "discovery": "queued"
+     }
+    ]
+   }
+  },
+  {
+   "check": "2 competitor for a business never onboarded (auto-onboarded)",
+   "pass": true,
+   "evidence": {
+    "business_domain": "fullstackpython.com",
+    "results": [
+     {
+      "domain": "djangoproject.com",
+      "status": "registered",
+      "job_id": 2,
+      "priority": "P3",
+      "target_type": "competitor",
+      "known_backlinks": 0,
+      "discovery": "queued"
+     }
+    ]
+   }
+  },
+  {
+   "check": "9a same competitor under two customers: ONE discovery job",
+   "pass": true,
+   "evidence": {
+    "jobs": 1,
+    "ids": [
+     2,
+     2
+    ]
+   }
+  },
+  {
+   "check": "9b access isolation: each customer lists only its own competitors",
+   "pass": true,
+   "evidence": {
+    "A": [
+     "djangoproject.com",
+     "palletsprojects.com",
+     "tiangolo.com"
+    ],
+    "B": [
+     "djangoproject.com"
+    ]
+   }
+  },
+  {
+   "check": "9c customer B cannot read A's competitor config",
+   "pass": true,
+   "evidence": "404"
+  },
+  {
+   "check": "seed accepted by the API (flag written)",
+   "pass": true,
+   "evidence": {
+    "queued": [
+     "https://python.org/"
+    ]
+   }
+  },
+  {
+   "check": "3/4 initial DDGS search ran for every target, <=50 unique candidates, none lost to a failure",
+   "pass": true,
+   "evidence": {
+    "realpython.com": [
+     "done",
+     35
+    ],
+    "djangoproject.com": [
+     "done",
+     36
+    ],
+    "palletsprojects.com": [
+     "done",
+     17
+    ],
+    "tiangolo.com": [
+     "done",
+     15
+    ],
+    "fullstackpython.com": [
+     "done",
+     28
+    ]
+   }
+  },
+  {
+   "check": "4 candidate URLs are unique per job (job_urls PK) and equal search_results",
+   "pass": true,
+   "evidence": {
+    "realpython.com": 35,
+    "djangoproject.com": 36,
+    "palletsprojects.com": 17,
+    "tiangolo.com": 15,
+    "fullstackpython.com": 28
+   }
+  },
+  {
+   "check": "5 candidates entered Crawlee: pages crawled, depth <= 3, per-job page budget respected",
+   "pass": true,
+   "evidence": {
+    "crawled": {
+     "realpython.com": 39,
+     "djangoproject.com": 57,
+     "palletsprojects.com": 56,
+     "tiangolo.com": 52,
+     "fullstackpython.com": 45
+    },
+    "max_depth": 1
+   }
+  },
+  {
+   "check": "shared URLs: URLs referenced by several jobs vs fetched more than once",
+   "pass": true,
+   "evidence": {
+    "urls_in_multiple_jobs": 0,
+    "urls_fetched_more_than_once": 2
+   }
+  },
+  {
+   "check": "6/7 backlinks to djangoproject.com: APIs answer, links are real hyperlinks (re-fetched live)",
+   "pass": true,
+   "evidence": {
+    "total": 167,
+    "referring_domains": 13,
+    "anchors": 117,
+    "history_events": 167,
+    "discovery": "completed",
+    "sampled": 8,
+    "confirmed_on_live_page": 8,
+    "api_status": [
+     200,
+     200,
+     200,
+     200,
+     200
+    ]
+   }
+  },
+  {
+   "check": "6/7 backlinks to palletsprojects.com: APIs answer, links are real hyperlinks (re-fetched live)",
+   "pass": true,
+   "evidence": {
+    "total": 19,
+    "referring_domains": 3,
+    "anchors": 15,
+    "history_events": 19,
+    "discovery": "completed",
+    "sampled": 8,
+    "confirmed_on_live_page": 8,
+    "api_status": [
+     200,
+     200,
+     200,
+     200,
+     200
+    ]
+   }
+  },
+  {
+   "check": "6 no internal links counted as backlinks",
+   "pass": true,
+   "evidence": "no source_domain == competitor in API output"
+  },
+  {
+   "check": "8 gap analysis equals an independent set computation from outgoing_links",
+   "pass": true,
+   "evidence": {
+    "summary": {
+     "own_referring_domains": 5,
+     "competitor_referring_domains": 14,
+     "gap_domains": 11,
+     "shared_domains": 3,
+     "own_only_domains": 2,
+     "gap_pages": 60
+    },
+    "expected_gap_domains": 11,
+    "own_domains": 5,
+    "coverage": {
+     "realpython.com": "completed",
+     "djangoproject.com": "completed",
+     "palletsprojects.com": "completed",
+     "tiangolo.com": "completed"
+    }
+   }
+  },
+  {
+   "check": "9d two customers get different gaps from the same competitor data",
+   "pass": true,
+   "evidence": {
+    "A": {
+     "own_referring_domains": 5,
+     "competitor_referring_domains": 14,
+     "gap_domains": 11,
+     "shared_domains": 3,
+     "own_only_domains": 2,
+     "gap_pages": 60
+    },
+    "B": {
+     "own_referring_domains": 4,
+     "competitor_referring_domains": 13,
+     "gap_domains": 12,
+     "shared_domains": 1,
+     "own_only_domains": 3,
+     "gap_pages": 49
+    }
+   }
+  },
+  {
+   "check": "9e removing the shared competitor for B keeps A's registration, the target and all data",
+   "pass": true,
+   "evidence": [
+    "djangoproject.com",
+    "palletsprojects.com",
+    "tiangolo.com"
+   ]
+  },
+  {
+   "check": "10 several competitors ran concurrently within the configured caps",
+   "pass": true,
+   "evidence": {
+    "samples": 116,
+    "max_process_cpu_pct": 109.3,
+    "mean_process_cpu_pct": 21.9,
+    "max_process_rss_mb": 1584,
+    "max_machine_cpu_pct": 86.1,
+    "max_machine_ram_pct": 97.7,
+    "max_pg_conns_staging": 18,
+    "max_pg_conns_database_total": 31,
+    "max_celery_queue": 3,
+    "max_competitor_jobs_active": 3,
+    "max_active_jobs_total": 4,
+    "max_leased_urls": 50,
+    "per_proc_max_rss_mb": {
+     "api": 256,
+     "engine": 285,
+     "engine2": 302,
+     "sw1": 399,
+     "sw2": 381
+    }
+   }
+  },
+  {
+   "check": "10b Celery queue never above CELERY_MAX_QUEUE=2",
+   "pass": false,
+   "evidence": {
+    "peak": 3
+   }
+  },
+  {
+   "check": "12 worker kill + engine restart: no URL left stuck with an expired lease, every job finished",
+   "pass": true,
+   "evidence": {
+    "sw1_leases_at_kill": 5,
+    "killed_procs": 2,
+    "worker_killed_at": 221,
+    "worker_restarted_at": 269,
+    "engine_hb_before_kill": "2026-11-16 12:06:39",
+    "engine_restarted_at": 338,
+    "expired_leases_left": 0,
+    "still_leased": 46,
+    "workers": [
+     {
+      "name": "business",
+      "status": "running",
+      "restart_count": 0,
+      "errors": 0
+     },
+     {
+      "name": "crawler",
+      "status": "idle",
+      "restart_count": 0,
+      "errors": 0
+     },
+     {
+      "name": "discovery",
+      "status": "idle",
+      "restart_count": 0,
+      "errors": 0
+     },
+     {
+      "name": "indexer",
+      "status": "idle",
+      "restart_count": 0,
+      "errors": 0
+     },
+     {
+      "name": "lookups",
+      "status": "idle",
+      "restart_count": 0,
+      "errors": 0
+     },
+     {
+      "name": "scheduler",
+      "status": "idle",
+      "restart_count": 0,
+      "errors": 8
+     },
+     {
+      "name": "verifier",
+      "status": "idle",
+      "restart_count": 0,
+      "errors": 0
+     }
+    ]
+   }
+  },
+  {
+   "check": "13 scheduler: >=5 consecutive COMPLETED cycles, no failed cycle, no lock timeout, restart_count 0",
+   "pass": false,
+   "evidence": {
+    "cycles": 14,
+    "by_status": {
+     "COMPLETED": 6,
+     "COMPLETED_WITH_ERRORS": 8,
+     "FAILED": 0
+    },
+    "max_consecutive_completed": 4,
+    "max_cycle_s": 185.4,
+    "max_op_s": {
+     "DOMAIN-ADMISSION": 181.33,
+     "SEEDS": 13.06,
+     "DOMAIN-REACTIVATION": 1.8,
+     "EXHAUSTED-RETIREMENT": 2.03,
+     "LEASE-RECOVERY": 1.92,
+     "UNREACHABLE-RETIREMENT": 3.83
+    },
+    "lock_busy_lines_engine2": 11,
+    "lock_acquired_engine1": 6,
+    "lock_acquired_engine2": 9,
+    "lock_timeouts_in_logs": 24,
+    "worker_status": {
+     "runs": 14,
+     "errors": 8,
+     "restart_count": 0,
+     "last_success_at": "2026-11-16 12:25:44",
+     "last_cycle_status": "skipped",
+     "last_partial_at": "2026-11-16 12:26:55",
+     "last_failed_at": null
+    }
+   }
+  },
+  {
+   "check": "14 two engines on one schema: the second skipped cycles while the first owned it",
+   "pass": true,
+   "evidence": {
+    "busy_lines": 11
+   }
+  },
+  {
+   "check": "14b after engine 1 was killed (abnormal termination) engine 2 took the scheduler over",
+   "pass": true,
+   "evidence": {
+    "acquired_by_engine2": 9
+   }
+  },
+  {
+   "check": "15 seed flag cleared only after the domain was admitted",
+   "pass": true,
+   "evidence": {
+    "flags_left": 0,
+    "python.org": [
+     {
+      "discovery_status": "admitted"
+     }
+    ]
+   }
+  }
+ ],
+ "samples": [
+  {
+   "t": 45,
+   "proc_cpu_pct": 12.2,
+   "proc_rss_mb": 1267,
+   "per_proc": {
+    "api": {
+     "cpu": 0.8,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.2,
+     "rss_mb": 251
+    },
+    "engine2": {
+     "cpu": 5.9,
+     "rss_mb": 252
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 254
+    },
+    "sw2": {
+     "cpu": 0.2,
+     "rss_mb": 254
+    }
+   },
+   "machine_cpu_pct": 55.6,
+   "machine_ram_pct": 88.8,
+   "pg_conns_staging": 14,
+   "pg_conns_database_total": 19,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {},
+   "jobs": {
+    "realpython.com": "pending",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "pending"
+   }
+  },
+  {
+   "t": 58,
+   "proc_cpu_pct": 15.7,
+   "proc_rss_mb": 1300,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.6,
+     "rss_mb": 268
+    },
+    "engine2": {
+     "cpu": 9.6,
+     "rss_mb": 268
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 254
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 254
+    }
+   },
+   "machine_cpu_pct": 63.2,
+   "machine_ram_pct": 90.4,
+   "pg_conns_staging": 2,
+   "pg_conns_database_total": 9,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {},
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 72,
+   "proc_cpu_pct": 19.0,
+   "proc_rss_mb": 1303,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.6,
+     "rss_mb": 269
+    },
+    "engine2": {
+     "cpu": 9.9,
+     "rss_mb": 271
+    },
+    "sw1": {
+     "cpu": 0.4,
+     "rss_mb": 254
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 254
+    }
+   },
+   "machine_cpu_pct": 72.2,
+   "machine_ram_pct": 95.0,
+   "pg_conns_staging": 3,
+   "pg_conns_database_total": 15,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {},
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 85,
+   "proc_cpu_pct": 16.1,
+   "proc_rss_mb": 1324,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 7.8,
+     "rss_mb": 271
+    },
+    "engine2": {
+     "cpu": 5.3,
+     "rss_mb": 272
+    },
+    "sw1": {
+     "cpu": 0.6,
+     "rss_mb": 259
+    },
+    "sw2": {
+     "cpu": 2.3,
+     "rss_mb": 266
+    }
+   },
+   "machine_cpu_pct": 68.6,
+   "machine_ram_pct": 95.3,
+   "pg_conns_staging": 4,
+   "pg_conns_database_total": 7,
+   "celery_queue": 1,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 97,
+   "proc_cpu_pct": 31.9,
+   "proc_rss_mb": 1363,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.8,
+     "rss_mb": 271
+    },
+    "engine2": {
+     "cpu": 4.3,
+     "rss_mb": 273
+    },
+    "sw1": {
+     "cpu": 10.5,
+     "rss_mb": 288
+    },
+    "sw2": {
+     "cpu": 8.2,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 68.1,
+   "machine_ram_pct": 94.6,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 15,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 20
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 110,
+   "proc_cpu_pct": 37.8,
+   "proc_rss_mb": 1405,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 6.3,
+     "rss_mb": 272
+    },
+    "engine2": {
+     "cpu": 12.8,
+     "rss_mb": 283
+    },
+    "sw1": {
+     "cpu": 17.4,
+     "rss_mb": 318
+    },
+    "sw2": {
+     "cpu": 1.2,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 53.0,
+   "machine_ram_pct": 94.9,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 12
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 122,
+   "proc_cpu_pct": 20.3,
+   "proc_rss_mb": 1409,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.3,
+     "rss_mb": 272
+    },
+    "engine2": {
+     "cpu": 4.2,
+     "rss_mb": 283
+    },
+    "sw1": {
+     "cpu": 9.3,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 1.1,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 45.1,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 11,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 134,
+   "proc_cpu_pct": 11.6,
+   "proc_rss_mb": 1409,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.4,
+     "rss_mb": 273
+    },
+    "engine2": {
+     "cpu": 5.1,
+     "rss_mb": 283
+    },
+    "sw1": {
+     "cpu": 0.4,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 0.6,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 45.3,
+   "machine_ram_pct": 95.7,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 7,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 147,
+   "proc_cpu_pct": 22.1,
+   "proc_rss_mb": 1411,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.7,
+     "rss_mb": 273
+    },
+    "engine2": {
+     "cpu": 10.8,
+     "rss_mb": 285
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 2.5,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 48.9,
+   "machine_ram_pct": 96.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 13,
+   "celery_queue": 1,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 159,
+   "proc_cpu_pct": 12.3,
+   "proc_rss_mb": 1411,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.2,
+     "rss_mb": 273
+    },
+    "engine2": {
+     "cpu": 5.8,
+     "rss_mb": 285
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 1.0,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 57.0,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 16,
+   "celery_queue": 1,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 171,
+   "proc_cpu_pct": 33.7,
+   "proc_rss_mb": 1414,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.9,
+     "rss_mb": 274
+    },
+    "engine2": {
+     "cpu": 22.4,
+     "rss_mb": 288
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 2.4,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 55.0,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 12,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 183,
+   "proc_cpu_pct": 9.7,
+   "proc_rss_mb": 1415,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 3.6,
+     "rss_mb": 274
+    },
+    "engine2": {
+     "cpu": 5.2,
+     "rss_mb": 288
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 0.9,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 44.9,
+   "machine_ram_pct": 95.6,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 15,
+   "celery_queue": 2,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 195,
+   "proc_cpu_pct": 8.7,
+   "proc_rss_mb": 1415,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 2.9,
+     "rss_mb": 274
+    },
+    "engine2": {
+     "cpu": 4.1,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 1.6,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 57.5,
+   "machine_ram_pct": 95.6,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 14,
+   "celery_queue": 0,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 208,
+   "proc_cpu_pct": 14.2,
+   "proc_rss_mb": 1416,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.8,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 7.4,
+     "rss_mb": 288
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 321
+    },
+    "sw2": {
+     "cpu": 0.9,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 45.9,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "searching"
+   }
+  },
+  {
+   "t": 220,
+   "proc_cpu_pct": 10.1,
+   "proc_rss_mb": 1415,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 3.7,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 5.4,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 320
+    },
+    "sw2": {
+     "cpu": 0.6,
+     "rss_mb": 276
+    }
+   },
+   "machine_cpu_pct": 52.7,
+   "machine_ram_pct": 96.1,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 13,
+   "celery_queue": 2,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 20
+   },
+   "jobs": {
+    "realpython.com": "searching",
+    "djangoproject.com": "pending",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 233,
+   "proc_cpu_pct": 40.7,
+   "proc_rss_mb": 1146,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 4.6,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 7.8,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0,
+     "rss_mb": 0
+    },
+    "sw2": {
+     "cpu": 28.3,
+     "rss_mb": 326
+    }
+   },
+   "machine_cpu_pct": 51.1,
+   "machine_ram_pct": 94.1,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 6
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 245,
+   "proc_cpu_pct": 12.9,
+   "proc_rss_mb": 1146,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 7.6,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 3.1,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0,
+     "rss_mb": 0
+    },
+    "sw2": {
+     "cpu": 2.2,
+     "rss_mb": 326
+    }
+   },
+   "machine_cpu_pct": 57.1,
+   "machine_ram_pct": 94.1,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 17,
+   "celery_queue": 2,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 3
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 258,
+   "proc_cpu_pct": 7.3,
+   "proc_rss_mb": 1146,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 3.8,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 3.2,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0,
+     "rss_mb": 0
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 326
+    }
+   },
+   "machine_cpu_pct": 53.0,
+   "machine_ram_pct": 94.5,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 3
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 269,
+   "proc_cpu_pct": 10.5,
+   "proc_rss_mb": 1146,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.1,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 2.0,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0,
+     "rss_mb": 0
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 326
+    }
+   },
+   "machine_cpu_pct": 62.4,
+   "machine_ram_pct": 93.9,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 3
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 283,
+   "proc_cpu_pct": 16.5,
+   "proc_rss_mb": 1400,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 11.2,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 2.5,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "sw2": {
+     "cpu": 2.4,
+     "rss_mb": 327
+    }
+   },
+   "machine_cpu_pct": 73.8,
+   "machine_ram_pct": 95.4,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 16,
+   "celery_queue": 1,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 25,
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 296,
+   "proc_cpu_pct": 16.2,
+   "proc_rss_mb": 1406,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 4.3,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 2.2,
+     "rss_mb": 289
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 254
+    },
+    "sw2": {
+     "cpu": 9.3,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 51.0,
+   "machine_ram_pct": 95.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 13,
+   "celery_queue": 1,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 309,
+   "proc_cpu_pct": 30.1,
+   "proc_rss_mb": 1415,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 6.4,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 7.3,
+     "rss_mb": 290
+    },
+    "sw1": {
+     "cpu": 0.7,
+     "rss_mb": 259
+    },
+    "sw2": {
+     "cpu": 15.6,
+     "rss_mb": 335
+    }
+   },
+   "machine_cpu_pct": 44.8,
+   "machine_ram_pct": 95.2,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 16,
+   "celery_queue": 1,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 6,
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 321,
+   "proc_cpu_pct": 29.7,
+   "proc_rss_mb": 1440,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 6.5,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 7.6,
+     "rss_mb": 290
+    },
+    "sw1": {
+     "cpu": 9.4,
+     "rss_mb": 285
+    },
+    "sw2": {
+     "cpu": 6.2,
+     "rss_mb": 334
+    }
+   },
+   "machine_cpu_pct": 50.9,
+   "machine_ram_pct": 95.1,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 17,
+   "celery_queue": 0,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "crawling"
+   }
+  },
+  {
+   "t": 332,
+   "proc_cpu_pct": 32.5,
+   "proc_rss_mb": 1457,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.4,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 9.0,
+     "rss_mb": 290
+    },
+    "sw1": {
+     "cpu": 7.9,
+     "rss_mb": 292
+    },
+    "sw2": {
+     "cpu": 7.1,
+     "rss_mb": 343
+    }
+   },
+   "machine_cpu_pct": 54.6,
+   "machine_ram_pct": 95.0,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 23,
+    "sw2@DESKTOP-QHEN45L": 14
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 350,
+   "proc_cpu_pct": 44.6,
+   "proc_rss_mb": 1436,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 240
+    },
+    "engine2": {
+     "cpu": 14.5,
+     "rss_mb": 291
+    },
+    "sw1": {
+     "cpu": 13.1,
+     "rss_mb": 303
+    },
+    "sw2": {
+     "cpu": 16.7,
+     "rss_mb": 345
+    }
+   },
+   "machine_cpu_pct": 61.9,
+   "machine_ram_pct": 96.1,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 14,
+   "celery_queue": 0,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 16
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 362,
+   "proc_cpu_pct": 8.6,
+   "proc_rss_mb": 1440,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 240
+    },
+    "engine2": {
+     "cpu": 5.2,
+     "rss_mb": 291
+    },
+    "sw1": {
+     "cpu": 2.9,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 345
+    }
+   },
+   "machine_cpu_pct": 58.9,
+   "machine_ram_pct": 96.8,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 20,
+   "celery_queue": 0,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 16
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 374,
+   "proc_cpu_pct": 11.5,
+   "proc_rss_mb": 1440,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 240
+    },
+    "engine2": {
+     "cpu": 11.1,
+     "rss_mb": 292
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 345
+    }
+   },
+   "machine_cpu_pct": 59.3,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 14,
+   "celery_queue": 0,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 16
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 387,
+   "proc_cpu_pct": 10.8,
+   "proc_rss_mb": 1441,
+   "per_proc": {
+    "api": {
+     "cpu": 0.5,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 240
+    },
+    "engine2": {
+     "cpu": 8.1,
+     "rss_mb": 292
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 2.1,
+     "rss_mb": 345
+    }
+   },
+   "machine_cpu_pct": 72.6,
+   "machine_ram_pct": 96.7,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 19,
+   "celery_queue": 1,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 16
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "searching",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 399,
+   "proc_cpu_pct": 28.8,
+   "proc_rss_mb": 1443,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.5,
+     "rss_mb": 240
+    },
+    "engine2": {
+     "cpu": 20.5,
+     "rss_mb": 293
+    },
+    "sw1": {
+     "cpu": 3.1,
+     "rss_mb": 308
+    },
+    "sw2": {
+     "cpu": 4.3,
+     "rss_mb": 346
+    }
+   },
+   "machine_cpu_pct": 81.4,
+   "machine_ram_pct": 93.0,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 17,
+   "celery_queue": 2,
+   "competitor_jobs_active": 1,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 2
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "pending",
+    "tiangolo.com": "pending",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 411,
+   "proc_cpu_pct": 72.5,
+   "proc_rss_mb": 1463,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 16.7,
+     "rss_mb": 252
+    },
+    "engine2": {
+     "cpu": 23.7,
+     "rss_mb": 295
+    },
+    "sw1": {
+     "cpu": 7.5,
+     "rss_mb": 308
+    },
+    "sw2": {
+     "cpu": 24.5,
+     "rss_mb": 352
+    }
+   },
+   "machine_cpu_pct": 69.4,
+   "machine_ram_pct": 94.9,
+   "pg_conns_staging": 14,
+   "pg_conns_database_total": 23,
+   "celery_queue": 1,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 424,
+   "proc_cpu_pct": 83.3,
+   "proc_rss_mb": 1487,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.8,
+     "rss_mb": 268
+    },
+    "engine2": {
+     "cpu": 11.3,
+     "rss_mb": 295
+    },
+    "sw1": {
+     "cpu": 2.4,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 60.8,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 69.2,
+   "machine_ram_pct": 95.9,
+   "pg_conns_staging": 13,
+   "pg_conns_database_total": 20,
+   "celery_queue": 1,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 4,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 436,
+   "proc_cpu_pct": 19.2,
+   "proc_rss_mb": 1490,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.7,
+     "rss_mb": 269
+    },
+    "engine2": {
+     "cpu": 6.5,
+     "rss_mb": 298
+    },
+    "sw1": {
+     "cpu": 6.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 1.0,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 61.8,
+   "machine_ram_pct": 94.0,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 19,
+   "celery_queue": 1,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 448,
+   "proc_cpu_pct": 14.6,
+   "proc_rss_mb": 1492,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.8,
+     "rss_mb": 271
+    },
+    "engine2": {
+     "cpu": 8.6,
+     "rss_mb": 298
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 53.4,
+   "machine_ram_pct": 93.8,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 16,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 460,
+   "proc_cpu_pct": 10.9,
+   "proc_rss_mb": 1492,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 3.2,
+     "rss_mb": 271
+    },
+    "engine2": {
+     "cpu": 7.3,
+     "rss_mb": 298
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 61.0,
+   "machine_ram_pct": 94.8,
+   "pg_conns_staging": 15,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 473,
+   "proc_cpu_pct": 30.6,
+   "proc_rss_mb": 1495,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 11.0,
+     "rss_mb": 272
+    },
+    "engine2": {
+     "cpu": 19.3,
+     "rss_mb": 300
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.2,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 64.4,
+   "machine_ram_pct": 95.0,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 13,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 486,
+   "proc_cpu_pct": 11.7,
+   "proc_rss_mb": 1496,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 4.1,
+     "rss_mb": 273
+    },
+    "engine2": {
+     "cpu": 6.2,
+     "rss_mb": 300
+    },
+    "sw1": {
+     "cpu": 0.6,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.7,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 64.8,
+   "machine_ram_pct": 96.5,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 16,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 499,
+   "proc_cpu_pct": 8.7,
+   "proc_rss_mb": 1498,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 2.9,
+     "rss_mb": 274
+    },
+    "engine2": {
+     "cpu": 5.2,
+     "rss_mb": 301
+    },
+    "sw1": {
+     "cpu": 0.5,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 57.5,
+   "machine_ram_pct": 96.6,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 13,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 511,
+   "proc_cpu_pct": 13.0,
+   "proc_rss_mb": 1499,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 4.6,
+     "rss_mb": 274
+    },
+    "engine2": {
+     "cpu": 8.2,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 48.8,
+   "machine_ram_pct": 95.6,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 523,
+   "proc_cpu_pct": 9.2,
+   "proc_rss_mb": 1501,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 4.4,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 4.6,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 361
+    }
+   },
+   "machine_cpu_pct": 53.2,
+   "machine_ram_pct": 95.1,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 8,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 536,
+   "proc_cpu_pct": 11.3,
+   "proc_rss_mb": 1500,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 4.0,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 7.1,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 57.2,
+   "machine_ram_pct": 95.9,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 15,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 549,
+   "proc_cpu_pct": 11.7,
+   "proc_rss_mb": 1500,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.6,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 4.8,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.3,
+     "rss_mb": 306
+    },
+    "sw2": {
+     "cpu": 0.7,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 59.6,
+   "machine_ram_pct": 95.3,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 561,
+   "proc_cpu_pct": 6.5,
+   "proc_rss_mb": 1500,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 3.2,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 2.9,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.4,
+     "rss_mb": 306
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 52.9,
+   "machine_ram_pct": 95.7,
+   "pg_conns_staging": 14,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "searching",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 573,
+   "proc_cpu_pct": 7.8,
+   "proc_rss_mb": 1501,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.2,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 2.2,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 52.4,
+   "machine_ram_pct": 95.1,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 585,
+   "proc_cpu_pct": 10.5,
+   "proc_rss_mb": 1501,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 6.8,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 3.4,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 55.5,
+   "machine_ram_pct": 95.3,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 8,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "searching",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 598,
+   "proc_cpu_pct": 21.6,
+   "proc_rss_mb": 1501,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 5.3,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 16.0,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 70.0,
+   "machine_ram_pct": 96.8,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 610,
+   "proc_cpu_pct": 19.9,
+   "proc_rss_mb": 1501,
+   "per_proc": {
+    "api": {
+     "cpu": 0.5,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 10.5,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 7.2,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 1.6,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 82.1,
+   "machine_ram_pct": 96.3,
+   "pg_conns_staging": 4,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 625,
+   "proc_cpu_pct": 21.8,
+   "proc_rss_mb": 1502,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 9.8,
+     "rss_mb": 278
+    },
+    "engine2": {
+     "cpu": 10.4,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 0.6,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.6,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 76.5,
+   "machine_ram_pct": 96.7,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 21,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 3,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 638,
+   "proc_cpu_pct": 11.0,
+   "proc_rss_mb": 1502,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.1,
+     "rss_mb": 278
+    },
+    "engine2": {
+     "cpu": 9.8,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 1.0,
+     "rss_mb": 307
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 76.9,
+   "machine_ram_pct": 95.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 15,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 651,
+   "proc_cpu_pct": 25.6,
+   "proc_rss_mb": 1515,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 278
+    },
+    "engine2": {
+     "cpu": 6.2,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 19.4,
+     "rss_mb": 319
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 76.7,
+   "machine_ram_pct": 96.3,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 16,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 19,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 665,
+   "proc_cpu_pct": 44.1,
+   "proc_rss_mb": 1528,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 278
+    },
+    "engine2": {
+     "cpu": 9.6,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 34.3,
+     "rss_mb": 333
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 360
+    }
+   },
+   "machine_cpu_pct": 80.2,
+   "machine_ram_pct": 96.2,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 2
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 677,
+   "proc_cpu_pct": 62.3,
+   "proc_rss_mb": 1549,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 0.1,
+     "rss_mb": 278
+    },
+    "engine2": {
+     "cpu": 12.4,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 5.3,
+     "rss_mb": 332
+    },
+    "sw2": {
+     "cpu": 44.4,
+     "rss_mb": 381
+    }
+   },
+   "machine_cpu_pct": 73.3,
+   "machine_ram_pct": 96.5,
+   "pg_conns_staging": 11,
+   "pg_conns_database_total": 21,
+   "celery_queue": 0,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 25,
+    "sw2@DESKTOP-QHEN45L": 20
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 690,
+   "proc_cpu_pct": 109.3,
+   "proc_rss_mb": 1552,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 256
+    },
+    "engine": {
+     "cpu": 8.3,
+     "rss_mb": 278
+    },
+    "engine2": {
+     "cpu": 10.5,
+     "rss_mb": 302
+    },
+    "sw1": {
+     "cpu": 38.1,
+     "rss_mb": 336
+    },
+    "sw2": {
+     "cpu": 52.3,
+     "rss_mb": 381
+    }
+   },
+   "machine_cpu_pct": 71.0,
+   "machine_ram_pct": 96.4,
+   "pg_conns_staging": 17,
+   "pg_conns_database_total": 25,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 9
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 703,
+   "proc_cpu_pct": 45.9,
+   "proc_rss_mb": 1544,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 3.5,
+     "rss_mb": 274
+    },
+    "engine2": {
+     "cpu": 7.0,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 32.2,
+     "rss_mb": 343
+    },
+    "sw2": {
+     "cpu": 3.2,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 59.3,
+   "machine_ram_pct": 89.6,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 9,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 717,
+   "proc_cpu_pct": 18.4,
+   "proc_rss_mb": 1544,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 4.2,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 7.0,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 7.1,
+     "rss_mb": 343
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 42.9,
+   "machine_ram_pct": 89.8,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 19,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 23,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 731,
+   "proc_cpu_pct": 20.0,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.5,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 6.4,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 0.7,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 12.3,
+     "rss_mb": 345
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 42.5,
+   "machine_ram_pct": 89.5,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 31,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 16,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 743,
+   "proc_cpu_pct": 10.0,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 2.3,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 1.0,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 5.1,
+     "rss_mb": 345
+    },
+    "sw2": {
+     "cpu": 1.4,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 48.7,
+   "machine_ram_pct": 90.0,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 17,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 756,
+   "proc_cpu_pct": 16.3,
+   "proc_rss_mb": 1549,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 5.5,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 0.9,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 9.8,
+     "rss_mb": 348
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 47.4,
+   "machine_ram_pct": 91.4,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 20,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 769,
+   "proc_cpu_pct": 29.3,
+   "proc_rss_mb": 1553,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 6.3,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 1.2,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 21.6,
+     "rss_mb": 352
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 47.6,
+   "machine_ram_pct": 89.9,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 16,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 11,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 782,
+   "proc_cpu_pct": 16.5,
+   "proc_rss_mb": 1554,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 2.8,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 5.4,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 8.3,
+     "rss_mb": 354
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 376
+    }
+   },
+   "machine_cpu_pct": 38.7,
+   "machine_ram_pct": 89.9,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 17,
+   "celery_queue": 3,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 795,
+   "proc_cpu_pct": 9.2,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 4.1,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 2.2,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 2.0,
+     "rss_mb": 352
+    },
+    "sw2": {
+     "cpu": 0.5,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 48.0,
+   "machine_ram_pct": 91.3,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 25,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 808,
+   "proc_cpu_pct": 50.9,
+   "proc_rss_mb": 1554,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 9.9,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 6.8,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 31.6,
+     "rss_mb": 359
+    },
+    "sw2": {
+     "cpu": 2.2,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 63.8,
+   "machine_ram_pct": 91.6,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 16,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 821,
+   "proc_cpu_pct": 38.7,
+   "proc_rss_mb": 1556,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 0.1,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 8.9,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 29.6,
+     "rss_mb": 361
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 64.2,
+   "machine_ram_pct": 92.6,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 15,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 8,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 833,
+   "proc_cpu_pct": 11.5,
+   "proc_rss_mb": 1557,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 0.1,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 4.6,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 6.2,
+     "rss_mb": 363
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 51.9,
+   "machine_ram_pct": 92.1,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 15,
+   "celery_queue": 1,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 845,
+   "proc_cpu_pct": 7.7,
+   "proc_rss_mb": 1558,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 0.1,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 5.6,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 1.6,
+     "rss_mb": 363
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 57.5,
+   "machine_ram_pct": 91.9,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 858,
+   "proc_cpu_pct": 39.3,
+   "proc_rss_mb": 1574,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 0.0,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 9.8,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 29.1,
+     "rss_mb": 379
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 59.8,
+   "machine_ram_pct": 91.6,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 871,
+   "proc_cpu_pct": 23.8,
+   "proc_rss_mb": 1579,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 4.1,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 5.2,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 13.4,
+     "rss_mb": 384
+    },
+    "sw2": {
+     "cpu": 1.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 56.0,
+   "machine_ram_pct": 91.6,
+   "pg_conns_staging": 11,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 884,
+   "proc_cpu_pct": 12.7,
+   "proc_rss_mb": 1579,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 4.5,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 6.3,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 1.4,
+     "rss_mb": 384
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 55.5,
+   "machine_ram_pct": 92.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 897,
+   "proc_cpu_pct": 12.3,
+   "proc_rss_mb": 1579,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 4.0,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 7.8,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 384
+    },
+    "sw2": {
+     "cpu": 0.5,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 54.2,
+   "machine_ram_pct": 92.7,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 909,
+   "proc_cpu_pct": 8.2,
+   "proc_rss_mb": 1579,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 6.2,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 0.8,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 0.7,
+     "rss_mb": 384
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 48.4,
+   "machine_ram_pct": 92.0,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 921,
+   "proc_cpu_pct": 5.1,
+   "proc_rss_mb": 1579,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 3.4,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 1.6,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 384
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 56.2,
+   "machine_ram_pct": 93.1,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 933,
+   "proc_cpu_pct": 7.1,
+   "proc_rss_mb": 1579,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 4.2,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 0.7,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 1.2,
+     "rss_mb": 384
+    },
+    "sw2": {
+     "cpu": 0.7,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 54.4,
+   "machine_ram_pct": 92.7,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 14,
+   "celery_queue": 3,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 946,
+   "proc_cpu_pct": 45.8,
+   "proc_rss_mb": 1582,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 8.2,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 1.1,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 35.8,
+     "rss_mb": 387
+    },
+    "sw2": {
+     "cpu": 0.6,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 61.4,
+   "machine_ram_pct": 92.3,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 15,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 959,
+   "proc_cpu_pct": 23.2,
+   "proc_rss_mb": 1583,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 6.0,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 1.2,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 13.6,
+     "rss_mb": 387
+    },
+    "sw2": {
+     "cpu": 2.3,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 64.1,
+   "machine_ram_pct": 94.6,
+   "pg_conns_staging": 18,
+   "pg_conns_database_total": 19,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 971,
+   "proc_cpu_pct": 18.8,
+   "proc_rss_mb": 1584,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 5.3,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 9.3,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 386
+    },
+    "sw2": {
+     "cpu": 3.9,
+     "rss_mb": 373
+    }
+   },
+   "machine_cpu_pct": 58.3,
+   "machine_ram_pct": 93.8,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 1
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 984,
+   "proc_cpu_pct": 23.6,
+   "proc_rss_mb": 1580,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 253
+    },
+    "engine": {
+     "cpu": 5.9,
+     "rss_mb": 275
+    },
+    "engine2": {
+     "cpu": 5.0,
+     "rss_mb": 297
+    },
+    "sw1": {
+     "cpu": 11.6,
+     "rss_mb": 381
+    },
+    "sw2": {
+     "cpu": 0.8,
+     "rss_mb": 374
+    }
+   },
+   "machine_cpu_pct": 68.6,
+   "machine_ram_pct": 95.3,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 22
+   },
+   "jobs": {
+    "realpython.com": "crawling",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 997,
+   "proc_cpu_pct": 71.0,
+   "proc_rss_mb": 1550,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 15.8,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 7.5,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 41.8,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 5.9,
+     "rss_mb": 375
+    }
+   },
+   "machine_cpu_pct": 81.7,
+   "machine_ram_pct": 94.5,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 20
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1009,
+   "proc_cpu_pct": 33.0,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 6.8,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 8.6,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.5,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 16.7,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 59.2,
+   "machine_ram_pct": 94.4,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 11
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1022,
+   "proc_cpu_pct": 15.2,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.5,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 4.5,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 3.1,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 6.9,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 50.6,
+   "machine_ram_pct": 94.1,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1036,
+   "proc_cpu_pct": 9.7,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 4.5,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 4.6,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 46.6,
+   "machine_ram_pct": 94.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1048,
+   "proc_cpu_pct": 14.7,
+   "proc_rss_mb": 1546,
+   "per_proc": {
+    "api": {
+     "cpu": 0.5,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 7.8,
+     "rss_mb": 277
+    },
+    "engine2": {
+     "cpu": 6.1,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 51.0,
+   "machine_ram_pct": 94.2,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1061,
+   "proc_cpu_pct": 15.3,
+   "proc_rss_mb": 1554,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 10.3,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 4.3,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.4,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 56.8,
+   "machine_ram_pct": 95.5,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 15,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1074,
+   "proc_cpu_pct": 13.5,
+   "proc_rss_mb": 1554,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 6.5,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 6.6,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 49.8,
+   "machine_ram_pct": 95.4,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1086,
+   "proc_cpu_pct": 15.6,
+   "proc_rss_mb": 1554,
+   "per_proc": {
+    "api": {
+     "cpu": 0.5,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 9.9,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 4.7,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 63.2,
+   "machine_ram_pct": 94.9,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 7,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1099,
+   "proc_cpu_pct": 12.4,
+   "proc_rss_mb": 1553,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 5.5,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 6.9,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 399
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 60.1,
+   "machine_ram_pct": 94.7,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 5,
+    "sw2@DESKTOP-QHEN45L": 7
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1113,
+   "proc_cpu_pct": 17.2,
+   "proc_rss_mb": 1553,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 5.4,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 7.9,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 2.8,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 1.0,
+     "rss_mb": 371
+    }
+   },
+   "machine_cpu_pct": 64.0,
+   "machine_ram_pct": 95.0,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 19,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 22,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1126,
+   "proc_cpu_pct": 25.0,
+   "proc_rss_mb": 1552,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 8.3,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 4.7,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 11.8,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 62.8,
+   "machine_ram_pct": 95.1,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 13,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 22,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1138,
+   "proc_cpu_pct": 6.5,
+   "proc_rss_mb": 1551,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 6.2,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 0.1,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 58.1,
+   "machine_ram_pct": 94.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 22,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1150,
+   "proc_cpu_pct": 7.4,
+   "proc_rss_mb": 1551,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 6.9,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 0.3,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 58.1,
+   "machine_ram_pct": 94.5,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 22,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1162,
+   "proc_cpu_pct": 7.2,
+   "proc_rss_mb": 1551,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 6.7,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 0.0,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.3,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 68.2,
+   "machine_ram_pct": 95.4,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 17,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 22,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1175,
+   "proc_cpu_pct": 24.7,
+   "proc_rss_mb": 1552,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 9.8,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 9.0,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 5.4,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 82.9,
+   "machine_ram_pct": 95.1,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 20,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1188,
+   "proc_cpu_pct": 26.4,
+   "proc_rss_mb": 1552,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 13.4,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 12.8,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 75.6,
+   "machine_ram_pct": 95.9,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 25,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 20,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1202,
+   "proc_cpu_pct": 13.6,
+   "proc_rss_mb": 1552,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 205
+    },
+    "engine": {
+     "cpu": 6.9,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 5.9,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.5,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.2,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 80.8,
+   "machine_ram_pct": 97.0,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 22,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 20,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1214,
+   "proc_cpu_pct": 14.5,
+   "proc_rss_mb": 1505,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 158
+    },
+    "engine": {
+     "cpu": 6.1,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 7.9,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.2,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 74.4,
+   "machine_ram_pct": 97.0,
+   "pg_conns_staging": 12,
+   "pg_conns_database_total": 18,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 20,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1227,
+   "proc_cpu_pct": 17.7,
+   "proc_rss_mb": 1505,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 158
+    },
+    "engine": {
+     "cpu": 10.6,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 6.8,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 0.3,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 72.9,
+   "machine_ram_pct": 97.4,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 17,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1239,
+   "proc_cpu_pct": 8.3,
+   "proc_rss_mb": 1480,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 133
+    },
+    "engine": {
+     "cpu": 3.6,
+     "rss_mb": 285
+    },
+    "engine2": {
+     "cpu": 1.6,
+     "rss_mb": 294
+    },
+    "sw1": {
+     "cpu": 2.4,
+     "rss_mb": 398
+    },
+    "sw2": {
+     "cpu": 0.7,
+     "rss_mb": 370
+    }
+   },
+   "machine_cpu_pct": 74.5,
+   "machine_ram_pct": 96.6,
+   "pg_conns_staging": 12,
+   "pg_conns_database_total": 20,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1251,
+   "proc_cpu_pct": 9.4,
+   "proc_rss_mb": 1473,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 133
+    },
+    "engine": {
+     "cpu": 7.5,
+     "rss_mb": 284
+    },
+    "engine2": {
+     "cpu": 1.4,
+     "rss_mb": 293
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 393
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 369
+    }
+   },
+   "machine_cpu_pct": 78.5,
+   "machine_ram_pct": 96.5,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 19,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1264,
+   "proc_cpu_pct": 9.9,
+   "proc_rss_mb": 1473,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 133
+    },
+    "engine": {
+     "cpu": 8.5,
+     "rss_mb": 284
+    },
+    "engine2": {
+     "cpu": 0.9,
+     "rss_mb": 293
+    },
+    "sw1": {
+     "cpu": 0.4,
+     "rss_mb": 393
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 369
+    }
+   },
+   "machine_cpu_pct": 60.6,
+   "machine_ram_pct": 97.0,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 15,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1277,
+   "proc_cpu_pct": 6.9,
+   "proc_rss_mb": 1456,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 133
+    },
+    "engine": {
+     "cpu": 6.1,
+     "rss_mb": 284
+    },
+    "engine2": {
+     "cpu": 0.5,
+     "rss_mb": 293
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 393
+    },
+    "sw2": {
+     "cpu": 0.2,
+     "rss_mb": 352
+    }
+   },
+   "machine_cpu_pct": 63.7,
+   "machine_ram_pct": 97.7,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 18,
+    "sw2@DESKTOP-QHEN45L": 5
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1290,
+   "proc_cpu_pct": 11.7,
+   "proc_rss_mb": 1456,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 133
+    },
+    "engine": {
+     "cpu": 7.9,
+     "rss_mb": 284
+    },
+    "engine2": {
+     "cpu": 2.0,
+     "rss_mb": 293
+    },
+    "sw1": {
+     "cpu": 1.0,
+     "rss_mb": 393
+    },
+    "sw2": {
+     "cpu": 0.4,
+     "rss_mb": 352
+    }
+   },
+   "machine_cpu_pct": 60.7,
+   "machine_ram_pct": 96.4,
+   "pg_conns_staging": 13,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 17
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1302,
+   "proc_cpu_pct": 17.0,
+   "proc_rss_mb": 1366,
+   "per_proc": {
+    "api": {
+     "cpu": 0.4,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 6.1,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 10.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 388
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 330
+    }
+   },
+   "machine_cpu_pct": 59.5,
+   "machine_ram_pct": 92.6,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 17
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1314,
+   "proc_cpu_pct": 11.1,
+   "proc_rss_mb": 1366,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 6.3,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 4.1,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.3,
+     "rss_mb": 388
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 330
+    }
+   },
+   "machine_cpu_pct": 55.0,
+   "machine_ram_pct": 93.0,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 9,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 17
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1327,
+   "proc_cpu_pct": 18.9,
+   "proc_rss_mb": 1366,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 12.4,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 6.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 388
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 330
+    }
+   },
+   "machine_cpu_pct": 62.7,
+   "machine_ram_pct": 92.8,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 17
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1339,
+   "proc_cpu_pct": 8.8,
+   "proc_rss_mb": 1366,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 1.5,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 7.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 388
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 330
+    }
+   },
+   "machine_cpu_pct": 55.4,
+   "machine_ram_pct": 92.9,
+   "pg_conns_staging": 5,
+   "pg_conns_database_total": 8,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 17
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1351,
+   "proc_cpu_pct": 6.8,
+   "proc_rss_mb": 1366,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 1.6,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 3.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.9,
+     "rss_mb": 388
+    },
+    "sw2": {
+     "cpu": 0.9,
+     "rss_mb": 330
+    }
+   },
+   "machine_cpu_pct": 56.6,
+   "machine_ram_pct": 93.0,
+   "pg_conns_staging": 4,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {},
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1364,
+   "proc_cpu_pct": 28.9,
+   "proc_rss_mb": 1367,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 17.2,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 8.2,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 1.1,
+     "rss_mb": 388
+    },
+    "sw2": {
+     "cpu": 2.2,
+     "rss_mb": 330
+    }
+   },
+   "machine_cpu_pct": 68.9,
+   "machine_ram_pct": 93.0,
+   "pg_conns_staging": 6,
+   "pg_conns_database_total": 7,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 25,
+    "sw1@DESKTOP-QHEN45L": 25
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1376,
+   "proc_cpu_pct": 63.8,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 11.7,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 8.2,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 17.9,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 25.7,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 77.7,
+   "machine_ram_pct": 93.4,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 8,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1389,
+   "proc_cpu_pct": 25.9,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 7.5,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 6.6,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 9.1,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 2.6,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 61.9,
+   "machine_ram_pct": 93.2,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 14,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1401,
+   "proc_cpu_pct": 19.3,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 10.3,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 8.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 63.3,
+   "machine_ram_pct": 93.4,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 11,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1413,
+   "proc_cpu_pct": 17.4,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.0,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 9.3,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 7.9,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 0.1,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 59.5,
+   "machine_ram_pct": 93.2,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 10,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1426,
+   "proc_cpu_pct": 7.4,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.3,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 2.4,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 4.0,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.4,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 0.3,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 78.8,
+   "machine_ram_pct": 95.2,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 16,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1440,
+   "proc_cpu_pct": 13.4,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 1.9,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 10.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.3,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 0.7,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 84.2,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 16,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1453,
+   "proc_cpu_pct": 7.0,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 2.8,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 3.9,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.1,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 0.0,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 76.2,
+   "machine_ram_pct": 95.8,
+   "pg_conns_staging": 7,
+   "pg_conns_database_total": 23,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 18,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1465,
+   "proc_cpu_pct": 17.5,
+   "proc_rss_mb": 1371,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 5.9,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 8.9,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 2.4,
+     "rss_mb": 332
+    }
+   },
+   "machine_cpu_pct": 86.1,
+   "machine_ram_pct": 96.1,
+   "pg_conns_staging": 8,
+   "pg_conns_database_total": 12,
+   "celery_queue": 2,
+   "competitor_jobs_active": 3,
+   "leases": {
+    "sw2@DESKTOP-QHEN45L": 11,
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "crawling",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1479,
+   "proc_cpu_pct": 26.0,
+   "proc_rss_mb": 1370,
+   "per_proc": {
+    "api": {
+     "cpu": 0.1,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 8.8,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 8.3,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.2,
+     "rss_mb": 390
+    },
+    "sw2": {
+     "cpu": 8.6,
+     "rss_mb": 331
+    }
+   },
+   "machine_cpu_pct": 72.4,
+   "machine_ram_pct": 95.9,
+   "pg_conns_staging": 9,
+   "pg_conns_database_total": 23,
+   "celery_queue": 0,
+   "competitor_jobs_active": 2,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 21
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "done",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1492,
+   "proc_cpu_pct": 44.2,
+   "proc_rss_mb": 1393,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 7.4,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 4.0,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.6,
+     "rss_mb": 389
+    },
+    "sw2": {
+     "cpu": 32.0,
+     "rss_mb": 355
+    }
+   },
+   "machine_cpu_pct": 82.9,
+   "machine_ram_pct": 97.1,
+   "pg_conns_staging": 13,
+   "pg_conns_database_total": 19,
+   "celery_queue": 2,
+   "competitor_jobs_active": 2,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 21,
+    "sw2@DESKTOP-QHEN45L": 4
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "crawling",
+    "palletsprojects.com": "done",
+    "tiangolo.com": "crawling",
+    "fullstackpython.com": "done"
+   }
+  },
+  {
+   "t": 1505,
+   "proc_cpu_pct": 90.8,
+   "proc_rss_mb": 1379,
+   "per_proc": {
+    "api": {
+     "cpu": 0.2,
+     "rss_mb": 89
+    },
+    "engine": {
+     "cpu": 12.5,
+     "rss_mb": 276
+    },
+    "engine2": {
+     "cpu": 0.1,
+     "rss_mb": 284
+    },
+    "sw1": {
+     "cpu": 0.0,
+     "rss_mb": 389
+    },
+    "sw2": {
+     "cpu": 78.0,
+     "rss_mb": 341
+    }
+   },
+   "machine_cpu_pct": 83.7,
+   "machine_ram_pct": 94.0,
+   "pg_conns_staging": 10,
+   "pg_conns_database_total": 19,
+   "celery_queue": 1,
+   "competitor_jobs_active": 0,
+   "leases": {
+    "sw1@DESKTOP-QHEN45L": 21,
+    "sw2@DESKTOP-QHEN45L": 15
+   },
+   "jobs": {
+    "realpython.com": "done",
+    "djangoproject.com": "done",
+    "palletsprojects.com": "done",
+    "tiangolo.com": "done",
+    "fullstackpython.com": "done"
+   }
+  }
+ ],
+ "schema_versions": [
+  1,
+  2,
+  5,
+  6,
+  7,
+  8,
+  9
+ ],
+ "finished_all_jobs": true,
+ "recovery": {
+  "sw1_leases_at_kill": 5,
+  "killed_procs": 2,
+  "worker_killed_at": 221,
+  "worker_restarted_at": 269,
+  "engine_hb_before_kill": "2026-11-16 12:06:39",
+  "engine_restarted_at": 338
+ },
+ "jobs": {
+  "realpython.com": {
+   "id": 1,
+   "status": "done",
+   "priority": 1,
+   "target_type": "own_business",
+   "search_results": 35,
+   "duplicate_candidates": 2,
+   "pages_discovered": 60,
+   "pages_crawled": 39,
+   "pages_failed": 1,
+   "backlinks_found": 5,
+   "retry_count": 0,
+   "last_error": null
+  },
+  "djangoproject.com": {
+   "id": 2,
+   "status": "done",
+   "priority": 3,
+   "target_type": "competitor",
+   "search_results": 36,
+   "duplicate_candidates": 1,
+   "pages_discovered": 60,
+   "pages_crawled": 57,
+   "pages_failed": 1,
+   "backlinks_found": 41,
+   "retry_count": 0,
+   "last_error": null
+  },
+  "palletsprojects.com": {
+   "id": 3,
+   "status": "done",
+   "priority": 3,
+   "target_type": "competitor",
+   "search_results": 17,
+   "duplicate_candidates": 0,
+   "pages_discovered": 60,
+   "pages_crawled": 56,
+   "pages_failed": 2,
+   "backlinks_found": 3,
+   "retry_count": 0,
+   "last_error": null
+  },
+  "tiangolo.com": {
+   "id": 4,
+   "status": "done",
+   "priority": 3,
+   "target_type": "competitor",
+   "search_results": 15,
+   "duplicate_candidates": 1,
+   "pages_discovered": 60,
+   "pages_crawled": 52,
+   "pages_failed": 2,
+   "backlinks_found": 8,
+   "retry_count": 0,
+   "last_error": null
+  },
+  "fullstackpython.com": {
+   "id": 5,
+   "status": "done",
+   "priority": 1,
+   "target_type": "own_business",
+   "search_results": 28,
+   "duplicate_candidates": 0,
+   "pages_discovered": 60,
+   "pages_crawled": 45,
+   "pages_failed": 4,
+   "backlinks_found": 6,
+   "retry_count": 0,
+   "last_error": null
+  }
+ },
+ "resources": {
+  "samples": 116,
+  "max_process_cpu_pct": 109.3,
+  "mean_process_cpu_pct": 21.9,
+  "max_process_rss_mb": 1584,
+  "max_machine_cpu_pct": 86.1,
+  "max_machine_ram_pct": 97.7,
+  "max_pg_conns_staging": 18,
+  "max_pg_conns_database_total": 31,
+  "max_celery_queue": 3,
+  "max_competitor_jobs_active": 3,
+  "max_active_jobs_total": 4,
+  "max_leased_urls": 50,
+  "per_proc_max_rss_mb": {
+   "api": 256,
+   "engine": 285,
+   "engine2": 302,
+   "sw1": 399,
+   "sw2": 381
+  }
+ },
+ "worker_status": [
+  {
+   "name": "business",
+   "status": "running",
+   "restart_count": 0,
+   "errors": 0
+  },
+  {
+   "name": "crawler",
+   "status": "idle",
+   "restart_count": 0,
+   "errors": 0
+  },
+  {
+   "name": "discovery",
+   "status": "idle",
+   "restart_count": 0,
+   "errors": 0
+  },
+  {
+   "name": "indexer",
+   "status": "idle",
+   "restart_count": 0,
+   "errors": 0
+  },
+  {
+   "name": "lookups",
+   "status": "idle",
+   "restart_count": 0,
+   "errors": 0
+  },
+  {
+   "name": "scheduler",
+   "status": "idle",
+   "restart_count": 0,
+   "errors": 8
+  },
+  {
+   "name": "verifier",
+   "status": "idle",
+   "restart_count": 0,
+   "errors": 0
+  }
+ ],
+ "scheduler": {
+  "cycles": 14,
+  "by_status": {
+   "COMPLETED": 6,
+   "COMPLETED_WITH_ERRORS": 8,
+   "FAILED": 0
+  },
+  "max_consecutive_completed": 4,
+  "max_cycle_s": 185.4,
+  "max_op_s": {
+   "DOMAIN-ADMISSION": 181.33,
+   "SEEDS": 13.06,
+   "DOMAIN-REACTIVATION": 1.8,
+   "EXHAUSTED-RETIREMENT": 2.03,
+   "LEASE-RECOVERY": 1.92,
+   "UNREACHABLE-RETIREMENT": 3.83
+  },
+  "lock_busy_lines_engine2": 11,
+  "lock_acquired_engine1": 6,
+  "lock_acquired_engine2": 9,
+  "lock_timeouts_in_logs": 24,
+  "worker_status": {
+   "runs": 14,
+   "errors": 8,
+   "restart_count": 0,
+   "last_success_at": "2026-11-16 12:25:44",
+   "last_cycle_status": "skipped",
+   "last_partial_at": "2026-11-16 12:26:55",
+   "last_failed_at": null
+  }
+ },
+ "db_deadlocks_staging_window": 30
+}

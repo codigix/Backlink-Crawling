@@ -3,15 +3,33 @@
 Crawls the web, stores every URL, link and backlink in PostgreSQL. Crawling runs in Celery workers (Redis is the queue);
 `autonomous.py` finds new domains and keeps the queue fed. More detail on the design: [CELERY.md](CELERY.md).
 
-## Common Crawl setup (one command)
-After pulling the branch and installing the Python packages (`pip install -r requirements.txt`), run once:
-```
-python fetch_cc_data.py
-```
-It installs Java 21 if missing, asks for your Kaggle token (https://www.kaggle.com/settings/api) if none is set, downloads the
-cc-webgraph jar and the domain graph (~10 GB, 25 GB free disk needed; rerun to resume after an interruption) and checks a lookup works.
-Afterwards the engine uses it automatically: `GET /backlinks/<domain>` for a domain with no stored backlinks queues a Common Crawl
-lookup, and the engine seeds the linking sites into the crawler. Try a lookup by hand: `python backlinks_cli.py <domain>`.
+## Business onboarding (highest priority)
+`POST /businesses {"domain": "example.com"}` (or `GET /backlinks/<domain>` for a domain with no stored backlinks) creates one discovery job per business
+(idempotent while a job for that domain is active). The engine then: searches DuckDuckGo (`ddg_lookup.py`, top ~50 results, the domain's own pages excluded;
+bounded concurrency and a provider-wide cooldown after a failure), and crawls those pages **and the other pages of the same site up to depth 3** (external destinations are stored as links but not followed unless `FOLLOW_EXTERNAL_DOMAINS=true`),
+at most 150 pages per run. Every business also re-runs every `DDGS_INTERVAL_HOURS` (default 6, +0-10% jitter, `businesses.next_run_at`; a missed run fires once after a restart) as a P2 job. `POST /discovery/onboard {domain, business_name}`; `GET /discovery/business/<domain>/status|runs`. `GET /businesses/<domain>` shows progress; `GET /businesses` lists jobs.
+
+Scheduling (`business_jobs.py`, PostgreSQL is the only state):
+- Business URLs are always claimed before autonomous ones (P0 new job, P1 job already crawling, P2 recurring re-discovery, then P3 autonomous, P4 re-verification).
+- Businesses are served round-robin; one business may use at most `MAX_ACTIVE_TASKS_PER_BUSINESS` workers at a time.
+- `MAX_CRAWL_WORKERS` workers in total; while business work is waiting, autonomous crawling gets only `MAX_CRAWL_WORKERS - BUSINESS_RESERVED_WORKERS`; when none is waiting it may use all.
+- A page is fetched once for everybody; its links are stored once in the shared graph. Depth is stored per job (`job_urls.depth`), never on the shared URL.
+- Leases carry a fencing token (`discovered_urls.lease_gen`): a worker whose lease expired cannot overwrite the new owner's result.
+
+Settings (`.env`, see `.env.example`): `MAX_CRAWL_WORKERS=4`, `BUSINESS_RESERVED_WORKERS=3`, `MAX_ACTIVE_TASKS_PER_BUSINESS=1`, `MAX_PAGES_PER_BUSINESS_RUN=150`, `MAX_DEPTH=3`,
+`FOLLOW_EXTERNAL_DOMAINS=false`, `DDGS_ENABLED`, `DDGS_RESULTS_PER_RUN=50`, `DDGS_MAX_RESULTS=60`, `DDGS_INTERVAL_HOURS=6`, `DDGS_SEARCH_CONCURRENCY=1`, `DDGS_MAX_RETRIES=3`, `DDG_COOLDOWN_SECONDS=60`.
+Tranco/feeds are off unless `AUTONOMOUS_SOURCES=tranco,feeds`. Reserved above total is rejected at start.
+
+## Competitors and backlink gap
+
+A competitor is a monitored target like a business (its own DuckDuckGo search, job, schedule and crawl progress) on the SAME shared graph: a page that links
+several targets is fetched once and its links stored once. Customer-business jobs always go first (P0-P2); a new competitor is P3, its reruns P4; at most
+`MAX_ACTIVE_COMPETITOR_JOBS` competitor jobs run at once. Reruns every `COMPETITOR_DDGS_INTERVAL_HOURS` (24).
+
+- `POST /businesses/{domain}/competitors` `{"competitors":[{"domain":"competitor-a.com","business_name":"Competitor A"}]}` (the business must be onboarded;
+  returns known backlinks already in the graph). `GET` list / `GET|PATCH {"active":false}|DELETE /businesses/{domain}/competitors/{competitor}` (delete keeps all crawled data).
+- `GET /competitors/{domain}/backlinks|referring-domains|anchors|history|discovery/status`
+- `GET /businesses/{domain}/backlink-gap[?competitor=x.com]`: referring domains / pages that link the competitors but not you, over the DISCOVERED index only.
 
 ## One-time setup (Windows)
 
@@ -71,7 +89,7 @@ Start order: Redis, workers, engine, then the API and Flower. Run only ONE `auto
 `-P solo` is required on Windows (no prefork); one worker process = one crawl batch at a time, so start several.
 Give every worker its own name (`w1`, `w2`, ...). `%h` does not work in PowerShell, so the examples use `@pc`.
 
-The engine runs until you stop it: it keeps finding domains (Tranco, feeds, Common Crawl), keeps the Celery queue full and re-verifies known backlinks.
+The engine runs until you stop it: it keeps finding domains (Tranco, feeds), keeps the Celery queue full and re-verifies known backlinks.
 It indexes backlinks to every site it crawls; look up a domain with `GET /backlinks/<domain>`. Coverage grows over time and is never complete.
 
 Useful extras (same venv terminal):
@@ -112,4 +130,3 @@ LIVE_BROKER=filesystem python tests/run_celery_live.py   # same without Redis
 - `No module named 'celery'`: you are not in the project venv (prompt must show `(crawlee)`), or skipped `pip install -r requirements.txt`.
 - `Connection refused ... 6379`: Redis is not running.
 - `celery.exe ... blocked` or `no pq wrapper available`: see setup step 5.
-- `/api/backlinks/*` and `POST /api/backlinks/discover` are not wired into the app yet; use `/backlinks/<domain>` and `/crawler/*`.

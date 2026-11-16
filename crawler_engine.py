@@ -140,6 +140,19 @@ def page_facts(soup, base: str) -> tuple[list, str, str | None]:
             soup.title.get_text(strip=True)[:300] if soup.title else None)
 
 
+FENCE: dict[str, int] = {}  # normalized_url -> lease_gen this process got when it claimed the URL (set by autonomous.claim_urls / business_jobs.claim)
+
+
+def stale_lease(conn, norm: str | None) -> bool:
+    """Fencing: True if another worker claimed this URL after we did (its lease expired and was recovered), so our result is
+    outdated and must not overwrite the newer one. URLs never claimed through a lease (manual / tests) are not fenced."""
+    gen = FENCE.get(norm or "")
+    if gen is None:
+        return False
+    r = conn.execute("SELECT lease_gen FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone()
+    return r is None or r["lease_gen"] != gen
+
+
 def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: int | None, ctype: str | None,
                  cfg: Config, approved: set[str], follow: bool, started: str, facts: tuple | None = None) -> list[tuple[str, int]]:
     """Persist one successfully fetched page in ONE transaction (all of it or none of it). Returns internal (url, depth) to crawl next.
@@ -150,6 +163,9 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
     PostgreSQL and the whole transaction is retried by the caller (core.retry_locked), so nothing is half-written."""
     src_dom = core.registrable_domain(core.hostname(key_url))
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", ("page:" + src_dom,))
+    if stale_lease(conn, core.normalize_url(key_url)):
+        log.warning("STALE LEASE: %s was re-claimed by another worker; result dropped", key_url)
+        return []
     links, digest, title = facts or page_facts(soup, base_url)
     links = list(links)  # a deadlock retry re-enters here; do not append the redirect twice
     if base_url != key_url:  # redirect
@@ -291,6 +307,11 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
 def mark_failed(conn, url: str, error: str, status: int | None, cfg: Config, started: str, permanent: bool = False) -> None:
     """A failed fetch changes nothing about links or backlinks; it only schedules a retry with backoff."""
     norm = core.normalize_url(url)
+    stale = stale_lease(conn, norm)
+    FENCE.pop(norm or "", None)  # this claim's outcome is recorded either way
+    if stale:
+        log.warning("STALE LEASE: failure of %s ignored, another worker owns it now", url)
+        return
     row = conn.execute("SELECT retry_count FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone()
     tries = (row["retry_count"] if row else 0) + 1
     if permanent:
@@ -483,8 +504,11 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
                 with core.connect() as c:  # one transaction per page; a deadlock victim is rolled back whole and retried
                     return process_page(c, url, base, depth, soup, status, ctype, cfg, approved, follow, t0, facts)
             return core.retry_locked(once)
-        async with _persist_lock(core.registrable_domain(core.hostname(url))):  # waiting here holds no thread or connection
-            nxt = await asyncio.to_thread(persist)
+        try:
+            async with _persist_lock(core.registrable_domain(core.hostname(url))):  # waiting here holds no thread or connection
+                nxt = await asyncio.to_thread(persist)
+        finally:
+            FENCE.pop(core.normalize_url(url) or "", None)
         finished.add(url)
         _job_add(job_id, "pages_crawled")
         def last():
@@ -694,7 +718,6 @@ async def admit_domain(cfg: Config, job_id: str | None, domain: str, seed_url: s
         with core.connect() as c:
             c.execute("INSERT OR IGNORE INTO discovered_domains (domain, discovery_source) VALUES (?, 'seed')", (domain,))
             c.execute("UPDATE discovered_domains SET discovery_status='admitted' WHERE domain=?", (domain,))
-            c.execute("INSERT OR IGNORE INTO discovery_jobs (domain_id, source) SELECT id, 'commoncrawl' FROM discovered_domains WHERE domain=?", (domain,))
             core.save_url(c, seed_url or origin + "/", None, "seed", 0, True)
             for u, mod in sitemap:
                 if core.registrable_domain(core.hostname(u)) == domain:

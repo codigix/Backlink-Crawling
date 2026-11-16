@@ -4,7 +4,10 @@ Crawling is done only by the standalone autonomous.py process."""
 import re
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
 
+import business_jobs
+import competitors
 import crawler_core as core
 
 router = APIRouter()
@@ -90,7 +93,7 @@ def _graph(c, target: str, active_only: bool = True, limit: int | None = None, o
 @router.get("/backlinks/{target_domain}")
 def backlinks(target_domain: str, include_removed: bool = False, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
     """Backlinks for ANY domain, read from our own link graph; no network call here. A domain with nothing yet is queued for the
-    engine, which looks it up in Common Crawl and crawls the linking sites: call again later (status 'discovering')."""
+    engine's discovery for a business is started by POST /discovery/onboard, never by this GET."""
     target = _clean(target_domain)
     reg = core.registrable_domain(target)
     with core.connect() as c:
@@ -98,21 +101,15 @@ def backlinks(target_domain: str, include_removed: bool = False, limit: int = Qu
         every = _graph(c, target, not include_removed)[1]
         active = sum(link_status(r) == "verified" for r in every)
         refs = len({r["source_domain"] for r in every})
-        state = None
-        if total == 0:
-            done = c.execute("SELECT value FROM engine_state WHERE key=?", (f"cc_done:{reg}",)).fetchone()
-            if done is None:  # never looked up yet (or lookup pending): make sure the engine has the request
-                c.execute("INSERT INTO engine_state (key, value) VALUES (?, '1') ON CONFLICT (key) DO NOTHING", (f"cc_lookup:{reg}",))
-            state = done[0] if done else None
+        job = business_jobs.latest(c, reg)
+    state = business_jobs.api_state(job)
     if total == 0:
-        crawling = state is None or state.startswith("ok:")  # lookup pending, or sources seeded and the crawler is on them
         return {"domain": target, "target_domain": target, "total_backlinks": 0, "referring_domains": 0, "total_referring_domains": 0,
-                "status": "discovering" if crawling else "not_found_in_current_index",
-                "message": "Discovery started: Common Crawl lookup and crawl in progress, check again shortly." if crawling
-                else (f"Common Crawl's referring sites were crawled ({state.split(':')[1]} pages) and no link to this domain was found."
-                      if state.startswith("done:") and state != "done:0:0" else f"No backlinks found ({state})."), "backlinks": []}
+                "status": state, "job_id": job and job["id"], "backlinks": [],
+                "message": "Not onboarded: POST /discovery/onboard to start discovery." if not job else
+                f"No backlink found yet ({job['pages_crawled']} page(s) crawled" + (f"; last error: {job['last_error']}" if job["last_error"] else "") + ")."}
     return {
-        "domain": target, "target_domain": target, "status": "ok", "total_backlinks": total, "verified_backlinks": active,
+        "domain": target, "target_domain": target, "status": "ok", "discovery_status": state, "total_backlinks": total, "verified_backlinks": active,
         "referring_domains": refs, "total_referring_domains": refs, "limit": limit, "offset": offset,
         "backlinks": [{
             "source_url": r["source_url"], "destination_url": r["destination_url"], "anchor_text": r["anchor_text"],
@@ -174,3 +171,177 @@ def backlink_history(target_domain: str, limit: int = Query(200, ge=1, le=1000))
                        "details": r["details"], "origin": "backlink"})
     ev.sort(key=lambda e: e["at"], reverse=True)
     return {"domain": target, "events": ev[:limit]}
+
+
+class OnboardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"domain": "codigix.co"}]})
+    domain: str = Field(min_length=3, max_length=2048, description="The business's domain or website URL, e.g. codigix.co or https://www.codigix.co/")
+
+
+@router.post("/discovery/onboard", status_code=202)
+def discovery_onboard(body: OnboardRequest) -> dict:
+    """Register a business and queue its P0 discovery job; returns at once (the engine searches and crawls). Idempotent per active job."""
+    domain = _clean(body.domain)
+    with core.connect() as c:
+        job, created = business_jobs.create_job(c, domain)
+    return {"domain": job["target_domain"], "job_id": job["id"], "status": "queued" if created else business_jobs.api_state(job),
+            "priority": f"P{job['priority']}", "created": created}
+
+
+@router.post("/businesses", status_code=202)
+def onboard_business(body: OnboardRequest) -> dict:
+    """Older form of /discovery/onboard (returns the whole job)."""
+    with core.connect() as c:
+        job, created = business_jobs.create_job(c, _clean(body.domain))
+    return {"created": created, "job": job}
+
+
+@router.get("/discovery/business/{domain}/status")
+def discovery_business_status(domain: str) -> dict:
+    with core.connect() as c:
+        reg = core.registrable_domain(_clean(domain))
+        job, sched = business_jobs.latest(c, reg), c.execute("SELECT * FROM businesses WHERE domain=?", (reg,)).fetchone()
+    if job is None:
+        raise HTTPException(404, "not onboarded")
+    return {"domain": reg, "status": business_jobs.api_state(job), "job": job, "schedule": dict(sched) if sched else None}
+
+
+@router.get("/discovery/business/{domain}/runs")
+def discovery_business_runs(domain: str, limit: int = Query(50, ge=1, le=500)) -> dict:
+    with core.connect() as c:
+        return {"runs": _page(c, "SELECT * FROM business_jobs WHERE target_domain=? ORDER BY id DESC", [core.registrable_domain(_clean(domain))], limit, 0)}
+
+
+@router.get("/businesses")
+def list_businesses(status: str | None = None, limit: int = Query(100, ge=1, le=1000)) -> dict:
+    with core.connect() as c:
+        where, args = (" WHERE status=?", [status]) if status else ("", [])
+        return {"items": _page(c, "SELECT * FROM business_jobs" + where + " ORDER BY id DESC", args, limit, 0)}
+
+
+@router.get("/businesses/{domain}")
+def business_status(domain: str) -> dict:
+    """Progress of this business's latest discovery job (counters are refreshed by the engine every few seconds)."""
+    with core.connect() as c:
+        job = business_jobs.latest(c, _clean(domain))
+    if job is None:
+        raise HTTPException(404, "not onboarded")
+    return job
+
+
+# ---------- competitors: registered per business; backlinks come from the same shared graph as everyone else's ----------
+
+class CompetitorIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    domain: str = Field(min_length=3, max_length=2048, description="Competitor domain or URL, e.g. competitor-a.com")
+    business_name: str | None = Field(None, max_length=200, description="Optional: improves the DuckDuckGo queries")
+
+
+class CompetitorsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"competitors": [{"domain": "competitor-a.com", "business_name": "Competitor A"}]}]})
+    competitors: list[CompetitorIn] = Field(min_length=1, max_length=20)
+
+
+class ActiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    active: bool
+
+
+def _owner(business_domain: str) -> str:
+    return core.registrable_domain(_clean(business_domain))
+
+
+@router.post("/businesses/{business_domain}/competitors", status_code=202)
+def add_competitors(business_domain: str, body: CompetitorsRequest) -> dict:
+    """Add competitors to a business (e.g. codigix.co, with the TLD); each gets its own discovery job and starts finding backlinks at once
+    (returns immediately). The business is onboarded automatically if it is not yet, because the gap analysis needs its own backlinks too.
+    Per-item result, so one bad domain does not reject the rest."""
+    owner, out = _owner(business_domain), []
+    with core.connect() as c:
+        if not competitors.own_business(c, owner):
+            business_jobs.create_job(c, owner)  # idempotent; also registers its schedule
+        for item in body.competitors:
+            try:
+                out.append(competitors.register(c, owner, item.domain, item.business_name))
+            except ValueError as e:  # invalid host or the business itself
+                out.append({"domain": item.domain, "status": "rejected", "error": str(e)})
+    return {"business_domain": owner, "results": out}
+
+
+@router.get("/businesses/{business_domain}/competitors")
+def list_competitors(business_domain: str) -> dict:
+    owner = _owner(business_domain)
+    with core.connect() as c:
+        if not competitors.own_business(c, owner):
+            raise HTTPException(404, "not an onboarded business")
+        return {"business_domain": owner, "competitors": competitors.listing(c, owner)}
+
+
+@router.get("/businesses/{business_domain}/competitors/{competitor_domain}")
+def get_competitor(business_domain: str, competitor_domain: str) -> dict:
+    with core.connect() as c:
+        d = competitors.detail(c, _owner(business_domain), _clean(competitor_domain))
+    if d is None:
+        raise HTTPException(404, "not a registered competitor of this business")
+    return d
+
+
+@router.patch("/businesses/{business_domain}/competitors/{competitor_domain}")
+def set_competitor_active(business_domain: str, competitor_domain: str, body: ActiveRequest) -> dict:
+    """Enable or disable monitoring (a disabled competitor is not re-searched; its data stays)."""
+    with core.connect() as c:
+        if not competitors.set_active(c, _owner(business_domain), _clean(competitor_domain), body.active):
+            raise HTTPException(404, "not a registered competitor of this business")
+    return {"competitor_domain": core.registrable_domain(_clean(competitor_domain)), "active": body.active}
+
+
+@router.delete("/businesses/{business_domain}/competitors/{competitor_domain}")
+def remove_competitor(business_domain: str, competitor_domain: str) -> dict:
+    """Unregister only. Crawled pages, links, jobs and history are shared graph data and are kept."""
+    with core.connect() as c:
+        if not competitors.remove(c, _owner(business_domain), _clean(competitor_domain)):
+            raise HTTPException(404, "not a registered competitor of this business")
+    return {"removed": True, "data_kept": True}
+
+
+@router.get("/businesses/{business_domain}/backlink-gap")
+def backlink_gap(business_domain: str, competitor: str | None = None, limit: int = Query(200, ge=1, le=2000)) -> dict:
+    """Referring domains and pages that link the competitors but not this business, over the discovered index (not the whole internet)."""
+    try:
+        with core.connect() as c:
+            return competitors.gap(c, _owner(business_domain), _clean(competitor) if competitor else None, limit)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+def _comp(domain: str) -> str:
+    d = _clean(domain)
+    with core.connect() as c:
+        if not competitors.is_competitor(c, d):
+            raise HTTPException(404, "not a registered competitor")
+    return d
+
+
+@router.get("/competitors/{competitor_domain}/backlinks")
+def competitor_backlinks(competitor_domain: str, include_removed: bool = False, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
+    return {**backlinks(_comp(competitor_domain), include_removed, limit, offset), "target_type": "competitor"}
+
+
+@router.get("/competitors/{competitor_domain}/referring-domains")
+def competitor_referring_domains(competitor_domain: str) -> dict:
+    return referring_domains(_comp(competitor_domain))
+
+
+@router.get("/competitors/{competitor_domain}/anchors")
+def competitor_anchors(competitor_domain: str) -> dict:
+    return backlink_anchors(_comp(competitor_domain))
+
+
+@router.get("/competitors/{competitor_domain}/history")
+def competitor_history(competitor_domain: str, limit: int = Query(200, ge=1, le=1000)) -> dict:
+    return backlink_history(_comp(competitor_domain), limit)
+
+
+@router.get("/competitors/{competitor_domain}/discovery/status")
+def competitor_discovery_status(competitor_domain: str) -> dict:
+    return discovery_business_status(_comp(competitor_domain))
