@@ -107,8 +107,10 @@ async def _handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
 
 
 def _listening(url: str) -> bool:
-    try:
-        socket.create_connection(("127.0.0.1", int(url.rsplit(":", 1)[1])), timeout=1).close()
+    try:  # plain connect to an IP literal: no getaddrinfo, so a faked/blocked resolver cannot break the check
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(("127.0.0.1", int(url.rsplit(":", 1)[1])))
         return True
     except OSError:
         return False
