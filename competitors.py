@@ -10,6 +10,13 @@ LINKS = ("SELECT source_url, source_domain, destination_url, anchor_text, rel_at
          " FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND is_active=1 AND source_domain<>? ORDER BY id")
 
 
+GLOBAL = "*"  # owner of a competitor registered once for every business (POST /competitors)
+
+
+def _o(owner: str) -> str:
+    return owner if owner == GLOBAL else _reg(owner)
+
+
 def _reg(domain: str) -> str:
     return core.registrable_domain(core.clean_target(domain))  # ValueError for anything that is not a hostname
 
@@ -34,10 +41,10 @@ def _sync_target(conn, comp: str) -> None:
 def register(conn, owner: str, domain: str, name: str | None = None) -> dict:
     """Register one competitor of `owner` (an onboarded business) and queue its first discovery job. Raises LookupError (owner unknown)
     or ValueError (invalid domain, the owner itself). A repeat registration returns status 'duplicate' and changes nothing."""
-    owner, comp = _reg(owner), _reg(domain)
+    owner, comp = _o(owner), _reg(domain)
     if comp == owner:
         raise ValueError("a business cannot be its own competitor")
-    if not own_business(conn, owner):
+    if owner != GLOBAL and not own_business(conn, owner):
         raise LookupError(f"{owner} is not an onboarded business")  # the API onboards it first; direct callers must
     if not conn.execute("INSERT INTO business_competitors (business_domain, competitor_domain, competitor_name) VALUES (?,?,?) ON CONFLICT DO NOTHING RETURNING id",
                         (owner, comp, name)).fetchone():
@@ -57,7 +64,7 @@ def register(conn, owner: str, domain: str, name: str | None = None) -> dict:
 
 
 def detail(conn, owner: str, comp: str) -> dict | None:
-    owner, comp = _reg(owner), _reg(comp)
+    owner, comp = _o(owner), _reg(comp)
     r = conn.execute("SELECT * FROM business_competitors WHERE business_domain=? AND competitor_domain=?", (owner, comp)).fetchone()
     if not r:
         return None
@@ -68,13 +75,13 @@ def detail(conn, owner: str, comp: str) -> dict | None:
 
 
 def listing(conn, owner: str) -> list[dict]:
-    owner = _reg(owner)
+    owner = _o(owner)
     return [detail(conn, owner, r["competitor_domain"]) for r in conn.execute(
         "SELECT competitor_domain FROM business_competitors WHERE business_domain=? ORDER BY id", (owner,)).fetchall()]
 
 
 def set_active(conn, owner: str, comp: str, active: bool) -> bool:
-    owner, comp = _reg(owner), _reg(comp)
+    owner, comp = _o(owner), _reg(comp)
     n = conn.execute("UPDATE business_competitors SET active=?, updated_at=? WHERE business_domain=? AND competitor_domain=?",
                      (int(active), core.now(), owner, comp)).rowcount
     _sync_target(conn, comp)
@@ -83,7 +90,7 @@ def set_active(conn, owner: str, comp: str, active: bool) -> bool:
 
 def remove(conn, owner: str, comp: str) -> bool:
     """Drops the relation only: crawled pages, outgoing_links, jobs and history stay (they are shared graph data)."""
-    owner, comp = _reg(owner), _reg(comp)
+    owner, comp = _o(owner), _reg(comp)
     n = conn.execute("DELETE FROM business_competitors WHERE business_domain=? AND competitor_domain=?", (owner, comp)).rowcount
     _sync_target(conn, comp)
     return bool(n)
@@ -100,12 +107,13 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200) -> dict:
     owner = _reg(owner)
     if not own_business(conn, owner):
         raise LookupError(f"{owner} is not an onboarded business")
-    comps = [r["competitor_domain"] for r in conn.execute(
-        "SELECT competitor_domain FROM business_competitors WHERE business_domain=? AND active=1 ORDER BY id", (owner,)).fetchall()]
+    comps = [r["competitor_domain"] for r in conn.execute(  # this business's own competitors plus the global ones (never itself)
+        "SELECT competitor_domain FROM business_competitors WHERE business_domain IN (?, ?) AND active=1 AND competitor_domain<>?"
+        " GROUP BY competitor_domain ORDER BY MIN(id)", (owner, GLOBAL, owner)).fetchall()]
     if only:
-        only = _reg(only)
-        if only not in comps:
-            raise LookupError(f"{only} is not an active competitor of {owner}")
+        only = _reg(only)  # any domain can be compared, registered or not: the gap is a read of the shared graph
+        if only == owner:
+            raise LookupError(f"{owner} cannot be compared with itself")
         comps = [only]
     own_rows = conn.execute(LINKS, (owner, owner)).fetchall()
     own_domains = {r["source_domain"] for r in own_rows}

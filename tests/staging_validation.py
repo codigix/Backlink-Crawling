@@ -1,3 +1,4 @@
+# STALE: steps 1/2/9 call the removed per-business /businesses/{domain}/competitors routes; competitors are now global (POST /competitors). Update before use.
 """Live competitor validation against a STAGING copy of the stack: own PostgreSQL schema (DB_SCHEMA=stg_val), own Redis DBs, own API / engine /
 two Celery workers, real DuckDuckGo and the real internet. Nothing here touches the production schema or queue.
 

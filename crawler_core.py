@@ -109,7 +109,7 @@ def host_matches(host: str, target: str) -> bool:
 def clean_target(domain: str) -> str:
     """'https://www.Codigix.co/x' -> 'codigix.co'. Raises ValueError for anything that is not a hostname."""
     d = domain.strip().lower()
-    d = urlsplit(d).hostname or "" if "://" in d else d.split("/")[0]
+    d = urlsplit(d if "://" in d else "//" + d).hostname or ""  # bare domains too, incl. codigix.co:443 / codigix.co?x=1
     d = idna(d.removeprefix("www."))
     if not HOSTNAME.match(d):
         raise ValueError(f"invalid domain: {domain!r}")

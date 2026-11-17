@@ -389,7 +389,7 @@ def test_business_and_competitor_discovery_progress_while_a_scheduler_operation_
     monkeypatch.setattr(bj, "MAX_ACTIVE_COMPETITOR_JOBS", 2)
     with core.connect() as c:
         bj.create_job(c, "own.localhost")
-    crawler_api.add_competitors("own.localhost", crawler_api.CompetitorsRequest(competitors=[crawler_api.CompetitorIn(domain="ca.localhost"), crawler_api.CompetitorIn(domain="cb.localhost")]))
+    crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["ca.localhost", "cb.localhost"]))
     monkeypatch.setattr(autonomous, "retire_exhausted", lambda cfg: (_ for _ in ()).throw(RuntimeError("lock timeout")))
     monkeypatch.setattr(autonomous, "admit_batch", lambda cfg: asyncio.sleep(0, 0))
     eng, c, partial = autonomous.Engine(acfg()), bcfg(), 0

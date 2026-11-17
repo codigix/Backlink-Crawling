@@ -14,9 +14,23 @@ from test_business_jobs import cfg, drive, job_status, onboard, search_with
 from test_crawler import SITES, a, env, page, port, rows  # noqa: F401 - fixtures
 
 
+def db(fn, *a):
+    with core.connect() as c:
+        return fn(c, *a)
+
+
 def reg_comp(owner, *items):
-    return crawler_api.add_competitors(owner, crawler_api.CompetitorsRequest(
-        competitors=[crawler_api.CompetitorIn(domain=d, business_name=n) for d, n in items]))["results"]
+    """Per-business registration (library level; the API registers competitors globally)."""
+    out = []
+    with core.connect() as c:
+        if not competitors.own_business(c, owner):
+            bj.create_job(c, owner)
+        for d, n in items:
+            try:
+                out.append(competitors.register(c, owner, d, n))
+            except ValueError as e:
+                out.append({"domain": d, "status": "rejected", "error": str(e)})
+    return out
 
 
 def link(src: str, dst: str, anchor="x", rel=None, nofollow=0):
@@ -40,9 +54,8 @@ def test_registration_rules_ownership_and_removal_keeps_data(env):
     r = reg_comp("fresh.localhost", ("fa.localhost", None))[0]  # ...the API onboards it on the fly, so no separate step is needed
     assert r["status"] == "registered" and targets()["fresh.localhost"]["target_type"] == "own_business"
     assert rows("SELECT priority FROM business_jobs WHERE target_domain='fresh.localhost'")[0]["priority"] == bj.CrawlPriority.BUSINESS_ONBOARDING
-    with pytest.raises(HTTPException) as e:
+    with pytest.raises(ValueError):
         reg_comp("omxtechnologies", ("fa.localhost", None))  # no TLD: not a domain
-    assert e.value.status_code == 422
     res = reg_comp("own.localhost", ("https://www.Comp-A.localhost/x", "Comp A"), ("comp-b.localhost", None), ("own.localhost", None),
                    ("not a domain", None), ("comp-a.localhost", None))
     assert [r["status"] for r in res] == ["registered", "registered", "rejected", "rejected", "duplicate"]
@@ -60,21 +73,20 @@ def test_registration_rules_ownership_and_removal_keeps_data(env):
     onboard("own2.localhost")
     reg_comp("own2.localhost", ("comp-a.localhost", None))
     assert len(rows("SELECT * FROM business_jobs WHERE target_domain='comp-a.localhost'")) == 1  # not searched twice
-    assert [c["competitor_domain"] for c in crawler_api.list_competitors("own2.localhost")["competitors"]] == ["comp-a.localhost"]  # no leak between owners
+    assert [c["competitor_domain"] for c in db(competitors.listing, "own2.localhost")] == ["comp-a.localhost"]  # no leak between owners
 
     # disable / enable
     link("http://x.localhost/p", "http://comp-a.localhost/", "A")
-    crawler_api.set_competitor_active("own.localhost", "comp-a.localhost", crawler_api.ActiveRequest(active=False))
+    db(competitors.set_active, "own.localhost", "comp-a.localhost", False)
     assert targets()["comp-a.localhost"]["active"] == 1  # own2 still monitors it
-    crawler_api.set_competitor_active("own2.localhost", "comp-a.localhost", crawler_api.ActiveRequest(active=False))
-    assert targets()["comp-a.localhost"]["active"] == 0 and not crawler_api.get_competitor("own.localhost", "comp-a.localhost")["active"]
-    crawler_api.set_competitor_active("own.localhost", "comp-a.localhost", crawler_api.ActiveRequest(active=True))
+    db(competitors.set_active, "own2.localhost", "comp-a.localhost", False)
+    assert targets()["comp-a.localhost"]["active"] == 0 and not db(competitors.detail, "own.localhost", "comp-a.localhost")["active"]
+    db(competitors.set_active, "own.localhost", "comp-a.localhost", True)
     assert targets()["comp-a.localhost"]["active"] == 1
 
     # removal drops the relation only; the graph, jobs and history stay
-    assert crawler_api.remove_competitor("own.localhost", "comp-a.localhost")["data_kept"]
-    with pytest.raises(HTTPException):
-        crawler_api.get_competitor("own.localhost", "comp-a.localhost")
+    assert db(competitors.remove, "own.localhost", "comp-a.localhost")
+    assert db(competitors.detail, "own.localhost", "comp-a.localhost") is None
     assert rows("SELECT COUNT(*) n FROM outgoing_links WHERE destination_domain='comp-a.localhost'")[0]["n"] == 1
     assert len(rows("SELECT * FROM business_jobs WHERE target_domain='comp-a.localhost'")) == 1
 
@@ -198,7 +210,40 @@ def test_backlink_gap_classification_pages_attributes_and_coverage(env):
     assert bl["links"][0]["nofollow"] is True and bl["links"][0]["rel"] == "nofollow"  # attributes preserved, not filtered
     assert any("own.localhost" in w for w in g["coverage"]["warnings"])  # discovery not finished: the answer says so
     assert crawler_api.backlink_gap("own.localhost", "cb.localhost", 100)["summary"]["gap_domains"] == 2  # directory, extra
+    u = crawler_api.backlink_gap("own.localhost", "unknown.localhost", 100)  # not registered: still answered, with a coverage warning
+    assert u["competitors"] == ["unknown.localhost"] and u["summary"]["gap_domains"] == 0
     with pytest.raises(HTTPException):
-        crawler_api.backlink_gap("own.localhost", "unknown.localhost", 100)
-    crawler_api.set_competitor_active("own.localhost", "cb.localhost", crawler_api.ActiveRequest(active=False))
+        crawler_api.backlink_gap("own.localhost", "own.localhost", 100)
+    db(competitors.set_active, "own.localhost", "cb.localhost", False)
     assert crawler_api.backlink_gap("own.localhost", None, 100)["competitors"] == ["ca.localhost"]  # disabled competitors leave the comparison
+
+
+def test_global_competitor_needs_only_a_domain_and_serves_every_business(env):
+    onboard("own1.localhost")
+    onboard("own2.localhost")
+    r = crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["https://gc.localhost/x"]))["results"]
+    assert r[0]["status"] == "registered" and r[0]["domain"] == "gc.localhost"
+    assert crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["gc.localhost"]))["results"][0]["status"] == "duplicate"
+    link("http://dir.localhost/a", "http://gc.localhost/", "g")
+    for o in ("own1.localhost", "own2.localhost"):  # no per-business registration, both see it
+        g = crawler_api.backlink_gap(o, None, 100)
+        assert g["competitors"] == ["gc.localhost"] and g["summary"]["gap_domains"] == 1
+    assert [c["competitor_domain"] for c in crawler_api.list_global_competitors()["competitors"]] == ["gc.localhost"]
+    crawler_api.set_global_competitor_active("gc.localhost", crawler_api.ActiveRequest(active=False))
+    assert crawler_api.backlink_gap("own1.localhost", None, 100)["competitors"] == []
+    assert len(rows("SELECT * FROM job_urls")) >= 0 and rows("SELECT 1 FROM business_jobs WHERE target_domain='gc.localhost'")  # one crawl job, not one per business
+
+
+def test_all_backlinks_route_returns_businesses_and_competitors(env):
+    onboard("own1.localhost")
+    reg_comp("own1.localhost", ("ca.localhost", None))
+    crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["gc.localhost"]))
+    link("http://n.localhost/a", "http://own1.localhost/")
+    link("http://n.localhost/b", "http://ca.localhost/")
+    link("http://d.localhost/a", "http://gc.localhost/")
+    link("http://own1.localhost/x", "http://own1.localhost/")  # internal: never counts
+    r = crawler_api.all_backlinks(None, False, 100, 0)
+    assert r["total_backlinks"] == 3
+    assert {(b["target_domain"], b["target_type"]) for b in r["backlinks"]} == {("own1.localhost", "own_business"), ("ca.localhost", "competitor"), ("gc.localhost", "competitor")}
+    assert {t["domain"]: t["backlinks"] for t in r["targets"]} == {"own1.localhost": 1, "ca.localhost": 1, "gc.localhost": 1}
+    assert crawler_api.all_backlinks("competitor", False, 100, 0)["total_backlinks"] == 2

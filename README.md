@@ -26,8 +26,9 @@ A competitor is a monitored target like a business (its own DuckDuckGo search, j
 several targets is fetched once and its links stored once. Customer-business jobs always go first (P0-P2); a new competitor is P3, its reruns P4; at most
 `MAX_ACTIVE_COMPETITOR_JOBS` competitor jobs run at once. Reruns every `COMPETITOR_DDGS_INTERVAL_HOURS` (24).
 
-- `POST /businesses/{domain}/competitors` `{"competitors":[{"domain":"competitor-a.com","business_name":"Competitor A"}]}` (the business must be onboarded;
-  returns known backlinks already in the graph). `GET` list / `GET|PATCH {"active":false}|DELETE /businesses/{domain}/competitors/{competitor}` (delete keeps all crawled data).
+- `POST /competitors` `{"domains":["competitor-a.com"]}`: registered ONCE for all businesses, crawled once, part of every
+  business's `GET /businesses/{domain}/backlink-gap`. `GET /competitors`, `GET|PATCH {"active":false}|DELETE /competitors/{competitor}` (delete keeps all crawled data).
+  `GET /backlinks` lists the backlinks of all businesses and competitors (`?target_type=`).
 - `GET /competitors/{domain}/backlinks|referring-domains|anchors|history|discovery/status`
 - `GET /businesses/{domain}/backlink-gap[?competitor=x.com]`: referring domains / pages that link the competitors but not you, over the DISCOVERED index only.
 
