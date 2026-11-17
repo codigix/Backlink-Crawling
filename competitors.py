@@ -107,13 +107,13 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200) -> dict:
     owner = _reg(owner)
     if not own_business(conn, owner):
         raise LookupError(f"{owner} is not an onboarded business")
-    comps = [r["competitor_domain"] for r in conn.execute(  # this business's own competitors plus the global ones (never itself)
-        "SELECT competitor_domain FROM business_competitors WHERE business_domain IN (?, ?) AND active=1 AND competitor_domain<>?"
-        " GROUP BY competitor_domain ORDER BY MIN(id)", (owner, GLOBAL, owner)).fetchall()]
+    comps = [r["competitor_domain"] for r in conn.execute(  # only this business's own competitors (never itself)
+        "SELECT competitor_domain FROM business_competitors WHERE business_domain=? AND active=1 AND competitor_domain<>?"
+        " GROUP BY competitor_domain ORDER BY MIN(id)", (owner, owner)).fetchall()]
     if only:
-        only = _reg(only)  # any domain can be compared, registered or not: the gap is a read of the shared graph
-        if only == owner:
-            raise LookupError(f"{owner} cannot be compared with itself")
+        only = _reg(only)
+        if not conn.execute("SELECT 1 FROM business_competitors WHERE business_domain=? AND competitor_domain=?", (owner, only)).fetchone():
+            raise LookupError(f"{only} is not a competitor of {owner}")
         comps = [only]
     own_rows = conn.execute(LINKS, (owner, owner)).fetchall()
     own_domains = {r["source_domain"] for r in own_rows}

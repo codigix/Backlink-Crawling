@@ -210,34 +210,27 @@ def test_backlink_gap_classification_pages_attributes_and_coverage(env):
     assert bl["links"][0]["nofollow"] is True and bl["links"][0]["rel"] == "nofollow"  # attributes preserved, not filtered
     assert any("own.localhost" in w for w in g["coverage"]["warnings"])  # discovery not finished: the answer says so
     assert crawler_api.backlink_gap("own.localhost", "cb.localhost", 100)["summary"]["gap_domains"] == 2  # directory, extra
-    u = crawler_api.backlink_gap("own.localhost", "unknown.localhost", 100)  # not registered: still answered, with a coverage warning
-    assert u["competitors"] == ["unknown.localhost"] and u["summary"]["gap_domains"] == 0
-    with pytest.raises(HTTPException):
-        crawler_api.backlink_gap("own.localhost", "own.localhost", 100)
+    for bad in ("unknown.localhost", "own.localhost"):  # not registered for this business (or itself): 404, never a silent answer
+        with pytest.raises(HTTPException):
+            crawler_api.backlink_gap("own.localhost", bad, 100)
     db(competitors.set_active, "own.localhost", "cb.localhost", False)
     assert crawler_api.backlink_gap("own.localhost", None, 100)["competitors"] == ["ca.localhost"]  # disabled competitors leave the comparison
 
 
-def test_global_competitor_needs_only_a_domain_and_serves_every_business(env):
-    onboard("own1.localhost")
+def test_gap_returns_only_the_competitors_registered_for_that_business(env):
+    R = crawler_api.CompetitorsRequest
     onboard("own2.localhost")
-    r = crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["https://gc.localhost/x"]))["results"]
-    assert r[0]["status"] == "registered" and r[0]["domain"] == "gc.localhost"
-    assert crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["gc.localhost"]))["results"][0]["status"] == "duplicate"
-    link("http://dir.localhost/a", "http://gc.localhost/", "g")
-    for o in ("own1.localhost", "own2.localhost"):  # no per-business registration, both see it
-        g = crawler_api.backlink_gap(o, None, 100)
-        assert g["competitors"] == ["gc.localhost"] and g["summary"]["gap_domains"] == 1
-    assert [c["competitor_domain"] for c in crawler_api.list_global_competitors()["competitors"]] == ["gc.localhost"]
-    crawler_api.set_global_competitor_active("gc.localhost", crawler_api.ActiveRequest(active=False))
-    assert crawler_api.backlink_gap("own1.localhost", None, 100)["competitors"] == []
-    assert len(rows("SELECT * FROM job_urls")) >= 0 and rows("SELECT 1 FROM business_jobs WHERE target_domain='gc.localhost'")  # one crawl job, not one per business
+    crawler_api.add_business_competitors("own1.localhost", R(domains=["c1.localhost"]))
+    crawler_api.add_business_competitors("own2.localhost", R(domains=["c2.localhost"]))
+    link("http://d.localhost/a", "http://c1.localhost/")
+    link("http://d.localhost/b", "http://c2.localhost/")
+    assert crawler_api.backlink_gap("own1.localhost", None, 100)["competitors"] == ["c1.localhost"]
+    assert crawler_api.backlink_gap("own2.localhost", None, 100)["competitors"] == ["c2.localhost"]
 
 
 def test_all_backlinks_route_returns_businesses_and_competitors(env):
     onboard("own1.localhost")
-    reg_comp("own1.localhost", ("ca.localhost", None))
-    crawler_api.add_global_competitors(crawler_api.CompetitorsRequest(domains=["gc.localhost"]))
+    reg_comp("own1.localhost", ("ca.localhost", None), ("gc.localhost", None))
     link("http://n.localhost/a", "http://own1.localhost/")
     link("http://n.localhost/b", "http://ca.localhost/")
     link("http://d.localhost/a", "http://gc.localhost/")
@@ -247,3 +240,14 @@ def test_all_backlinks_route_returns_businesses_and_competitors(env):
     assert {(b["target_domain"], b["target_type"]) for b in r["backlinks"]} == {("own1.localhost", "own_business"), ("ca.localhost", "competitor"), ("gc.localhost", "competitor")}
     assert {t["domain"]: t["backlinks"] for t in r["targets"]} == {"own1.localhost": 1, "ca.localhost": 1, "gc.localhost": 1}
     assert crawler_api.all_backlinks("competitor", False, 100, 0)["total_backlinks"] == 2
+
+
+def test_business_competitor_routes_keep_each_business_own_list(env):
+    R = crawler_api.CompetitorsRequest
+    crawler_api.add_business_competitors("b1.localhost", R(domains=["c1.localhost", "bad domain"]))
+    crawler_api.add_business_competitors("b2.localhost", R(domains=["c2.localhost"]))
+    assert [x["competitor_domain"] for x in crawler_api.list_business_competitors("b1.localhost")["competitors"]] == ["c1.localhost"]
+    assert [x["competitor_domain"] for x in crawler_api.list_business_competitors("b2.localhost")["competitors"]] == ["c2.localhost"]
+    assert crawler_api.remove_business_competitor("b1.localhost", "c1.localhost")["removed"]
+    with pytest.raises(HTTPException):
+        crawler_api.remove_business_competitor("b1.localhost", "c2.localhost")

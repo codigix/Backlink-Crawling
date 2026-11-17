@@ -248,63 +248,43 @@ def business_status(domain: str) -> dict:
     return job
 
 
-# ---------- competitors: registered once for all businesses; backlinks come from the same shared graph as everyone else's ----------
+# ---------- competitors: registered per business; backlinks come from the same shared graph as everyone else's ----------
 
 class CompetitorsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"domains": ["competitor-a.com"]}]})
     domains: list[str] = Field(min_length=1, max_length=20, description="Competitor domains or URLs")
 
 
-class ActiveRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    active: bool
-
-
 def _owner(business_domain: str) -> str:
     return core.registrable_domain(_clean(business_domain))
 
 
-@router.post("/competitors", status_code=202)
-def add_global_competitors(body: CompetitorsRequest) -> dict:
-    """Register competitors once for ALL businesses: only a domain or URL is needed. Each is crawled once and is part of every business's backlink gap."""
-    out = []
+@router.post("/businesses/{business_domain}/competitors", status_code=202)
+def add_business_competitors(business_domain: str, body: CompetitorsRequest) -> dict:
+    """Register competitors of ONE business (onboards it first if needed); only that business's gap includes them."""
+    owner, out = _owner(business_domain), []
     with core.connect() as c:
+        if not competitors.own_business(c, owner):
+            business_jobs.create_job(c, owner)
         for d in body.domains:
             try:
-                out.append(competitors.register(c, competitors.GLOBAL, d))
+                out.append(competitors.register(c, owner, d))
             except ValueError as e:
                 out.append({"domain": d, "status": "rejected", "error": str(e)})
-    return {"results": out}
+    return {"business": owner, "results": out}
 
 
-@router.get("/competitors")
-def list_global_competitors() -> dict:
+@router.get("/businesses/{business_domain}/competitors")
+def list_business_competitors(business_domain: str) -> dict:
     with core.connect() as c:
-        return {"competitors": competitors.listing(c, competitors.GLOBAL)}
+        return {"business": _owner(business_domain), "competitors": competitors.listing(c, _owner(business_domain))}
 
 
-@router.get("/competitors/{competitor_domain}")
-def get_global_competitor(competitor_domain: str) -> dict:
+@router.delete("/businesses/{business_domain}/competitors/{competitor_domain}")
+def remove_business_competitor(business_domain: str, competitor_domain: str) -> dict:
     with core.connect() as c:
-        d = competitors.detail(c, competitors.GLOBAL, _clean(competitor_domain))
-    if d is None:
-        raise HTTPException(404, "not a global competitor")
-    return d
-
-
-@router.patch("/competitors/{competitor_domain}")
-def set_global_competitor_active(competitor_domain: str, body: ActiveRequest) -> dict:
-    with core.connect() as c:
-        if not competitors.set_active(c, competitors.GLOBAL, _clean(competitor_domain), body.active):
-            raise HTTPException(404, "not a global competitor")
-    return {"competitor_domain": core.registrable_domain(_clean(competitor_domain)), "active": body.active}
-
-
-@router.delete("/competitors/{competitor_domain}")
-def remove_global_competitor(competitor_domain: str) -> dict:
-    with core.connect() as c:
-        if not competitors.remove(c, competitors.GLOBAL, _clean(competitor_domain)):
-            raise HTTPException(404, "not a global competitor")
+        if not competitors.remove(c, _owner(business_domain), _clean(competitor_domain)):
+            raise HTTPException(404, "not a competitor of this business")
     return {"removed": True, "data_kept": True}
 
 
