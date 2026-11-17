@@ -9,6 +9,7 @@ import logging
 from fastapi import FastAPI, Security
 from fastapi.security import APIKeyHeader
 
+import api_timing
 import crawler_core
 from autonomous_api import router as discovery_router
 from crawler_api import router as crawler_router
@@ -30,3 +31,4 @@ with crawler_core.connect() as conn:
 app = FastAPI(title="Backlink Crawler", dependencies=[Security(APIKeyHeader(name="X-API-Key", auto_error=False))])
 app.include_router(crawler_router)
 app.include_router(discovery_router)
+api_timing.install(app)  # Server-Timing header (db_connect / db_sql / db_fetch / app / total) and a WARNING for requests over API_SLOW_MS

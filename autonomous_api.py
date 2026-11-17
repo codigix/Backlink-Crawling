@@ -1,21 +1,31 @@
 """Discovery / global-crawler endpoints. Read-only views of PostgreSQL plus flags (pause, bootstrap) for the standalone
 `python autonomous.py` engine."""
 
+from contextlib import nullcontext
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import autonomous
 import crawler_core as core
 import engine_stats
+from api_timing import connect
 
 router = APIRouter()
 
+
+def _stats(connect_fn=None) -> dict:
+    """The shared statistics snapshot (see engine_stats.snapshot_counts); 503 only when there is none at all and the database cannot make one."""
+    try:
+        return engine_stats.snapshot_counts(connect_fn)
+    except engine_stats.StatsUnavailable as e:
+        raise HTTPException(503, "statistics temporarily unavailable") from e
 
 
 @router.post("/discovery/bootstrap", status_code=202)
 def discovery_bootstrap() -> dict:
     """Ask the standalone engine to run every enabled source now (within ~30s). The API itself never fetches anything."""
-    with core.connect() as c:
+    with connect() as c:
         c.execute("INSERT INTO engine_state (key, value) VALUES ('bootstrap_requested', '1') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value")
     return {"requested": True}
 
@@ -32,7 +42,7 @@ def seed(req: SeedRequest) -> dict:
     bad = [u for u in urls if not core.normalize_url(u)]
     if bad or not urls:
         raise HTTPException(422, f"invalid or empty urls: {bad}")
-    with core.connect() as c:
+    with connect() as c:
         c.executemany("INSERT INTO engine_state (key, value) VALUES (?, '1') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                       [(f"seed:{u}",) for u in urls])
     return {"queued": urls}
@@ -40,21 +50,23 @@ def seed(req: SeedRequest) -> dict:
 
 @router.get("/discovery/status")
 def discovery_status() -> dict:
-    with core.connect() as c:
+    with connect() as c:
         return {"sources": [dict(r) for r in c.execute("SELECT * FROM discovery_sources ORDER BY name")],
                 "bootstrapped": c.execute("SELECT COUNT(*) FROM discovery_sources WHERE runs>0").fetchone()[0] > 0}
 
 
 @router.get("/discovery/statistics")
 def discovery_statistics() -> dict:
-    return engine_stats.counts()
+    return _stats(connect)
 
 
 @router.get("/crawler/global-status")
 def global_status() -> dict:
-    with core.connect() as c:
+    with connect() as c:  # one connection for workers, the paused flag and (when a refresh is due) the statistics
         workers = [{**r, "healthy": autonomous.worker_health(r)} for r in map(dict, c.execute("SELECT * FROM worker_status ORDER BY name"))]
-    return {"paused": autonomous.is_paused(), "workers": workers, **engine_stats.counts()}
+        row = c.execute("SELECT value FROM engine_state WHERE key='paused'").fetchone()  # same rule as autonomous.is_paused()
+        stats = _stats(lambda: nullcontext(c))
+    return {"paused": bool(row and row["value"] == "1"), "workers": workers, **stats}
 
 
 @router.post("/crawler/pause")

@@ -566,6 +566,8 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
     def common(**extra) -> dict:
         return dict(
             max_requests_per_crawl=limit, max_request_retries=cfg.max_retries,
+            # fresh per crawler: the default ./storage is shared by every process and purged on start; only temporary run statistics live here
+            storage_client=MemoryStorageClient(),
             concurrency_settings=ConcurrencySettings(desired_concurrency=cfg.concurrency, max_concurrency=cfg.concurrency),
             request_handler_timeout=timedelta(seconds=cfg.timeout * 2 + PERSIST_QUEUE_SECONDS), respect_robots_txt_file=True,
             ignore_http_error_status_codes=PERMANENT_HTTP, http_client=SafeImpitClient(
