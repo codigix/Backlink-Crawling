@@ -297,9 +297,10 @@ def discovery_business_status(domain: str) -> dict:
     with connect() as c:
         reg = core.registrable_domain(_clean(domain))
         job, sched = business_jobs.latest(c, reg), c.execute("SELECT * FROM businesses WHERE domain=?", (reg,)).fetchone()
+        disc = business_jobs.discovery_status(c, reg)
     if job is None:
         raise HTTPException(404, "not onboarded")
-    return {"domain": reg, "status": business_jobs.api_state(job), "job": job, "schedule": dict(sched) if sched else None}
+    return {"domain": reg, "status": business_jobs.api_state(job), "job": job, "schedule": dict(sched) if sched else None, "discovery": disc}
 
 
 @router.get("/discovery/business/{domain}/runs")

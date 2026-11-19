@@ -51,11 +51,22 @@ COMPETITOR_ENABLED = os.environ.get("COMPETITOR_DISCOVERY_ENABLED", "true").lowe
 COMPETITOR_INTERVAL = int(float(os.environ.get("COMPETITOR_DDGS_INTERVAL_HOURS", 24)) * 3600)
 COMPETITOR_RESULTS = min(_env("COMPETITOR_DDGS_RESULTS", 50), _env("DDGS_MAX_RESULTS", 60))
 MAX_ACTIVE_COMPETITOR_JOBS = _env("MAX_ACTIVE_COMPETITOR_JOBS", 1)  # competitor jobs past 'pending' at once (searching or crawling)
+MAX_OUTSTANDING_URLS = _env("MAX_OUTSTANDING_URLS_PER_TARGET", 300)  # open (not yet crawled) URLs one target may hold; above it its next discovery is deferred
+COMPETITOR_STARVATION_SECONDS = _env("DDGS_COMPETITOR_MAX_WAIT_SECONDS", 1800)  # a competitor job waiting this long is claimed before customer re-runs
+FAIR_POLICY = os.environ.get("DDGS_FAIR_POLICY", "hierarchical")  # hierarchical: parent business first, then its own targets | target: every target equal
+FAIR_WINDOW = 50  # due targets looked at per scheduling pass (bounded, so a backlog of deferred targets cannot hide a due one behind it)
 JITTER = 0.1  # next run lands 0-10% after the interval, so businesses onboarded together drift apart
 DDG_COOLDOWN = _env("DDG_COOLDOWN_SECONDS", 60)  # first provider-wide pause after a failed search; doubles per failure of the same job
 LOCK = 724002  # advisory lock serializing every capacity decision (claim) across processes
 ACTIVE = ("pending", "searching", "crawling")
 OPEN_URL = "('pending','crawling','recrawling','retry_pending')"
+
+
+def _group() -> str:
+    """Level 1 of the search rotation: the customer business a target belongs to (a competitor belongs to the owner that registered it)."""
+    if FAIR_POLICY not in ("hierarchical", "target"):
+        raise ValueError(f"DDGS_FAIR_POLICY must be 'hierarchical' or 'target', not {FAIR_POLICY!r}")
+    return "COALESCE(parent_domain, domain)" if FAIR_POLICY == "hierarchical" else "domain"
 
 
 def validate(total: int, reserved: int, per_business: int) -> None:
@@ -111,6 +122,9 @@ def _reschedule(conn, domain: str, ok: bool) -> None:
     if b:
         conn.execute("UPDATE businesses SET last_run_at=?, last_success_at=CASE WHEN ? THEN ? ELSE last_success_at END, next_run_at=? WHERE domain=?",
                      (core.now(), ok, core.now(), core.later(seconds=b["s"] * (1 + random.random() * JITTER)), domain))
+        # every query exhausted: nothing to read until the earliest rediscovery time, so do not schedule a pointless run before it
+        conn.execute("UPDATE businesses SET next_run_at=GREATEST(next_run_at, (SELECT MIN(rediscover_after) FROM discovery_cursors c"
+                     " WHERE c.domain=businesses.domain AND c.status='exhausted')) WHERE domain=? AND discovery_state='waiting_rediscovery'", (domain,))
 
 
 def schedule_due() -> int:
@@ -119,37 +133,76 @@ def schedule_due() -> int:
     if not DDGS_ENABLED:
         return 0
     with core.connect() as c:
-        return len(c.execute(
-            "INSERT INTO business_jobs (target_domain, priority, max_depth, max_pages) SELECT domain,"
-            " CASE WHEN target_type='competitor' THEN ? ELSE ? END, ?, ? FROM businesses WHERE active=1 AND next_run_at<=?"
-            " AND (target_type<>'competitor' OR ?::boolean)"
-            " AND NOT EXISTS (SELECT 1 FROM business_jobs j WHERE j.target_domain=businesses.domain AND j.status IN ('pending','searching','crawling'))"
-            " ORDER BY next_run_at LIMIT GREATEST(? - (SELECT COUNT(*) FROM business_jobs WHERE status IN ('pending','searching')), 0) ON CONFLICT DO NOTHING RETURNING id",
-            (CrawlPriority.COMPETITOR_RECURRING, CrawlPriority.RECURRING, MAX_DISCOVERY_DEPTH, MAX_PAGES_PER_BUSINESS_JOB, core.now(),
-             COMPETITOR_ENABLED, DDG_CONCURRENCY)).fetchall())
+        slots = DDG_CONCURRENCY - c.execute("SELECT COUNT(*) FROM business_jobs WHERE status IN ('pending','searching')").fetchone()[0]
+        if slots <= 0:
+            return 0
+        # least recently searched first (never searched = new targets first); the window is bounded, the cap check only runs on these rows
+        due = c.execute(  # glast: when the business's group (itself + its competitors) last had a turn; the group served longest ago goes first
+            f"SELECT domain, target_type FROM (SELECT domain, target_type, active, next_run_at, last_search_at, MAX(last_search_at) OVER (PARTITION BY {_group()}) glast"
+            " FROM businesses WHERE active=1) b WHERE next_run_at<=? AND (target_type<>'competitor' OR ?::boolean)"
+            " AND NOT EXISTS (SELECT 1 FROM business_jobs j WHERE j.target_domain=b.domain AND j.status IN ('pending','searching','crawling'))"
+            " ORDER BY glast NULLS FIRST, last_search_at NULLS FIRST, next_run_at LIMIT ?", (core.now(), COMPETITOR_ENABLED, FAIR_WINDOW)).fetchall()
+        take, deferred = [], []
+        for r in due:
+            if len(take) >= slots:
+                break
+            (deferred if outstanding(c, r["domain"]) >= MAX_OUTSTANDING_URLS else take).append(r)
+        if deferred:  # stays due: the first pass after its backlog drops below the cap picks it up again, no other trigger needed
+            c.execute("UPDATE businesses SET discovery_state='deferred_backlog' WHERE domain = ANY(?::text[])", ([r["domain"] for r in deferred],))
+        return sum(1 for r in take if c.execute(
+            "INSERT INTO business_jobs (target_domain, priority, max_depth, max_pages) VALUES (?,?,?,?) ON CONFLICT DO NOTHING RETURNING id",
+            (r["domain"], CrawlPriority.COMPETITOR_RECURRING if r["target_type"] == "competitor" else CrawlPriority.RECURRING,
+             MAX_DISCOVERY_DEPTH, MAX_PAGES_PER_BUSINESS_JOB)).fetchone())
+
+
+def outstanding(conn, domain: str) -> int:
+    """Open (waiting or being crawled) URLs of the target's jobs, counted only up to the cap."""
+    return conn.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM job_urls ju JOIN business_jobs j ON j.id=ju.job_id AND j.target_domain=? JOIN discovered_urls u ON u.id=ju.url_id"
+        f" WHERE u.crawl_status IN {OPEN_URL} LIMIT ?) x", (domain, MAX_OUTSTANDING_URLS)).fetchone()[0]
+
+
+def discovery_status(conn, domain: str) -> dict:
+    """Where discovery of one target stands. exhausted = cursors that read past their last page; waiting_rediscovery = ALL of them, until their
+    rediscovery time; deferred_backlog = too many open URLs; failed = the last run ran out of retries; paused = the target is switched off."""
+    b = conn.execute("SELECT active, discovery_state, last_search_at, next_run_at FROM businesses WHERE domain=?", (domain,)).fetchone()
+    if not b:
+        return {"state": "not_started"}
+    cur = conn.execute("SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='exhausted') exhausted, COALESCE(SUM(urls_found),0) urls, MIN(rediscover_after) FILTER"
+                       " (WHERE status='exhausted') rediscover_at FROM discovery_cursors WHERE domain=?", (domain,)).fetchone()
+    return {"state": "paused" if not b["active"] else b["discovery_state"], "last_search_at": b["last_search_at"], "next_run_at": b["next_run_at"],
+            "cursors": cur["total"], "exhausted_cursors": cur["exhausted"], "urls_found": int(cur["urls"]), "rediscover_at": cur["rediscover_at"]}
 
 
 # ---------- search phase ----------
 
-def _claim_kind(c, limit: int, competitor: bool) -> list[dict]:
-    return [dict(r) for r in c.execute(
-        "UPDATE business_jobs SET status='searching', search_gen=search_gen+1, started_at=COALESCE(started_at, ?), updated_at=? WHERE id IN (SELECT j.id FROM business_jobs j WHERE j.status='pending'"
+def _claim_kind(c, limit: int, competitor: bool, aged: bool = False) -> list[dict]:
+    """Claim pending searches of one kind, least recently searched first inside a priority, and stamp last_search_at NOW (the attempt, success or
+    not, is the target's turn). aged: only competitor jobs that have waited past COMPETITOR_STARVATION_SECONDS."""
+    got = [dict(r) for r in c.execute(
+        "UPDATE business_jobs SET status='searching', search_gen=search_gen+1, started_at=COALESCE(started_at, ?), updated_at=? WHERE id IN (SELECT j.id FROM business_jobs j LEFT JOIN (SELECT domain, last_search_at tlast, MAX(last_search_at) OVER (PARTITION BY " + _group() + ") glast"
+        " FROM businesses WHERE active=1) f ON f.domain=j.target_domain WHERE j.status='pending'"
         " AND (j.next_retry_at IS NULL OR j.next_retry_at<=?)"
-        " AND EXISTS (SELECT 1 FROM businesses b WHERE b.domain=j.target_domain AND b.target_type='competitor') = ?::boolean"
-        " ORDER BY j.priority, j.id LIMIT ? FOR UPDATE OF j SKIP LOCKED) RETURNING id, target_domain, retry_count, search_gen,"
+        " AND EXISTS (SELECT 1 FROM businesses b WHERE b.domain=j.target_domain AND b.target_type='competitor') = ?::boolean AND (NOT ?::boolean OR j.created_at<=?)"
+        " ORDER BY j.priority, f.glast NULLS FIRST, f.tlast NULLS FIRST, j.id LIMIT ? FOR UPDATE OF j SKIP LOCKED) RETURNING id, target_domain, retry_count, search_gen,"
         " (SELECT business_name FROM businesses WHERE domain=business_jobs.target_domain) AS name,"
         " (SELECT target_type FROM businesses WHERE domain=business_jobs.target_domain) AS target_type",
-        (core.now(), core.now(), core.now(), competitor, limit))]
+        (core.now(), core.now(), core.now(), competitor, aged, core.later(seconds=-COMPETITOR_STARVATION_SECONDS), limit))]
+    if got:
+        c.execute("UPDATE businesses SET last_search_at=to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') WHERE domain = ANY(?::text[])",
+                  ([j["target_domain"] for j in got],))  # microseconds: two targets claimed in one second still have an order
+    return got
 
 
 def _claim_search(limit: int) -> list[dict]:
     """Customer-business jobs first (P0-P2), then competitor jobs only into the free MAX_ACTIVE_COMPETITOR_JOBS slots (jobs past 'pending').
     shortcut: the slot count is read, not locked; exact because one engine process claims searches serially."""
     with core.connect() as c:
-        got = _claim_kind(c, limit, False)
+        got = _claim_kind(c, 1, True, aged=True) if limit > 0 and COMPETITOR_STARVATION_SECONDS > 0 else []  # an aged competitor first: no starvation by customer re-runs
+        got += _claim_kind(c, limit - len(got), False) if limit > len(got) else []
         active = c.execute("SELECT COUNT(*) FROM business_jobs j JOIN businesses b ON b.domain=j.target_domain AND b.target_type='competitor'"
                            " WHERE j.status IN ('searching','crawling')").fetchone()[0]
-        room = min(limit - len(got), MAX_ACTIVE_COMPETITOR_JOBS - active)
+        room = min(limit - len(got), MAX_ACTIVE_COMPETITOR_JOBS - active - sum(1 for j in got if j["target_type"] == "competitor"))
         return got + (_claim_kind(c, room, True) if room > 0 else [])
 
 
@@ -165,19 +218,22 @@ def _search_failed(job: dict, err: Exception) -> None:
             log.warning("BUSINESS-JOB %s: failure of a superseded search ignored (%r)", job["target_domain"], err)
             return
         if final:
+            c.execute("UPDATE businesses SET discovery_state='failed' WHERE domain=?", (job["target_domain"],))
             _reschedule(c, job["target_domain"], False)
         c.execute("INSERT INTO engine_state (key, value) VALUES ('ddg_cooldown_until', ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                   (core.later(seconds=wait),))  # provider-level: every job waits, not just this one
     log.error("BUSINESS-JOB-ERROR >>> BUSINESS-JOB %s: search failed (%d/%d)%s: %r", job["target_domain"], tries, SEARCH_RETRIES, "" if final else f", retry in {wait}s", err)
 
 
-def _search_done(job: dict, urls: list[str]) -> None:
+def _search_done(job: dict, urls: list[str], run: "ddg_lookup.Run | None" = None) -> None:
     """Store a finished search. Fenced: only the search that currently owns the job (status 'searching', same search_gen) may write; a result
     from a search that was reset and re-claimed meanwhile (engine restart, a second engine) is discarded, so one job never gets two result
-    sets. Candidates are capped by the job's page budget."""
+    sets. Candidates are capped by the job's page budget. With a Run, the pagination cursors and the query provenance of every hit are stored in
+    this same transaction: a cursor never moves past a page whose URLs were not stored, and a URL already known globally is still associated."""
     reg = job["target_domain"]
     ids: list[int] = []
     dup = 0
+    done: set[str] = set()
     with core.connect() as c:
         own = c.execute("UPDATE business_jobs SET status='crawling', last_error=NULL, updated_at=? WHERE id=? AND status='searching' AND search_gen=? RETURNING max_pages",
                         (core.now(), job["id"], job["search_gen"])).fetchone()
@@ -196,6 +252,9 @@ def _search_done(job: dict, urls: list[str]) -> None:
             ok = core.crawlable(u) and dom not in engine.NO_CRAWL_DOMAINS
             core.save_url(c, u, None, "ddg", 0, False, "pending" if ok else "skipped", None, None if ok else "no_crawl")
             ids.append(c.execute("SELECT id FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone()["id"])
+            done.add(norm)
+        if run:
+            _store_run(c, reg, run, done, cut=len(done) < len({core.normalize_url(u) for u in urls} - {None}))
         if ids:
             c.execute("INSERT INTO job_urls (job_id, url_id, depth) SELECT ?, unnest(?::bigint[]), 0 ON CONFLICT DO NOTHING", (job["id"], ids))
         c.execute("UPDATE business_jobs SET search_results=(SELECT COUNT(*) FROM job_urls WHERE job_id=? AND depth=0), duplicate_candidates=? WHERE id=?",
@@ -203,13 +262,45 @@ def _search_done(job: dict, urls: list[str]) -> None:
     log.info(">>> BUSINESS-JOB %s: DuckDuckGo gave %d candidate page(s)", reg, len(ids))
 
 
+def _load_run(domain: str) -> "ddg_lookup.Run":
+    """The target's saved pagination cursors and the URLs it already discovered, two indexed reads."""
+    with core.connect() as c:
+        cursors = {(r["query_hash"], r["backend"]): dict(r) for r in c.execute("SELECT * FROM discovery_cursors WHERE domain=?", (domain,))}
+        known = {r["normalized_url"] for r in c.execute("SELECT u.normalized_url FROM url_discoveries d JOIN discovered_urls u ON u.id=d.url_id"
+                                                        " WHERE d.target_domain=?", (domain,))}
+    return ddg_lookup.Run(cursors, known)
+
+
+def _store_run(c, domain: str, run: "ddg_lookup.Run", done: set[str], cut: bool) -> None:
+    """Cursors, query provenance and the target's discovery state, atomically with the candidate URLs. `cut`: the job's page budget dropped some
+    new URLs, so cursors stay where they were (those pages are read again; what was stored is deduplicated)."""
+    keep = [(h, qh) for h, qh, new in run.hits if not new or core.normalize_url(h) in done]
+    if keep:
+        ids = {r["normalized_url"]: r["id"] for r in c.execute("SELECT id, normalized_url FROM discovered_urls WHERE normalized_url = ANY(?::text[])",
+                                                               (sorted({core.normalize_url(h) for h, _ in keep}),))}
+        pairs = sorted({(ids[n], qh) for h, qh in keep if (n := core.normalize_url(h)) in ids})
+        if pairs:  # a URL found by several targets or several queries keeps every association
+            c.execute("INSERT INTO url_discoveries (url_id, target_domain, query_hash) SELECT unnest(?::bigint[]), ?, unnest(?::text[]) ON CONFLICT DO NOTHING",
+                      ([p[0] for p in pairs], domain, [p[1] for p in pairs]))
+    if not cut:
+        for (qh, backend), k in run.updates.items():
+            c.execute("INSERT INTO discovery_cursors (domain, query_hash, backend, query, next_page, status, dup_streak, pages_done, urls_found, exhausted_at,"
+                      " rediscover_after, last_ok_at, empty_streak) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (domain, query_hash, backend) DO UPDATE SET next_page=EXCLUDED.next_page,"
+                      " empty_streak=EXCLUDED.empty_streak, status=EXCLUDED.status, dup_streak=EXCLUDED.dup_streak, pages_done=EXCLUDED.pages_done, urls_found=EXCLUDED.urls_found,"
+                      " exhausted_at=EXCLUDED.exhausted_at, rediscover_after=EXCLUDED.rediscover_after, last_ok_at=EXCLUDED.last_ok_at",
+                      (domain, qh, backend, k["query"], k["next_page"], k["status"], k["dup_streak"], k["pages_done"], k["urls_found"], k["exhausted_at"],
+                       k["rediscover_after"], k["last_ok_at"], k.get("empty_streak", 0)))
+    c.execute("UPDATE businesses SET discovery_state=? WHERE domain=?", ("waiting_rediscovery" if run.waiting_until else "active", domain))
+
+
 async def _search_one(job: dict) -> None:
     try:
+        run = await asyncio.to_thread(_load_run, job["target_domain"])
         urls = await asyncio.to_thread(ddg_lookup.search_urls, job["target_domain"], COMPETITOR_RESULTS if job.get("target_type") == "competitor" else DDG_RESULTS,
-                                       name=job.get("name"))
+                                       name=job.get("name"), run=run)
     except Exception as e:  # noqa: BLE001 - one business's failed search must never touch another job
         return await asyncio.to_thread(_search_failed, job, e)
-    await asyncio.to_thread(_search_done, job, urls)
+    await asyncio.to_thread(_search_done, job, urls, run)
 
 
 def poll_state() -> dict:

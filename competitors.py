@@ -33,9 +33,11 @@ def known_backlinks(conn, domain: str) -> int:
 
 
 def _sync_target(conn, comp: str) -> None:
-    """A competitor target is monitored while at least one owner has it active; own businesses are never touched."""
-    conn.execute("UPDATE businesses SET active=CASE WHEN EXISTS (SELECT 1 FROM business_competitors WHERE competitor_domain=? AND active=1) THEN 1 ELSE 0 END"
-                 " WHERE domain=? AND target_type='competitor'", (comp, comp))
+    """A competitor target is monitored while at least one owner has it active; own businesses are never touched. Its search turns are charged to
+    one owner (the lowest-sorting active one), so a competitor shared by many businesses is still ONE search stream."""
+    conn.execute("UPDATE businesses SET active=CASE WHEN EXISTS (SELECT 1 FROM business_competitors WHERE competitor_domain=? AND active=1) THEN 1 ELSE 0 END,"
+                 " parent_domain=COALESCE((SELECT MIN(business_domain) FROM business_competitors WHERE competitor_domain=? AND active=1), parent_domain)"
+                 " WHERE domain=? AND target_type='competitor'", (comp, comp, comp))
 
 
 def register(conn, owner: str, domain: str, name: str | None = None) -> dict:

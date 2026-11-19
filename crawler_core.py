@@ -433,6 +433,35 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         # bumped by every claim of the search phase: a result from a search that was reset/re-claimed meanwhile (engine restart, second engine) is discarded
         "ALTER TABLE business_jobs ADD COLUMN IF NOT EXISTS search_gen INTEGER NOT NULL DEFAULT 0",
     ]),
+    # 10 and 11 exist in databases migrated by other work (search_lease_expires, scheduler indexes): never reuse them
+    (12, "continuous discovery: per-query pagination cursors, URL discovery provenance, fair-search order", [
+        # one row per (target, query variation, backend): a backend's page offset is never reused by another backend
+        "CREATE TABLE IF NOT EXISTS discovery_cursors (domain TEXT NOT NULL, query_hash TEXT NOT NULL, backend TEXT NOT NULL, query TEXT NOT NULL,"
+        " next_page INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'active', dup_streak INTEGER NOT NULL DEFAULT 0,"
+        " pages_done INTEGER NOT NULL DEFAULT 0, urls_found INTEGER NOT NULL DEFAULT 0, exhausted_at TEXT, rediscover_after TEXT, last_ok_at TEXT,"
+        " PRIMARY KEY (domain, query_hash, backend))",
+        # which target found which URL through which query: many targets and many queries per URL, never lost to global URL dedup
+        "CREATE TABLE IF NOT EXISTS url_discoveries (url_id BIGINT NOT NULL REFERENCES discovered_urls(id) ON DELETE CASCADE, target_domain TEXT NOT NULL,"
+        " query_hash TEXT NOT NULL, found_at TEXT DEFAULT " + TS + ", PRIMARY KEY (url_id, target_domain, query_hash))",
+        "CREATE INDEX IF NOT EXISTS idx_url_discoveries_target ON url_discoveries(target_domain)",
+        "CREATE INDEX IF NOT EXISTS idx_business_jobs_target ON business_jobs(target_domain, id)",  # outstanding-URL cap and latest-job lookups
+        "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS last_search_at TEXT",  # set on claim/attempt, failures included: the least recently searched goes first
+        "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS discovery_state TEXT NOT NULL DEFAULT 'active'",  # active|deferred_backlog|waiting_rediscovery|failed
+        "CREATE INDEX IF NOT EXISTS idx_businesses_fair ON businesses(last_search_at NULLS FIRST, next_run_at) WHERE active=1",
+        # candidates found before cursors existed count as already discovered by that target
+        "INSERT INTO url_discoveries (url_id, target_domain, query_hash) SELECT DISTINCT ju.url_id, j.target_domain, 'legacy' FROM job_urls ju"
+        " JOIN business_jobs j ON j.id=ju.job_id WHERE ju.depth=0 ON CONFLICT DO NOTHING",
+    ]),
+    (13, "hierarchical search fairness: the customer business a competitor is searched on behalf of; empty-page confirmation", [
+        # level 1 of the rotation. NULL for a customer business (it is its own group); a shared competitor has ONE row and ONE search stream,
+        # grouped under the lowest-sorting active owner
+        "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS parent_domain TEXT",
+        "UPDATE businesses b SET parent_domain=(SELECT MIN(c.business_domain) FROM business_competitors c WHERE c.competitor_domain=b.domain AND c.active=1)"
+        " WHERE b.target_type='competitor' AND b.parent_domain IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_businesses_parent ON businesses(parent_domain) WHERE parent_domain IS NOT NULL",
+        # runs in a row that started on an empty page: a blocked client looks like the end of the results, so one such run does not exhaust a cursor
+        "ALTER TABLE discovery_cursors ADD COLUMN IF NOT EXISTS empty_streak INTEGER NOT NULL DEFAULT 0",
+    ]),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
