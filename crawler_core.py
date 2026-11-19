@@ -462,6 +462,9 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         # runs in a row that started on an empty page: a blocked client looks like the end of the results, so one such run does not exhaust a cursor
         "ALTER TABLE discovery_cursors ADD COLUMN IF NOT EXISTS empty_streak INTEGER NOT NULL DEFAULT 0",
     ]),
+    (14, "discovery_cursors.head_checked_at: when pages 1-2 of a deep cursor were last re-read", [
+        "ALTER TABLE discovery_cursors ADD COLUMN IF NOT EXISTS head_checked_at TEXT",
+    ]),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 

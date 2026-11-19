@@ -12,6 +12,15 @@ import crawler_api
 import crawler_core as core
 import crawler_engine as engine
 import ddg_lookup
+
+
+@pytest.fixture(autouse=True)
+def _fresh_backend_health():
+    ddg_lookup._health.clear()
+    yield
+    ddg_lookup._health.clear()
+
+
 from test_business_jobs import SITES, a, add_job_urls, cfg, drive, env, job_status, onboard, page, port, rows  # noqa: F401 - fixtures
 
 PAST = "2000-01-01 00:00:00"
@@ -170,7 +179,7 @@ def test_fallback_backend_continues_from_its_own_cursor_and_a_dead_backend_is_tr
     calls = web(monkeypatch, {q0: pool, q1: urls(200, "k")}, backends=("b1", "b2"), fail=lambda q, p, b: b == "b1")
     onboard(d)
     with core.connect() as c:  # b2 had been read up to page 7 earlier
-        c.execute("INSERT INTO discovery_cursors (domain, query_hash, backend, query, next_page) VALUES (?,?,?,?,7)", (d, ddg_lookup.qhash(q0), "b2", q0))
+        c.execute("INSERT INTO discovery_cursors (domain, query_hash, backend, query, next_page, head_checked_at) VALUES (?,?,?,?,7,?)", (d, ddg_lookup.qhash(q0), "b2", q0, core.now()))
     asyncio.run(bj.search_pending())
     assert [p for q, p, b in calls if b == "b2" and q == q0][0] == 7  # its own position, not 1 and not anything of b1's
     assert got(d) == pool[60:110]
@@ -660,3 +669,32 @@ def test_blocked_client_or_rate_limit_never_exhausts_anything(env, monkeypatch):
         assert k["status"] == "active" and k["next_page"] == 4 and k["empty_streak"] == 0
         with core.connect() as c:
             c.execute("UPDATE business_jobs SET status='done'")
+
+
+def test_deep_cursor_rereads_the_head_once_per_interval_and_keeps_its_page(env, monkeypatch):
+    d = "head.example"
+    q0 = ddg_lookup.queries(d)[0]
+    calls = web(monkeypatch, {q0: urls(200)}, backends=("b1",))
+    onboard(d)
+    with core.connect() as c:  # deep cursor whose head was last read two days ago
+        c.execute("INSERT INTO discovery_cursors (domain, query_hash, backend, query, next_page, head_checked_at) VALUES (?,?,?,?,8,?)",
+                  (d, ddg_lookup.qhash(q0), "b1", q0, core.later(days=-2)))
+    asyncio.run(bj.search_pending())
+    pages = [p for q, p, b in calls if q == q0]
+    assert pages[:2] == [1, 2] and pages[2] == 8  # head first, then the deep read where it was
+    k = cursors(d)[(q0, "b1")]
+    assert k["next_page"] > 8 and k["head_checked_at"] > core.later(hours=-1)
+
+
+def test_dead_backend_is_skipped_after_two_strikes_and_comes_back_after_an_answer(env, monkeypatch):
+    doms = ["dead1.example", "dead2.example", "dead3.example"]
+    calls = web(monkeypatch, {q: urls(60, d) for d in doms for q in ddg_lookup.queries(d)}, backends=("b1", "b2"), fail=lambda q, p, b: b == "b1")
+    for d in doms:
+        onboard(d)
+        asyncio.run(bj.search_pending())
+    assert len([1 for q, p, b in calls if b == "b1"]) == 2  # two searches paid b1's failure; the third went straight to b2
+    assert ddg_lookup._cooling(["b1", "b2"]) == {"b1"}
+    ddg_lookup._note("b1", True)
+    assert ddg_lookup._cooling(["b1", "b2"]) == set()
+    ddg_lookup._note("b1", False), ddg_lookup._note("b1", False), ddg_lookup._note("b2", False), ddg_lookup._note("b2", False)
+    assert ddg_lookup._cooling(["b1", "b2"]) == set()  # everything cooling: try anyway

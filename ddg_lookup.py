@@ -20,6 +20,11 @@ MAX_PAGES_PER_QUERY = int(os.environ.get("DDGS_MAX_PAGES_PER_QUERY", 5))  # page
 DUP_PAGES_LIMIT = int(os.environ.get("DDGS_DUP_PAGES_LIMIT", 3))  # consecutive pages without a new URL: the query is exhausted on that backend
 REDISCOVERY_SECONDS = int(float(os.environ.get("DDGS_REDISCOVERY_DAYS", 7)) * 86400)  # an exhausted query is read again from page 1 after this long
 EMPTY_CONFIRM = int(os.environ.get("DDGS_EMPTY_CONFIRM_RUNS", 2))  # a run that STARTS on an empty page may be a blocked client: exhausted only after this many such runs
+HEAD_RECHECK_SECONDS = int(float(os.environ.get("DDGS_HEAD_RECHECK_HOURS", 24)) * 3600)  # a cursor deep in the results re-reads pages 1..HEAD_PAGES this often: new pages rank near the top
+HEAD_PAGES = 2
+BACKEND_COOLDOWN = int(os.environ.get("DDGS_BACKEND_COOLDOWN_SECONDS", 600))  # a backend that answered nothing in BACKEND_STRIKES searches in a row is skipped this long
+BACKEND_STRIKES = 2
+_health: dict[str, list] = {}  # backend -> [strikes in a row, skipped until (epoch)]; per process: a search holds the one slot, so a dead engine's timeouts must not be paid again by every search
 SEARCH_BUDGET = int(os.environ.get("DDGS_SEARCH_TIMEOUT_SECONDS", 180))  # wall clock for one whole search: it holds a global search slot
 
 
@@ -48,7 +53,7 @@ class Run:
     def cursor(self, qh: str, backend: str, query: str) -> dict:
         row = self.updates.get((qh, backend)) or self.cursors.get((qh, backend))
         return dict(row) if row else {"query": query, "next_page": 1, "status": "active", "dup_streak": 0, "pages_done": 0, "urls_found": 0,
-                                      "exhausted_at": None, "rediscover_after": None, "last_ok_at": None, "empty_streak": 0}
+                                      "exhausted_at": None, "rediscover_after": None, "last_ok_at": None, "empty_streak": 0, "head_checked_at": None}
 
 
 def _is_empty(e: Exception) -> bool:
@@ -74,6 +79,22 @@ def _page(query: str, page: int, attempts: int, end: float = float("inf"), backe
     return []
 
 
+def _cooling(backends: list[str]) -> set[str]:
+    now = time.time()
+    cool = {b for b in backends if _health.get(b, [0, 0])[1] > now}
+    return set() if len(cool) == len(backends) else cool  # all of them cooling: try anyway, a search that tries nothing finds nothing
+
+
+def _note(backend: str, answered: bool) -> None:
+    if answered:
+        _health.pop(backend, None)
+        return
+    h = _health.setdefault(backend, [0, 0.0])
+    h[0] += 1
+    if h[0] >= BACKEND_STRIKES:
+        h[1] = time.time() + BACKEND_COOLDOWN
+
+
 def _exhaust(cur: dict) -> None:
     cur.update(status="exhausted", exhausted_at=core.now(), rediscover_after=core.later(seconds=REDISCOVERY_SECONDS))
 
@@ -86,6 +107,39 @@ def _usable(cur: dict) -> bool:
         cur.update(status="active", next_page=1, dup_streak=0, exhausted_at=None, rediscover_after=None)
         return True
     return False
+
+
+def _collect(run: Run, hrefs: list[str], qh: str, own: str, found: dict, seen: set) -> int:
+    """Record one page's URLs (a known URL still records WHICH query found it again); returns how many are new to the target."""
+    new = 0
+    for h in hrefs:
+        norm = core.normalize_url(h)
+        if not norm or core.registrable_domain(core.hostname(h)) == own:
+            continue
+        fresh = norm not in run.known and norm not in seen
+        seen.add(norm)
+        run.hits.append((h, qh, fresh))
+        if fresh:
+            found[h] = None
+            new += 1
+    return new
+
+
+def _head(run: Run, q: str, qh: str, backend: str, cur: dict, own: str, found: dict, seen: set, end: float) -> None:
+    """Re-read the first pages of a query whose cursor is deep: results that appeared since come in at the top. Only head_checked_at changes on the
+    cursor (page, duplicate streak and exhaustion belong to the deep read). A failed or empty page is skipped and retried next run."""
+    for page in range(1, HEAD_PAGES + 1):
+        if time.time() > end:
+            return
+        try:
+            hrefs = [r["href"] for r in _page(q, page, 2, end, backend=backend) or [] if r.get("href")]
+        except Exception:  # noqa: BLE001
+            return
+        if not hrefs:
+            return
+        _collect(run, hrefs, qh, own, found, seen)
+        time.sleep(1 + random.random())
+    cur["head_checked_at"] = core.now()
 
 
 def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: str, found: dict, seen: set, target: int, end: float) -> bool:
@@ -109,17 +163,9 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
                 run.updates[(qh, backend)] = dict(cur)
             return got  # an empty page 1 may be a transient "No results" of one engine: never "exhausted"
         got = True
-        new = 0
-        for h in hrefs:
-            norm = core.normalize_url(h)
-            if not norm or core.registrable_domain(core.hostname(h)) == own:
-                continue
-            fresh = norm not in run.known and norm not in seen
-            seen.add(norm)
-            run.hits.append((h, qh, fresh))  # a known URL still records WHICH query found it again
-            if fresh:
-                found[h] = None
-                new += 1
+        if page == 1 and run.persist:
+            cur["head_checked_at"] = core.now()
+        new = _collect(run, hrefs, qh, own, found, seen)
         cur["dup_streak"] = 0 if new else cur["dup_streak"] + 1
         cur.update(empty_streak=0, next_page=page + 1, pages_done=cur["pages_done"] + 1, urls_found=cur["urls_found"] + new, last_ok_at=core.now())
         if cur["dup_streak"] >= (DUP_PAGES_LIMIT if run.persist else 1):
@@ -149,7 +195,7 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
     end = time.time() + (SEARCH_BUDGET if budget is None else budget)
     backends = BACKENDS if run.persist else ["auto"]
     qs = queries(domain, name)
-    dead: set[str] = set()
+    dead: set[str] = _cooling(backends) if run.persist else set()
     for q in qs:
         if len(found) >= target:
             break
@@ -163,14 +209,21 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
             if time.time() > end:
                 err = err or TimeoutError(f"search budget exhausted ({SEARCH_BUDGET if budget is None else budget:.0f}s)")
                 break
+            if run.persist and cur["status"] == "active" and cur["next_page"] > HEAD_PAGES and (cur.get("head_checked_at") or "") <= core.later(seconds=-HEAD_RECHECK_SECONDS):
+                _head(run, q, qh, b, cur, own, found, seen, end)
             try:
                 got = _read(run, q, qh, b, cur, pages, own, found, seen, target, end)
             except Exception as e:  # noqa: BLE001 - remembered; the next backend or query may use another engine
                 err = e
+                if run.persist and (qh, b) not in run.updates:
+                    _note(b, False)
                 if (qh, b) in run.updates:  # it read pages before failing: keep that progress, do not start over elsewhere
                     break
                 dead.add(b)
                 continue
+            if run.persist and b not in dead:
+                if got or cur.get("pages_done", 0) == 0:  # empty on a cursor that never read anything here: a blocked engine; an exhausted cursor's empty page is not
+                    _note(b, got)
             if len(found) >= target or (got and run.updates.get((qh, b), cur)["status"] != "exhausted"):
                 break  # served; an empty or exhausted backend hands the query to the next one
     if run.persist:  # every (query, backend) cursor exhausted and none due yet: nothing to read until the earliest rediscovery time

@@ -285,11 +285,11 @@ def _store_run(c, domain: str, run: "ddg_lookup.Run", done: set[str], cut: bool)
     if not cut:
         for (qh, backend), k in run.updates.items():
             c.execute("INSERT INTO discovery_cursors (domain, query_hash, backend, query, next_page, status, dup_streak, pages_done, urls_found, exhausted_at,"
-                      " rediscover_after, last_ok_at, empty_streak) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (domain, query_hash, backend) DO UPDATE SET next_page=EXCLUDED.next_page,"
+                      " rediscover_after, last_ok_at, empty_streak, head_checked_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (domain, query_hash, backend) DO UPDATE SET next_page=EXCLUDED.next_page,"
                       " empty_streak=EXCLUDED.empty_streak, status=EXCLUDED.status, dup_streak=EXCLUDED.dup_streak, pages_done=EXCLUDED.pages_done, urls_found=EXCLUDED.urls_found,"
-                      " exhausted_at=EXCLUDED.exhausted_at, rediscover_after=EXCLUDED.rediscover_after, last_ok_at=EXCLUDED.last_ok_at",
+                      " exhausted_at=EXCLUDED.exhausted_at, rediscover_after=EXCLUDED.rediscover_after, last_ok_at=EXCLUDED.last_ok_at, head_checked_at=EXCLUDED.head_checked_at",
                       (domain, qh, backend, k["query"], k["next_page"], k["status"], k["dup_streak"], k["pages_done"], k["urls_found"], k["exhausted_at"],
-                       k["rediscover_after"], k["last_ok_at"], k.get("empty_streak", 0)))
+                       k["rediscover_after"], k["last_ok_at"], k.get("empty_streak", 0), k.get("head_checked_at")))
     c.execute("UPDATE businesses SET discovery_state=? WHERE domain=?", ("waiting_rediscovery" if run.waiting_until else "active", domain))
 
 

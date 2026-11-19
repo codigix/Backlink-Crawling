@@ -143,7 +143,7 @@ def _graph_summary(c, target: str, active_only: bool) -> tuple[int, int, int]:
 
 @router.get("/backlinks")
 def all_backlinks(target_type: str | None = Query(None, pattern="^(own_business|competitor)$"), include_removed: bool = False,
-                  limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
+                  limit: int | None = Query(None, ge=1, description="omit to return every backlink"), offset: int = Query(0, ge=0)) -> dict:
     """Backlinks of EVERY monitored target, our businesses and all competitors together (filter with target_type), straight from the link graph."""
     cond = " FROM outgoing_links l JOIN businesses b ON b.domain=l.destination_domain WHERE l.link_type='html' AND l.source_domain<>b.domain"            + ("" if include_removed else " AND l.is_active=1") + (" AND b.target_type=?" if target_type else "")
     args = [target_type] if target_type else []
@@ -163,7 +163,7 @@ def all_backlinks(target_type: str | None = Query(None, pattern="^(own_business|
 
 
 @router.get("/backlinks/{target_domain}")
-def backlinks(target_domain: str, include_removed: bool = False, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
+def backlinks(target_domain: str, include_removed: bool = False, limit: int | None = Query(None, ge=1, description="omit to return every backlink"), offset: int = Query(0, ge=0)) -> dict:
     """Backlinks for ANY domain, read from our own link graph; no network call here. A domain with nothing yet is queued for the
     engine's discovery for a business is started by POST /discovery/onboard, never by this GET."""
     target = _clean(target_domain)
@@ -385,7 +385,7 @@ def _comp(domain: str) -> str:
 
 
 @router.get("/competitors/{competitor_domain}/backlinks")
-def competitor_backlinks(competitor_domain: str, include_removed: bool = False, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)) -> dict:
+def competitor_backlinks(competitor_domain: str, include_removed: bool = False, limit: int | None = Query(None, ge=1, description="omit to return every backlink"), offset: int = Query(0, ge=0)) -> dict:
     return {**backlinks(_comp(competitor_domain), include_removed, limit, offset), "target_type": "competitor"}
 
 
