@@ -17,8 +17,10 @@ import ddg_lookup
 @pytest.fixture(autouse=True)
 def _fresh_backend_health():
     ddg_lookup._health.clear()
+    ddg_lookup._sent.clear()
     yield
     ddg_lookup._health.clear()
+    ddg_lookup._sent.clear()
 
 
 from test_business_jobs import SITES, a, add_job_urls, cfg, drive, env, job_status, onboard, page, port, rows  # noqa: F401 - fixtures
@@ -99,11 +101,11 @@ def test_query_variations_keep_independent_cursors(env, monkeypatch):
     onboard(d)
     asyncio.run(bj.search_pending())
     c = cursors(d)
-    assert len(got(d)) == 50 and c[(q0, "b1")]["status"] == "exhausted" and (q1, "b1") in c and c[(q1, "b1")]["next_page"] == 3
+    assert len(got(d)) == 50 and c[(q0, "b1")]["status"] == "active" and c[(q0, "b1")]["empty_streak"] == 1 and (q1, "b1") in c and c[(q1, "b1")]["next_page"] == 3
     assert (q2, "b1") not in c  # not reached yet
     assert next_batch(d) == urls(60, "b")[20:60]  # q0 is skipped, q1 resumes at page 3
     c = cursors(d)
-    assert c[(q1, "b1")]["status"] == "exhausted" and (q2, "b1") not in c  # q2 answered an empty page 1: nothing to store, never "exhausted"
+    assert c[(q1, "b1")]["empty_streak"] == 1 and (q2, "b1") not in c  # q2 answered an empty page 1: nothing to store, never "exhausted"
 
 
 # 13: results that repeat forever stop the pagination; "exhausted" and "waiting" are different states; rediscovery reads from the start again
@@ -126,7 +128,7 @@ def test_repeated_results_exhaust_then_wait_then_rediscover(env, monkeypatch):
     with core.connect() as c:  # tick closes the empty job and pushes the next run to the rediscovery time, not one interval away
         bj.tick()
         nxt = c.execute("SELECT next_run_at FROM businesses WHERE domain=?", (d,)).fetchone()[0]
-    assert nxt > core.later(days=6)
+    assert nxt > core.later(seconds=ddg_lookup.REDISCOVERY_SECONDS - 3600)
     with core.connect() as c:  # a week passes: the queries become readable again from page 1
         c.execute("UPDATE discovery_cursors SET rediscover_after=? WHERE domain=?", (PAST, d))
     web(monkeypatch, {q: pool + urls(5, "fresh") for q in qs}, per_page=10)
@@ -497,7 +499,7 @@ def test_engine_end_to_end_via_api_with_only_the_ddgs_client_faked(env, monkeypa
     for t in targets:
         q0 = ddg_lookup.queries(t)[0]
         assert [p for q, p, b in log if q == q0 and b == "duckduckgo"] == [1, 2, 3]  # batch 1: page 1; batch 2: page 2, then the empty page 3. Never back to page 1
-        assert cursors(t)[(q0, "duckduckgo")]["status"] == "exhausted"  # read past the last page; the query then rotated to the next backends (only known URLs there)
+        assert cursors(t)[(q0, "duckduckgo")]["empty_streak"] == 1  # read past the last page: counted once, a second run would confirm the end
         assert rows("SELECT COUNT(DISTINCT url_id) n FROM url_discoveries WHERE target_domain=?", t)[0]["n"] == (11 if t == "eb.localhost" else 12)  # every result of the pool, none twice
     assert rows("SELECT COUNT(*) n FROM crawl_history WHERE source_url=?", u("shared"))[0]["n"] == 1
     for t in targets:
@@ -625,8 +627,11 @@ def test_running_off_the_end_exhausts_but_only_after_the_engine_answered(env, mo
     onboard(d)
     asyncio.run(bj.search_pending())
     c = cursors(d)[(q0, "b1")]
-    assert len(got(d)) == 25 and c["status"] == "exhausted" and state(d)["exhausted_cursors"] == 1  # page 4 was empty AFTER pages 1-3 answered: the real end
+    assert len(got(d)) == 25 and c["status"] == "active" and c["empty_streak"] == 1  # page 4 was empty after pages 1-3 answered: counted, not yet believed
     assert job_status(d)["status"] == "crawling" and not job_status(d)["last_error"]  # an empty page is not an error
+    assert next_batch(d) == got(d)
+    c = cursors(d)[(q0, "b1")]
+    assert c["status"] == "exhausted" and c["empty_streak"] == 2 and state(d)["exhausted_cursors"] == 1  # the second run confirms the end
 
 
 def test_a_run_that_starts_on_an_empty_page_needs_confirmation_before_exhausting(env, monkeypatch):
@@ -683,7 +688,7 @@ def test_deep_cursor_rereads_the_head_once_per_interval_and_keeps_its_page(env, 
     pages = [p for q, p, b in calls if q == q0]
     assert pages[:2] == [1, 2] and pages[2] == 8  # head first, then the deep read where it was
     k = cursors(d)[(q0, "b1")]
-    assert k["next_page"] > 8 and k["head_checked_at"] > core.later(hours=-1)
+    assert k["next_page"] > 8 and k["head_checked_at"] > core.later(hours=-7)  # stamped with up to 25% jitter
 
 
 def test_dead_backend_is_skipped_after_two_strikes_and_comes_back_after_an_answer(env, monkeypatch):
@@ -698,3 +703,74 @@ def test_dead_backend_is_skipped_after_two_strikes_and_comes_back_after_an_answe
     assert ddg_lookup._cooling(["b1", "b2"]) == set()
     ddg_lookup._note("b1", False), ddg_lookup._note("b1", False), ddg_lookup._note("b2", False), ddg_lookup._note("b2", False)
     assert ddg_lookup._cooling(["b1", "b2"]) == set()  # everything cooling: try anyway
+
+
+def seed_cursor(d, q, backend="b1", **kw):
+    cols = {"next_page": 3, "status": "exhausted", "pages_done": 2, "exhausted_at": core.later(days=-1), "rediscover_after": core.later(days=5), "empty_streak": 2,
+            "head_checked_at": core.later(days=-2), **kw}
+    with core.connect() as c:
+        c.execute(f"INSERT INTO discovery_cursors (domain, query_hash, backend, query, {', '.join(cols)}) VALUES (?,?,?,?,{', '.join('?' * len(cols))})",
+                  (d, ddg_lookup.qhash(q), backend, q, *cols.values()))
+
+
+def test_empty_streak_counts_runs_and_resets_on_results(env, monkeypatch):
+    d = "streak.localhost"
+    q0 = ddg_lookup.queries(d)[0]
+    ddgs_client(monkeypatch, {q0: urls(25)})
+    onboard(d)
+    asyncio.run(bj.search_pending())
+    assert cursors(d)[(q0, "b1")]["empty_streak"] == 1 and cursors(d)[(q0, "b1")]["status"] == "active"
+    ddgs_client(monkeypatch, {q0: urls(200)})  # the engine now has more behind the "end": the streak resets
+    next_batch(d)
+    k = cursors(d)[(q0, "b1")]
+    assert k["empty_streak"] == 0 and k["status"] == "active" and k["next_page"] > 4
+
+
+def test_head_rescan_on_exhausted_cursor_reactivates_it_only_when_there_is_news(env, monkeypatch):
+    d = "stale.localhost"
+    q0 = ddg_lookup.queries(d)[0]
+    seed_cursor(d, q0)
+    pool = urls(100)
+    web(monkeypatch, {q0: pool})
+    onboard(d)
+    with core.connect() as c:  # the target already knows the first 20 results
+        c.execute("INSERT INTO discovered_urls (url, normalized_url, domain, hostname) SELECT u, u, 'x.example.net', 'x.example.net' FROM unnest(?::text[]) u", (pool[:20],))
+        c.execute("INSERT INTO url_discoveries (url_id, target_domain, query_hash) SELECT id, ?, 'legacy' FROM discovered_urls WHERE normalized_url = ANY(?::text[])", (d, pool[:20]))
+    asyncio.run(bj.search_pending())
+    k = cursors(d)[(q0, "b1")]
+    assert k["status"] == "exhausted" and k["head_checked_at"] > core.later(hours=-7)  # nothing new on pages 1-2: stays exhausted, head stamped
+    with core.connect() as c:
+        c.execute("DELETE FROM url_discoveries WHERE target_domain=? AND url_id IN (SELECT id FROM discovered_urls WHERE normalized_url=?)", (d, pool[3]))
+        c.execute("UPDATE discovery_cursors SET head_checked_at=? WHERE domain=?", (core.later(days=-2), d))
+    next_batch(d)
+    k = cursors(d)[(q0, "b1")]
+    assert pool[3] in got(d) and k["status"] == "active" and k["empty_streak"] == 0 and k["rediscover_after"] is None and k["next_page"] >= 3  # news: active again
+
+
+def test_head_rescan_is_throttled_per_cursor_and_capped_per_hour(env, monkeypatch):
+    doms = [f"cap{i}.localhost" for i in range(4)]
+    calls = web(monkeypatch, {q: urls(30, d) for d in doms for q in ddg_lookup.queries(d)})
+    for d in doms:
+        seed_cursor(d, ddg_lookup.queries(d)[0], head_checked_at=core.now())  # scanned just now: not due
+    monkeypatch.setattr(ddg_lookup, "HOURLY_CAP", 4)
+    ddg_lookup._sent.clear()
+    for d in doms[:2]:
+        seed_cursor(d, ddg_lookup.queries(d)[1], head_checked_at=core.later(days=-2))  # due
+    for d in doms:
+        onboard(d)
+        asyncio.run(bj.search_pending())
+    assert len(calls) <= 4  # the hourly cap held across all four targets
+    assert not any(q == ddg_lookup.queries(doms[3])[0] for q, p, b in calls)  # an exhausted cursor scanned just now is not scanned again
+
+
+def test_rediscovery_default_and_per_target_override(env, monkeypatch):
+    d = "over.localhost"
+    onboard(d)
+    assert bj._load_run(d).rediscovery_seconds == ddg_lookup.REDISCOVERY_SECONDS  # no override set for any target
+    with core.connect() as c:
+        c.execute("UPDATE businesses SET rediscovery_days=1 WHERE domain=?", (d,))
+    run = bj._load_run(d)
+    assert run.rediscovery_seconds == 86400
+    cur = {"status": "active"}
+    ddg_lookup._exhaust(cur, run.rediscovery_seconds)
+    assert cur["rediscover_after"] < core.later(days=1, minutes=1)

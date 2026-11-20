@@ -465,6 +465,9 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (14, "discovery_cursors.head_checked_at: when pages 1-2 of a deep cursor were last re-read", [
         "ALTER TABLE discovery_cursors ADD COLUMN IF NOT EXISTS head_checked_at TEXT",
     ]),
+    (15, "businesses.rediscovery_days: optional per-target override of DDGS_REDISCOVERY_DAYS", [
+        "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS rediscovery_days REAL",  # NULL = the global default; set for no target by this migration
+    ]),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 

@@ -92,7 +92,7 @@ def offline(monkeypatch):
 
 def test_fresh_database_gets_every_version_and_no_schema_problems(schema, monkeypatch):
     migrate_to(monkeypatch, None)
-    assert versions() == [1, 2, 5, 6, 7, 8, 9, 12, 13, 14]  # 3/4 belong to the common-crawl branch, 10/11 to other work: deliberately not reused
+    assert versions() == [1, 2, 5, 6, 7, 8, 9, 12, 13, 14, 15]  # 3/4 belong to the common-crawl branch, 10/11 to other work: deliberately not reused
     with core.connect() as c:
         assert core.schema_problems(c) == []
         cols = {(r[0], r[1]) for r in c.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema=current_schema()")}
@@ -107,7 +107,7 @@ def test_upgrade_from_v9_keeps_every_existing_row_and_backfills(schema, monkeypa
     seed_v9()
     before = snapshot()
     migrate_to(monkeypatch, None)
-    assert versions() == [1, 2, 5, 6, 7, 8, 9, 12, 13, 14]
+    assert versions() == [1, 2, 5, 6, 7, 8, 9, 12, 13, 14, 15]
     assert_unchanged(before, snapshot())
     assert rows("SELECT COUNT(*) n FROM url_discoveries WHERE query_hash='legacy'")[0]["n"] == 6  # 3 candidates for each of two targets
     assert rows("SELECT domain, parent_domain FROM businesses ORDER BY domain") == [
@@ -125,7 +125,7 @@ def test_database_already_at_v11_with_history_this_branch_does_not_know(schema, 
         c.execute("INSERT INTO schema_migrations (version, name) VALUES (10, 'search_lease_expires'), (11, 'indexes for scheduler, metrics and retention')")
     before = snapshot()
     migrate_to(monkeypatch, None)
-    assert versions() == [1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]  # 10 and 11 are left exactly as they were, 12 and 13 are added on top
+    assert versions() == [1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]  # 10 and 11 are left exactly as they were, 12 and 13 are added on top
     after = snapshot()
     assert_unchanged(before, after)
     assert rows("SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND indexname='idx_unknown_v11'")
@@ -142,7 +142,7 @@ def test_database_at_v12_only_gets_v13(schema, monkeypatch):
         c.execute("INSERT INTO business_competitors (business_domain, competitor_domain) VALUES ('o.example', 'c.example')")
     before = snapshot()
     migrate_to(monkeypatch, None)
-    assert versions()[-2:] == [13, 14]
+    assert versions()[-3:] == [13, 14, 15]
     assert_unchanged(before, snapshot())
     assert rows("SELECT parent_domain FROM businesses WHERE domain='c.example'")[0]["parent_domain"] == "o.example"
 
@@ -159,4 +159,4 @@ def test_repeated_migration_changes_nothing(schema, monkeypatch):
         c.execute("DELETE FROM schema_migrations WHERE version IN (12, 13)")
         core.migrate(c, recover=False)
         assert core.schema_problems(c) == []
-    assert versions()[-2:] == [13, 14]
+    assert versions()[-3:] == [13, 14, 15]

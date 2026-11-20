@@ -8,6 +8,7 @@ import hashlib
 import os
 import random
 import time
+from collections import deque
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
@@ -18,10 +19,14 @@ import crawler_core as core
 BACKENDS = [b.strip() for b in os.environ.get("DDGS_BACKENDS", "duckduckgo,brave,bing,yahoo").split(",") if b.strip()]  # first usable one serves a query
 MAX_PAGES_PER_QUERY = int(os.environ.get("DDGS_MAX_PAGES_PER_QUERY", 5))  # pages one run reads per query and backend (10 results each)
 DUP_PAGES_LIMIT = int(os.environ.get("DDGS_DUP_PAGES_LIMIT", 3))  # consecutive pages without a new URL: the query is exhausted on that backend
-REDISCOVERY_SECONDS = int(float(os.environ.get("DDGS_REDISCOVERY_DAYS", 7)) * 86400)  # an exhausted query is read again from page 1 after this long
+REDISCOVERY_SECONDS = int(float(os.environ.get("DDGS_REDISCOVERY_DAYS", 3)) * 86400)  # an exhausted query is read again from page 1 after this long (businesses.rediscovery_days overrides it per target)
 EMPTY_CONFIRM = int(os.environ.get("DDGS_EMPTY_CONFIRM_RUNS", 2))  # a run that STARTS on an empty page may be a blocked client: exhausted only after this many such runs
 HEAD_RECHECK_SECONDS = int(float(os.environ.get("DDGS_HEAD_RECHECK_HOURS", 24)) * 3600)  # a cursor deep in the results re-reads pages 1..HEAD_PAGES this often: new pages rank near the top
 HEAD_PAGES = 2
+HEAD_JITTER = 0.25  # a stamped head re-scan is due up to 25% early, so targets that were scanned together drift apart
+HOURLY_CAP = int(os.environ.get("DDGS_MAX_REQUESTS_PER_HOUR", 1000))  # page requests per hour of this process, all targets; 0 = no cap
+HEAD_CAP_SHARE = 0.5  # head re-scans and rediscovery are optional work: they stop at this share of the cap and leave the rest to the normal reads
+_sent: deque = deque()  # epoch of every page request of the last hour
 BACKEND_COOLDOWN = int(os.environ.get("DDGS_BACKEND_COOLDOWN_SECONDS", 600))  # a backend that answered nothing in BACKEND_STRIKES searches in a row is skipped this long
 BACKEND_STRIKES = 2
 _health: dict[str, list] = {}  # backend -> [strikes in a row, skipped until (epoch)]; per process: a search holds the one slot, so a dead engine's timeouts must not be paid again by every search
@@ -44,8 +49,9 @@ class Run:
     were not stored. cursors: {(query_hash, backend): row} from discovery_cursors; known: normalized URLs this target already has.
     persist=False is the stateless legacy mode (backend "auto", stops at the first page without news)."""
 
-    def __init__(self, cursors: dict | None = None, known: set[str] | None = None, persist: bool = True):
+    def __init__(self, cursors: dict | None = None, known: set[str] | None = None, persist: bool = True, rediscovery_seconds: int | None = None):
         self.persist, self.cursors, self.known = persist, cursors or {}, known or set()
+        self.rediscovery_seconds = rediscovery_seconds or REDISCOVERY_SECONDS
         self.hits: list[tuple[str, str, bool]] = []  # (url, query_hash, new for this target)
         self.updates: dict[tuple[str, str], dict] = {}  # cursor rows to upsert
         self.waiting_until: str | None = None  # every cursor exhausted and none due: the earliest rediscovery time
@@ -95,8 +101,16 @@ def _note(backend: str, answered: bool) -> None:
         h[1] = time.time() + BACKEND_COOLDOWN
 
 
-def _exhaust(cur: dict) -> None:
-    cur.update(status="exhausted", exhausted_at=core.now(), rediscover_after=core.later(seconds=REDISCOVERY_SECONDS))
+def _room(share: float = 1.0) -> bool:
+    """Is there room for one more page request under the hourly cap (`share` of it for optional work)?"""
+    cut = time.time() - 3600
+    while _sent and _sent[0] < cut:
+        _sent.popleft()
+    return HOURLY_CAP <= 0 or len(_sent) < HOURLY_CAP * share
+
+
+def _exhaust(cur: dict, seconds: int = REDISCOVERY_SECONDS) -> None:
+    cur.update(status="exhausted", exhausted_at=core.now(), rediscover_after=core.later(seconds=seconds))
 
 
 def _usable(cur: dict) -> bool:
@@ -125,21 +139,25 @@ def _collect(run: Run, hrefs: list[str], qh: str, own: str, found: dict, seen: s
     return new
 
 
-def _head(run: Run, q: str, qh: str, backend: str, cur: dict, own: str, found: dict, seen: set, end: float) -> None:
-    """Re-read the first pages of a query whose cursor is deep: results that appeared since come in at the top. Only head_checked_at changes on the
-    cursor (page, duplicate streak and exhaustion belong to the deep read). A failed or empty page is skipped and retried next run."""
+def _head(run: Run, q: str, qh: str, backend: str, cur: dict, own: str, found: dict, seen: set, end: float) -> int:
+    """Re-read the first pages of a query whose cursor is deep or exhausted: results that appeared since come in at the top. Only head_checked_at
+    changes on the cursor here. Returns the number of URLs new to the target, or -1 when the scan did not complete (failed or empty page, no budget):
+    nothing is stamped then and it is retried next run."""
+    new = 0
     for page in range(1, HEAD_PAGES + 1):
-        if time.time() > end:
-            return
+        if time.time() > end or not _room(HEAD_CAP_SHARE):
+            return -1
+        _sent.append(time.time())
         try:
             hrefs = [r["href"] for r in _page(q, page, 2, end, backend=backend) or [] if r.get("href")]
         except Exception:  # noqa: BLE001
-            return
+            return -1
         if not hrefs:
-            return
-        _collect(run, hrefs, qh, own, found, seen)
+            return -1
+        new += _collect(run, hrefs, qh, own, found, seen)
         time.sleep(1 + random.random())
-    cur["head_checked_at"] = core.now()
+    cur["head_checked_at"] = core.later(seconds=-random.uniform(0, HEAD_JITTER * HEAD_RECHECK_SECONDS))
+    return new
 
 
 def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: str, found: dict, seen: set, target: int, end: float) -> bool:
@@ -149,17 +167,17 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
     for _ in range(pages):
         if time.time() > end:
             raise TimeoutError("search budget exhausted")
+        if not _room():
+            return got  # hourly cap reached: the cursor stays where it is and the next run continues from it
         page = cur["next_page"]
+        _sent.append(time.time())
         results = _page(q, page, 4 if page == 1 else 2, end, **kw)
         hrefs = [r["href"] for r in results or [] if r.get("href")]
         if not hrefs:
-            if page > 1 and run.persist:
-                if got:  # this run already read a page from this engine: it is answering, so the empty page is the real end of the results
-                    _exhaust(cur)
-                else:  # the run STARTED here: a blocked or limited client looks the same, so it takes repeated runs to call it the end
-                    cur["empty_streak"] = cur.get("empty_streak", 0) + 1
-                    if cur["empty_streak"] >= EMPTY_CONFIRM:
-                        _exhaust(cur)
+            if page > 1 and run.persist:  # an empty page may be a flaky engine: the end of the results needs EMPTY_CONFIRM runs in a row to say so
+                cur["empty_streak"] = cur.get("empty_streak", 0) + 1
+                if cur["empty_streak"] >= EMPTY_CONFIRM:
+                    _exhaust(cur, run.rediscovery_seconds)
                 run.updates[(qh, backend)] = dict(cur)
             return got  # an empty page 1 may be a transient "No results" of one engine: never "exhausted"
         got = True
@@ -170,7 +188,7 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
         cur.update(empty_streak=0, next_page=page + 1, pages_done=cur["pages_done"] + 1, urls_found=cur["urls_found"] + new, last_ok_at=core.now())
         if cur["dup_streak"] >= (DUP_PAGES_LIMIT if run.persist else 1):
             if run.persist:
-                _exhaust(cur)
+                _exhaust(cur, run.rediscovery_seconds)
             run.updates[(qh, backend)] = dict(cur)
             return got
         run.updates[(qh, backend)] = dict(cur)
@@ -204,13 +222,19 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
             if b in dead:  # it already failed in this run without answering: do not spend the budget on its timeouts again
                 continue
             cur = run.cursor(qh, b, q)  # a fallback backend continues from ITS OWN saved page (page 1 when it has none), never from another engine's offset
-            if not _usable(cur):
-                continue
+            usable = _usable(cur)
             if time.time() > end:
                 err = err or TimeoutError(f"search budget exhausted ({SEARCH_BUDGET if budget is None else budget:.0f}s)")
                 break
-            if run.persist and cur["status"] == "active" and cur["next_page"] > HEAD_PAGES and (cur.get("head_checked_at") or "") <= core.later(seconds=-HEAD_RECHECK_SECONDS):
-                _head(run, q, qh, b, cur, own, found, seen, end)
+            if run.persist and (not usable or (cur["status"] == "active" and cur["next_page"] > HEAD_PAGES)) and (cur.get("head_checked_at") or "") <= core.later(seconds=-HEAD_RECHECK_SECONDS):
+                n = _head(run, q, qh, b, cur, own, found, seen, end)
+                if not usable and n >= 0:  # an exhausted query that has news is active again, continuing behind the pages just read
+                    if n:
+                        cur.update(status="active", next_page=HEAD_PAGES + 1, dup_streak=0, empty_streak=0, exhausted_at=None, rediscover_after=None)
+                        usable = True
+                    run.updates[(qh, b)] = dict(cur)
+            if not usable:
+                continue
             try:
                 got = _read(run, q, qh, b, cur, pages, own, found, seen, target, end)
             except Exception as e:  # noqa: BLE001 - remembered; the next backend or query may use another engine

@@ -268,7 +268,8 @@ def _load_run(domain: str) -> "ddg_lookup.Run":
         cursors = {(r["query_hash"], r["backend"]): dict(r) for r in c.execute("SELECT * FROM discovery_cursors WHERE domain=?", (domain,))}
         known = {r["normalized_url"] for r in c.execute("SELECT u.normalized_url FROM url_discoveries d JOIN discovered_urls u ON u.id=d.url_id"
                                                         " WHERE d.target_domain=?", (domain,))}
-    return ddg_lookup.Run(cursors, known)
+        days = c.execute("SELECT rediscovery_days FROM businesses WHERE domain=?", (domain,)).fetchone()
+    return ddg_lookup.Run(cursors, known, rediscovery_seconds=int(days[0] * 86400) if days and days[0] else None)
 
 
 def _store_run(c, domain: str, run: "ddg_lookup.Run", done: set[str], cut: bool) -> None:
