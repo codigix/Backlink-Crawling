@@ -423,3 +423,14 @@ def test_superseded_search_result_is_discarded_and_candidates_respect_the_page_b
     assert j["search_results"] == 5  # the counter is what is stored, not what the last run returned
     bj._search_done(new, urls)  # a duplicate delivery of the same result changes nothing (the job is no longer 'searching')
     assert rows("SELECT COUNT(*) n FROM job_urls WHERE job_id=?", j["id"])[0]["n"] == 5
+
+
+def test_a_search_stuck_in_searching_is_returned_to_pending_without_a_restart(env, monkeypatch):
+    search_with(monkeypatch, {"stuck.localhost": [], "live.localhost": []})
+    with core.connect() as c:
+        c.execute("INSERT INTO business_jobs (target_domain, status, max_depth, max_pages, updated_at) VALUES ('stuck.localhost','searching',3,10,?)",
+                  (core.later(seconds=-bj.STALE_SEARCH - 5),))  # its worker died long ago (DB error after the search, crashed task)
+        c.execute("INSERT INTO business_jobs (target_domain, status, max_depth, max_pages, updated_at) VALUES ('live.localhost','searching',3,10,?)",
+                  (core.now(),))  # a search running right now is left alone
+    assert bj.reset_interrupted(bj.STALE_SEARCH) == 1
+    assert job_status("stuck.localhost")["status"] == "pending" and job_status("live.localhost")["status"] == "searching"

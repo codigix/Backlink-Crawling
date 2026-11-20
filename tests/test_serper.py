@@ -53,11 +53,27 @@ def test_key_never_appears_in_an_error(monkeypatch):
     assert "test-key-not-real" not in str(e.value)
 
 
-def test_serper_leads_the_backends_only_when_a_key_exists(monkeypatch):
+def test_backend_order_is_dogpile_then_ddgs_then_serper(monkeypatch):
+    monkeypatch.setenv("DOGPILE", "1")
     monkeypatch.setenv("DDGS_BACKENDS", "bing,yahoo")
-    assert dl._backends_from_env() == ["serper", "bing", "yahoo"]
-    monkeypatch.setenv("DDGS_BACKENDS", "serper,bing")
-    assert dl._backends_from_env() == ["serper", "bing"]  # not added twice
+    assert dl._backends_from_env() == ["dogpile", "bing", "yahoo", "serper"]
+    monkeypatch.setenv("DDGS_BACKENDS", "dogpile,serper,bing")
+    assert dl._backends_from_env() == ["dogpile", "serper", "bing"]  # not added twice
     monkeypatch.delenv("SERPER_API_KEY")
     monkeypatch.setenv("DDGS_BACKENDS", "bing,yahoo")
+    assert dl._backends_from_env() == ["dogpile", "bing", "yahoo"]
+    monkeypatch.setenv("DOGPILE", "0")
     assert dl._backends_from_env() == ["bing", "yahoo"]
+
+
+def test_dogpile_redirect_is_unwrapped():
+    assert dl._dogpile_url("https://www.dogpile.com/r?ru=https%3A%2F%2Fa.com%2Fx") == "https://a.com/x"
+    assert dl._dogpile_url("https://b.com/y") == "https://b.com/y"
+
+
+def test_tests_never_reach_the_real_serper(monkeypatch):
+    """A developer .env with a real key: conftest blanks it before import, so serper is not a backend, and a real request fails the test."""
+    assert "serper" not in dl.BACKENDS  # computed at import, after conftest blanked the key
+    monkeypatch.setenv("SERPER_API_KEY", "")  # the state every other test runs in (this file's fixture set a dummy key)
+    with pytest.raises(pytest.fail.Exception, match="real serper.dev request"):
+        dl._serper_post({"q": "x"})

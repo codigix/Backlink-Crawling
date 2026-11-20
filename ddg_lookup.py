@@ -7,8 +7,10 @@ Brave p-1), so a cursor is pinned to one backend and a backend never inherits an
 import hashlib
 import os
 import random
+import re
 import time
 from collections import deque
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import httpx
 from ddgs import DDGS
@@ -20,7 +22,9 @@ import crawler_core as core
 def _backends_from_env() -> list[str]:
     b = [x.strip() for x in os.environ.get("DDGS_BACKENDS", "duckduckgo,brave,bing,yahoo").split(",") if x.strip()]  # first usable one serves a query
     if os.environ.get("SERPER_API_KEY") and "serper" not in b:
-        b.insert(0, "serper")  # Google results through serper.dev honour the quoted domain; the scraped engines mostly do not
+        b.append("serper")  # last resort: paid credits, used only when the free engines answered nothing
+    if os.environ.get("DOGPILE", "1") != "0" and "dogpile" not in b:
+        b.insert(0, "dogpile")  # primary engine (headless browser); DOGPILE=0 turns it off
     return b
 
 
@@ -102,6 +106,51 @@ def _serper(query: str, page: int) -> list[dict]:
     return [{"href": x["link"], "title": x.get("title", ""), "body": x.get("snippet", "")} for x in data.get("organic", []) if x.get("link")]
 
 
+def _dogpile_url(href: str) -> str:
+    """Dogpile may wrap a result in its own redirect: pull the real URL out of it."""
+    p = urlparse(href)
+    if "dogpile.com" in p.netloc:
+        for k in ("ru", "url", "u"):
+            if k in (qs := parse_qs(p.query)):
+                return qs[k][0]
+    return href
+
+
+def _dogpile(query: str, page: int) -> list[dict]:
+    """One dogpile.com result page as [{"href": ...}], read with a headless browser (one per call: the search slot is global, so no sharing).
+    [] = the page held no result link; a browser or navigation error raises."""
+    from playwright.sync_api import sync_playwright  # imported here: the module must load where playwright is not installed
+
+    query = re.sub(r"\s*-site:\S+", "", query)  # dogpile answers nothing to -site:; the target's own pages are dropped later by _collect
+
+    out, seen = [], set()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                                      locale="en-US", viewport={"width": 1366, "height": 850})
+            pg = ctx.new_page()
+            pg.goto(f"https://www.dogpile.com/serp?q={quote_plus(query)}&page={page}", wait_until="domcontentloaded", timeout=60000)
+            pg.wait_for_timeout(5000)  # time to pass any bot check and render the results
+            try:
+                pg.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:  # noqa: BLE001 - a page that never goes idle is still readable
+                pass
+            if "temporarily unavailable" in pg.inner_text("body"):  # dogpile's throttle page: a failure, never an empty (= exhausted) page
+                raise RuntimeError("dogpile: search results temporarily unavailable (throttled)")
+            for a in pg.query_selector_all("a[href^='http']"):
+                real = _dogpile_url(a.get_attribute("href") or "")
+                host = urlparse(real).netloc
+                text = (a.inner_text() or "").strip()
+                if not host or "dogpile.com" in host or len(text) < 15 or real in seen:  # menu links and dogpile's own links are short or internal
+                    continue
+                seen.add(real)
+                out.append({"href": real, "title": text.replace("\n", " ")[:150], "body": ""})
+        finally:
+            browser.close()
+    return out
+
+
 def _page(query: str, page: int, attempts: int, end: float = float("inf"), backend: str = "auto") -> list[dict]:
     """One result page. Every attempt uses a fresh client, after an exponential pause with jitter (some engines refuse with 429/403 or answer
     "No results" for a query another one serves). Returns [] when every attempt came back empty; raises the last error when it was a failure
@@ -110,6 +159,8 @@ def _page(query: str, page: int, attempts: int, end: float = float("inf"), backe
         try:
             if backend == "serper":
                 return _serper(query, page)
+            if backend == "dogpile":
+                return _dogpile(query, page)
             with DDGS(timeout=10) as ddgs:
                 return ddgs.text(query, region="in-en", safesearch="moderate", max_results=10, page=page, backend=backend)
         except Exception as e:  # noqa: BLE001

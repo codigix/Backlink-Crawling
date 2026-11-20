@@ -665,6 +665,7 @@ class Engine:
             import tasks
             await asyncio.to_thread(tasks.recover)
             return bool(await asyncio.to_thread(tasks.dispatch))
+        await asyncio.to_thread(release)  # leases of a dead engine process: without this they wait for a restart and its job never closes
         work = await asyncio.to_thread(claim_work, self.forward_owner, self.cfg)
         if not work:
             return False

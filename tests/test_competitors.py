@@ -2,6 +2,8 @@
 backlink gap. Real PostgreSQL (isolated schema), real local HTTP fixtures, real Crawlee rounds; only DuckDuckGo is replaced."""
 
 import asyncio
+import copy
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -251,3 +253,77 @@ def test_business_competitor_routes_keep_each_business_own_list(env):
     assert crawler_api.remove_business_competitor("b1.localhost", "c1.localhost")["removed"]
     with pytest.raises(HTTPException):
         crawler_api.remove_business_competitor("b1.localhost", "c2.localhost")
+
+
+# ---- end to end: customer + two competitors through the real engine crawler loop, with a batch timeout and a dead worker ----
+def test_competitors_crawl_to_completion_one_slot_at_a_time_across_timeout_and_crash(env, monkeypatch):
+    import autonomous
+    import crawler_engine as engine
+    u = env
+    SITES["dir.localhost"] = {"/": page(a("https://codigix.co/"))}
+    for n in (1, 2, 3):  # webfx: 3 candidate sites x (root + 2 internal pages), every page links to webfx.com
+        SITES[f"blog{n}.localhost"] = {"/": page(a("https://webfx.com/"), a("/p0"), a("/p1")), "/p0": page(a("https://webfx.com/")), "/p1": page(a("https://webfx.com/"))}
+    SITES["blog2.localhost"]["/"] = (200, "sleep:3", SITES["blog2.localhost"]["/"][2])  # one slow page: its batch hits the time limit
+    SITES["news.localhost"] = {"/": page(a("https://ignitevisibility.com/"), a("/a")), "/a": page(a("https://ignitevisibility.com/"))}
+    search_with(monkeypatch, {"codigix.co": [u("dir")], "webfx.com": [u(f"blog{n}") for n in (1, 2, 3)], "ignitevisibility.com": [u("news")]})
+    monkeypatch.setattr(bj, "COMPETITOR_STARVATION_SECONDS", 60)
+
+    reg_comp("codigix.co", ("webfx.com", None), ("ignitevisibility.com", None))
+    assert {r["target_domain"]: r["priority"] for r in rows("SELECT * FROM business_jobs")} == {"codigix.co": 0, "webfx.com": 3, "ignitevisibility.com": 3}
+    assert targets()["webfx.com"]["parent_domain"] == targets()["ignitevisibility.com"]["parent_domain"] == "codigix.co"
+
+    c = cfg(claim_batch=3)
+    eng = autonomous.Engine(c)
+    webfx_closed_at = ignite_started_at = None
+    timed_out = crashed = aged = False
+    for i in range(80):
+        asyncio.run(bj.search_pending())
+        bj.tick()
+        st = {r["target_domain"]: r for r in rows("SELECT * FROM business_jobs")}
+        assert sum(st[d]["status"] in ("searching", "crawling") for d in ("webfx.com", "ignitevisibility.com")) <= 1  # one competitor slot
+        if webfx_closed_at is None and st["webfx.com"]["status"] == "done":
+            webfx_closed_at = i
+        if ignite_started_at is None and st["ignitevisibility.com"]["status"] != "pending":
+            ignite_started_at = i
+        if all(r["status"] == "done" for r in st.values()):
+            break
+        if st["webfx.com"]["status"] == "crawling" and not aged:  # ignitevisibility now waited "long": the aged claim must still respect the cap
+            with core.connect() as conn:
+                conn.execute("UPDATE business_jobs SET created_at=? WHERE target_domain='ignitevisibility.com'", (core.later(hours=-1),))
+            aged = True
+        if st["webfx.com"]["status"] == "crawling" and not timed_out:  # a worker whose round runs past its execution limit
+            work = autonomous.claim_work("slow-worker", c)
+            assert u("blog2") in [x for x, _ in work]
+            one = copy.copy(c.crawl)
+            one.concurrency = 1  # so the other two pages have not started when the limit hits
+            t0 = time.monotonic()
+            try:  # Crawlee absorbs the cancel: it lets the request in flight finish, drops the rest and returns
+                asyncio.run(asyncio.wait_for(engine.crawl_round(one, None, work, set(), False, len(work)), 1.5))
+            except TimeoutError:
+                pass
+            assert time.monotonic() - t0 < 6  # cut short: the two fast pages were never fetched
+            autonomous.release("slow-worker")  # what Engine.crawler's finally / the Celery task's error path does
+            status = {r["url"]: r["crawl_status"] for r in rows("SELECT url, crawl_status FROM discovered_urls WHERE url = ANY(?::text[])", [x for x, _ in work])}
+            assert sorted(status.values()).count("pending") >= 1 and "completed" in status.values() and len(set(status.values())) == 2  # progress kept, the rest back in the queue, nothing stuck
+            timed_out = True
+            continue
+        if timed_out and not crashed and st["webfx.com"]["status"] == "crawling":  # a worker claims a batch and dies without a word
+            assert autonomous.claim_work("dead-worker", c)
+            with core.connect() as conn:
+                conn.execute("UPDATE discovered_urls SET lease_expires=? WHERE lease_owner='dead-worker'", (core.later(seconds=-1),))
+            crashed = True
+            continue
+        asyncio.run(eng.crawler())  # the running engine: recovers expired leases, claims, crawls with lease renewal, releases
+    else:
+        raise AssertionError(f"not finished: {[(r['target_domain'], r['status']) for r in rows('SELECT * FROM business_jobs')]}")
+
+    assert timed_out and crashed and aged
+    assert webfx_closed_at is not None and ignite_started_at is not None and ignite_started_at >= webfx_closed_at  # slot handed over, not shared
+    jobs = {r["target_domain"]: r for r in rows("SELECT * FROM business_jobs")}
+    assert jobs["webfx.com"]["pages_crawled"] == jobs["webfx.com"]["pages_discovered"] == 9 and jobs["webfx.com"]["backlinks_found"] == 9
+    assert jobs["ignitevisibility.com"]["pages_crawled"] == 2 and jobs["ignitevisibility.com"]["backlinks_found"] == 2
+    assert jobs["codigix.co"]["backlinks_found"] == 1
+    assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status='crawling'")[0]["n"] == 0  # no stuck or duplicate lease
+    assert rows("SELECT COUNT(*) n FROM (SELECT source_url FROM crawl_history GROUP BY source_url HAVING COUNT(*)>1) x")[0]["n"] == 0  # no page stored twice
+    assert all(t["next_run_at"] > core.now() and t["last_success_at"] for t in targets().values())
+    assert bj.schedule_due() == 0  # a finished target is not requeued at once

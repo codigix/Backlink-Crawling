@@ -198,11 +198,13 @@ def _claim_search(limit: int) -> list[dict]:
     """Customer-business jobs first (P0-P2), then competitor jobs only into the free MAX_ACTIVE_COMPETITOR_JOBS slots (jobs past 'pending').
     shortcut: the slot count is read, not locked; exact because one engine process claims searches serially."""
     with core.connect() as c:
-        got = _claim_kind(c, 1, True, aged=True) if limit > 0 and COMPETITOR_STARVATION_SECONDS > 0 else []  # an aged competitor first: no starvation by customer re-runs
-        got += _claim_kind(c, limit - len(got), False) if limit > len(got) else []
         active = c.execute("SELECT COUNT(*) FROM business_jobs j JOIN businesses b ON b.domain=j.target_domain AND b.target_type='competitor'"
-                           " WHERE j.status IN ('searching','crawling')").fetchone()[0]
-        room = min(limit - len(got), MAX_ACTIVE_COMPETITOR_JOBS - active - sum(1 for j in got if j["target_type"] == "competitor"))
+                           " WHERE j.status IN ('searching','crawling')").fetchone()[0]  # read before claiming, so the claims below are not counted twice
+        free = MAX_ACTIVE_COMPETITOR_JOBS - active
+        # an aged competitor first (no starvation by customer re-runs), but never past the competitor cap
+        got = _claim_kind(c, 1, True, aged=True) if limit > 0 and free > 0 and COMPETITOR_STARVATION_SECONDS > 0 else []
+        got += _claim_kind(c, limit - len(got), False) if limit > len(got) else []
+        room = min(limit - len(got), free - sum(1 for j in got if j["target_type"] == "competitor"))
         return got + (_claim_kind(c, room, True) if room > 0 else [])
 
 
@@ -323,6 +325,8 @@ _last_beat = 0.0
 async def search_pending() -> bool:
     """Start searches for pending jobs: at most DDG_CONCURRENCY at once, none during the provider cooldown. True if any ran."""
     global _last_beat
+    if n := await asyncio.to_thread(reset_interrupted, STALE_SEARCH):
+        log.warning("BUSINESS-JOB: %d search(es) stuck in 'searching' over %ds returned to pending", n, STALE_SEARCH)
     st = await asyncio.to_thread(poll_state)
     busy = st["pending"] or st["searching"]
     log.log(logging.INFO if busy else logging.DEBUG, "BUSINESS-WORKER-POLL pending=%d eligible=%d searching=%d free_slots=%d next_retry_at=%s blocked_by=%s",
@@ -337,10 +341,15 @@ async def search_pending() -> bool:
     return bool(jobs)
 
 
-def reset_interrupted() -> None:
-    """Engine restart: a search that was in flight went down with the old process; run it again."""
+STALE_SEARCH = 3 * ddg_lookup.SEARCH_BUDGET  # a live search ends within its budget plus one page call; older = its worker died or hung
+
+
+def reset_interrupted(older_than: int | None = None) -> int:
+    """Engine restart (every search), or a running engine (searches older than `older_than` s: the worker crashed, a DB error after the search):
+    run it again. search_gen fences out a late result of the abandoned search."""
     with core.connect() as c:
-        c.execute("UPDATE business_jobs SET status='pending' WHERE status='searching'")
+        return c.execute("UPDATE business_jobs SET status='pending' WHERE status='searching' AND (?::int IS NULL OR updated_at<?)",
+                         (older_than, core.later(seconds=-(older_than or 0)))).rowcount
 
 
 # ---------- crawl phase: expansion, progress, completion ----------
