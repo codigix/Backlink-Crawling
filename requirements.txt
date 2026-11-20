@@ -1,12 +1,17 @@
+# Versions the full test suite passed with (217/217, 2026-11-20).
+# After install, Dogpile search needs a browser:  playwright install --with-deps chromium   (or set DOGPILE=0)
 crawlee[beautifulsoup,playwright]==1.11.1
-fastapi
-uvicorn[standard]
-tldextract
-httpx
-pytest
-psycopg[binary]
-python-dotenv
-celery[redis]
-redis
-flower
-ddgs
+playwright==1.64.1
+impit==0.15.1
+beautifulsoup4==4.13.3
+fastapi==0.161.1
+uvicorn[standard]==0.54.0
+tldextract==5.4.0
+httpx==0.28.1
+psycopg[binary]==3.3.6
+python-dotenv==1.1.0
+celery[redis]==5.7.0
+redis==8.1.0
+flower==2.2.0
+ddgs==9.16.1
+pytest==8.4.2
