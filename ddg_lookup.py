@@ -5,6 +5,7 @@ Continuous discovery: every (query variation, backend) has its own saved page cu
 until `target` URLs NEW to the business were found. ddgs page offsets differ per engine (DuckDuckGo 10+(p-2)*15, Bing (p-1)*10, Yahoo (p-1)*7+1,
 Brave p-1), so a cursor is pinned to one backend and a backend never inherits another one's offset."""
 import hashlib
+import logging
 import os
 import random
 import re
@@ -17,6 +18,8 @@ from ddgs import DDGS
 from ddgs.exceptions import DDGSException
 
 import crawler_core as core
+
+log = logging.getLogger("crawler.search")
 
 
 def _backends_from_env() -> list[str]:
@@ -267,6 +270,8 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
                 if cur["empty_streak"] >= EMPTY_CONFIRM:
                     _exhaust(cur, run.rediscovery_seconds)
                 run.updates[(qh, backend)] = dict(cur)
+            elif page == 1:
+                log.warning("search: %s returned no results for %s; trying the next engine", backend, q)
             return got  # an empty page 1 may be a transient "No results" of one engine: never "exhausted"
         got = True
         if page == 1 and run.persist:
@@ -326,6 +331,7 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
             try:
                 got = _read(run, q, qh, b, cur, pages, own, found, seen, target, end)
             except Exception as e:  # noqa: BLE001 - remembered; the next backend or query may use another engine
+                log.warning("search: %s failed for %s: %r", b, q, e)
                 err = e
                 if run.persist and (qh, b) not in run.updates:
                     _note(b, False)
