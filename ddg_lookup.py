@@ -10,13 +10,23 @@ import random
 import time
 from collections import deque
 
+import httpx
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
 
 import crawler_core as core
 
 
-BACKENDS = [b.strip() for b in os.environ.get("DDGS_BACKENDS", "duckduckgo,brave,bing,yahoo").split(",") if b.strip()]  # first usable one serves a query
+def _backends_from_env() -> list[str]:
+    b = [x.strip() for x in os.environ.get("DDGS_BACKENDS", "duckduckgo,brave,bing,yahoo").split(",") if x.strip()]  # first usable one serves a query
+    if os.environ.get("SERPER_API_KEY") and "serper" not in b:
+        b.insert(0, "serper")  # Google results through serper.dev honour the quoted domain; the scraped engines mostly do not
+    return b
+
+
+BACKENDS = _backends_from_env()
+SERPER_DAILY_LIMIT = int(os.environ.get("SERPER_DAILY_LIMIT", 1000))  # serper.dev credits are paid: one per page request; 0 = no limit
+_serper_day: list = ["", 0]  # [UTC day, requests that day] of this process
 MAX_PAGES_PER_QUERY = int(os.environ.get("DDGS_MAX_PAGES_PER_QUERY", 5))  # pages one run reads per query and backend (10 results each)
 DUP_PAGES_LIMIT = int(os.environ.get("DDGS_DUP_PAGES_LIMIT", 3))  # consecutive pages without a new URL: the query is exhausted on that backend
 REDISCOVERY_SECONDS = int(float(os.environ.get("DDGS_REDISCOVERY_DAYS", 3)) * 86400)  # an exhausted query is read again from page 1 after this long (businesses.rediscovery_days overrides it per target)
@@ -67,16 +77,43 @@ def _is_empty(e: Exception) -> bool:
     return type(e) is DDGSException and str(e).strip().lower().startswith("no results found")
 
 
+class SerperStop(RuntimeError):
+    """Retrying cannot help: the daily limit, or a refused key / out of credits."""
+
+
+def _serper_post(payload: dict) -> dict:
+    r = httpx.post("https://google.serper.dev/search", json=payload, headers={"X-API-KEY": os.environ["SERPER_API_KEY"]}, timeout=10)
+    if r.status_code in (400, 401, 402, 403):
+        raise SerperStop(f"serper refused the request (HTTP {r.status_code})")
+    r.raise_for_status()  # the message names the URL and status, never the key
+    return r.json()
+
+
+def _serper(query: str, page: int) -> list[dict]:
+    """One serper.dev (Google) result page as [{"href": ...}]. [] = Google has no more results; anything else wrong raises (a failure is never an empty page)."""
+    day = core.now()[:10]
+    if _serper_day[0] != day:
+        _serper_day[:] = [day, 0]
+    if SERPER_DAILY_LIMIT and _serper_day[1] >= SERPER_DAILY_LIMIT:
+        raise SerperStop(f"serper daily limit of {SERPER_DAILY_LIMIT} requests reached")
+    _serper_day[1] += 1
+    q = query if os.environ.get("SERPER_QUOTES") == "1" else query.replace('"', "")  # free serper accounts refuse quoted queries; SERPER_QUOTES=1 on a paid plan
+    data = _serper_post({"q": q, "page": page, "num": 10, "gl": "in"})
+    return [{"href": x["link"], "title": x.get("title", ""), "body": x.get("snippet", "")} for x in data.get("organic", []) if x.get("link")]
+
+
 def _page(query: str, page: int, attempts: int, end: float = float("inf"), backend: str = "auto") -> list[dict]:
     """One result page. Every attempt uses a fresh client, after an exponential pause with jitter (some engines refuse with 429/403 or answer
     "No results" for a query another one serves). Returns [] when every attempt came back empty; raises the last error when it was a failure
     (rate limit, timeout, transport): a failure is never an empty page."""
     for n in range(attempts):
         try:
+            if backend == "serper":
+                return _serper(query, page)
             with DDGS(timeout=10) as ddgs:
                 return ddgs.text(query, region="in-en", safesearch="moderate", max_results=10, page=page, backend=backend)
         except Exception as e:  # noqa: BLE001
-            last = n == attempts - 1 or time.time() > end
+            last = n == attempts - 1 or time.time() > end or isinstance(e, SerperStop)
             if last and _is_empty(e):
                 return []
             if last:
