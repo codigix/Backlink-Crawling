@@ -134,12 +134,19 @@ def _dogpile(query: str, page: int) -> list[dict]:
                                       locale="en-US", viewport={"width": 1366, "height": 850})
             pg = ctx.new_page()
             pg.goto(f"https://www.dogpile.com/serp?q={quote_plus(query)}&page={page}", wait_until="domcontentloaded", timeout=60000)
-            pg.wait_for_timeout(5000)  # time to pass any bot check and render the results
-            try:
-                pg.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:  # noqa: BLE001 - a page that never goes idle is still readable
-                pass
-            if "temporarily unavailable" in pg.inner_text("body"):  # dogpile's throttle page: a failure, never an empty (= exhausted) page
+            # Wait until the results have loaded: /serp redirects to /search and first shows "Loading search results"; reading then looked "empty".
+            body, deadline = "", time.time() + 30
+            while time.time() < deadline:
+                try:
+                    body = pg.inner_text("body")
+                except Exception:  # noqa: BLE001 - the redirect replaced the page mid-read
+                    body = ""
+                if body and "loading search results" not in body.lower():
+                    break
+                pg.wait_for_timeout(500)
+            else:
+                raise RuntimeError("dogpile: results did not finish loading")  # a failure, never an empty (= exhausted) page
+            if "temporarily unavailable" in body.lower():  # dogpile's throttle page: a failure, never an empty (= exhausted) page
                 raise RuntimeError("dogpile: search results temporarily unavailable (throttled)")
             for a in pg.query_selector_all("a[href^='http']"):
                 real = _dogpile_url(a.get_attribute("href") or "")
@@ -149,6 +156,8 @@ def _dogpile(query: str, page: int) -> list[dict]:
                     continue
                 seen.add(real)
                 out.append({"href": real, "title": text.replace("\n", " ")[:150], "body": ""})
+            if not out:
+                log.warning("dogpile: no result links on %s (%s): %s", pg.url, pg.title(), " | ".join(body.split("\n"))[:300])
         finally:
             browser.close()
     return out
