@@ -126,7 +126,7 @@ def _dogpile(query: str, page: int) -> list[dict]:
 
     query = re.sub(r"\s*-site:\S+", "", query)  # dogpile answers nothing to -site:; the target's own pages are dropped later by _collect
 
-    out, seen = [], set()
+    out, seen, started = [], set(), time.time()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
@@ -148,10 +148,11 @@ def _dogpile(query: str, page: int) -> list[dict]:
                 raise RuntimeError("dogpile: results did not finish loading")  # a failure, never an empty (= exhausted) page
             if "temporarily unavailable" in body.lower():  # dogpile's throttle page: a failure, never an empty (= exhausted) page
                 raise RuntimeError("dogpile: search results temporarily unavailable (throttled)")
-            for a in pg.query_selector_all("a[href^='http']"):
-                real = _dogpile_url(a.get_attribute("href") or "")
+            # one browser round trip for all links: per-link calls (~100 per page) crawled while the engine's crawler held the CPU
+            for href, text in pg.eval_on_selector_all("a[href^='http']", "els => els.map(a => [a.getAttribute('href') || '', a.innerText || ''])"):
+                real = _dogpile_url(href)
                 host = urlparse(real).netloc
-                text = (a.inner_text() or "").strip()
+                text = text.strip()
                 if not host or "dogpile.com" in host or len(text) < 15 or real in seen:  # menu links and dogpile's own links are short or internal
                     continue
                 seen.add(real)
@@ -160,6 +161,8 @@ def _dogpile(query: str, page: int) -> list[dict]:
                 log.warning("dogpile: no result links on %s (%s): %s", pg.url, pg.title(), " | ".join(body.split("\n"))[:300])
         finally:
             browser.close()
+    if time.time() - started > 15:
+        log.warning("dogpile: page %d took %.0fs for %s", page, time.time() - started, query)
     return out
 
 
