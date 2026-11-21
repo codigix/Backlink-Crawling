@@ -71,6 +71,14 @@ def test_dogpile_redirect_is_unwrapped():
     assert dl._dogpile_url("https://b.com/y") == "https://b.com/y"
 
 
+def test_adult_results_are_dropped_and_ordinary_sites_kept():
+    run, found = dl.Run(persist=False), {}
+    hrefs = ["https://www.xnxx.com/hits/1", "https://mobile-xvideos.com/tags/x", "https://anyporn.com/c/", "https://www.redtube.com/1",
+             "https://www.essexlive.news/a", "https://blog.example.com/post", "https://shop.x.com/self"]
+    assert dl._collect(run, hrefs, "qh", "x.com", found, set()) == 2
+    assert list(found) == ["https://www.essexlive.news/a", "https://blog.example.com/post"]  # own site and 18+ sites never become candidates
+
+
 def test_tests_never_reach_the_real_serper(monkeypatch):
     """A developer .env with a real key: conftest blanks it before import, so serper is not a backend, and a real request fails the test."""
     assert "serper" not in dl.BACKENDS  # computed at import, after conftest blanked the key

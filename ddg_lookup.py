@@ -226,12 +226,23 @@ def _usable(cur: dict) -> bool:
     return False
 
 
+# Adult (18+) sites never become crawl candidates: some engines (Bing, Yahoo) answer a quoted domain with porn pages that never link to a business.
+ADULT_WORDS = ("porn", "xxx", "xnxx", "xvideos", "xhamster", "hentai")
+ADULT_DOMAINS = {"redtube.com", "tube8.com", "spankbang.com", "beeg.com", "motherless.com", "chaturbate.com", "stripchat.com", "onlyfans.com",
+                 "brazzers.com", "livejasmin.com", "bongacams.com", "cam4.com"}
+
+
+def is_adult(url: str) -> bool:
+    reg = core.registrable_domain(core.hostname(url))
+    return reg in ADULT_DOMAINS or any(w in reg for w in ADULT_WORDS)
+
+
 def _collect(run: Run, hrefs: list[str], qh: str, own: str, found: dict, seen: set) -> int:
     """Record one page's URLs (a known URL still records WHICH query found it again); returns how many are new to the target."""
     new = 0
     for h in hrefs:
         norm = core.normalize_url(h)
-        if not norm or core.registrable_domain(core.hostname(h)) == own:
+        if not norm or core.registrable_domain(core.hostname(h)) == own or is_adult(h):
             continue
         fresh = norm not in run.known and norm not in seen
         seen.add(norm)
