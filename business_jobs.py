@@ -82,23 +82,34 @@ validate(MAX_CRAWL_WORKERS, BUSINESS_RESERVED_WORKERS, MAX_CONCURRENT_JOBS_PER_B
 # ---------- onboarding ----------
 
 def create_job(conn, domain: str, max_depth: int | None = None, max_pages: int | None = None, name: str | None = None,
-               target_type: str = "own_business") -> tuple[dict, bool]:
-    """(job, created). Registers the business (its recurring schedule) and queues a P0 job now. Idempotent: a domain with an active
-    job returns that job (the partial unique index decides, so concurrent requests cannot create two)."""
+               target_type: str = "own_business", force: bool = False) -> tuple[dict, bool]:
+    """(job, created). Registers the business (its recurring schedule) and queues its FIRST job now (P0, competitors P3). Idempotent:
+    - an active job is returned (the partial unique index decides, so concurrent requests cannot create two);
+    - a target that already had a job gets none: its recurring runs belong to the scheduler, so repeated onboarding calls (a dashboard
+      that POSTs on every page view) can neither flood the search queue nor reset next_run_at. Its latest job is returned.
+    force=True is the deliberate rescan (POST /discovery/business/{domain}/rescan): a new job unless one is active.
+    A competitor that becomes a customer business counts as new: it gets its first customer scan and the customer interval."""
     reg = core.registrable_domain(core.clean_target(domain))
+    was = conn.execute("SELECT target_type FROM businesses WHERE domain=?", (reg,)).fetchone()
+    upgraded = bool(was) and was[0] == "competitor" and target_type == "own_business"
     # a customer business is never downgraded to a competitor: onboarding upgrades a competitor row, registering a competitor leaves an own row alone
     conn.execute("INSERT INTO businesses (domain, business_name, search_interval_seconds, next_run_at, target_type) VALUES (?,?,?,?,?)"
                  " ON CONFLICT (domain) DO UPDATE SET business_name=COALESCE(EXCLUDED.business_name, businesses.business_name), active=1,"
+                 " search_interval_seconds=CASE WHEN businesses.target_type='competitor' AND EXCLUDED.target_type='own_business'"
+                 " THEN EXCLUDED.search_interval_seconds ELSE businesses.search_interval_seconds END,"
                  " target_type=CASE WHEN EXCLUDED.target_type='own_business' THEN 'own_business' ELSE businesses.target_type END",
                  (reg, name, COMPETITOR_INTERVAL if target_type == "competitor" else SEARCH_INTERVAL, core.now(), target_type))
     typ = conn.execute("SELECT target_type FROM businesses WHERE domain=?", (reg,)).fetchone()[0]
-    row = conn.execute("INSERT INTO business_jobs (target_domain, priority, max_depth, max_pages) VALUES (?,?,?,?) ON CONFLICT DO NOTHING RETURNING *",
+    # one statement: "never had a job" and the insert cannot be split by a concurrent request; the unique index settles a tie
+    row = conn.execute("INSERT INTO business_jobs (target_domain, priority, max_depth, max_pages) SELECT ?,?,?,?"
+                       " WHERE ?::boolean OR NOT EXISTS (SELECT 1 FROM business_jobs WHERE target_domain=?) ON CONFLICT DO NOTHING RETURNING *",
                        (reg, CrawlPriority.COMPETITOR_INITIAL if typ == "competitor" else CrawlPriority.BUSINESS_ONBOARDING,
-                        max_depth or MAX_DISCOVERY_DEPTH, max_pages or MAX_PAGES_PER_BUSINESS_JOB)).fetchone()
+                        max_depth or MAX_DISCOVERY_DEPTH, max_pages or MAX_PAGES_PER_BUSINESS_JOB, force or upgraded, reg)).fetchone()
     if row:
-        log.info(">>> BUSINESS-JOB %s: created (id %s)", reg, row["id"])
+        log.info(">>> BUSINESS-JOB %s: created (id %s%s)", reg, row["id"], ", forced rescan" if force else "")
         return dict(row), True
-    return dict(conn.execute("SELECT * FROM business_jobs WHERE target_domain=? AND status IN ('pending','searching','crawling')", (reg,)).fetchone()), False
+    active = conn.execute("SELECT * FROM business_jobs WHERE target_domain=? AND status IN ('pending','searching','crawling')", (reg,)).fetchone()
+    return dict(active or conn.execute("SELECT * FROM business_jobs WHERE target_domain=? ORDER BY id DESC LIMIT 1", (reg,)).fetchone()), False
 
 
 def latest(conn, domain: str) -> dict | None:
@@ -356,26 +367,45 @@ def reset_interrupted(older_than: int | None = None) -> int:
 
 def expand(conn, job: dict) -> int:
     """Move the job one level deeper through pages already crawled (by anyone): their stored html links to the SAME site become job URLs
-    at depth+1 (external ones stay in the graph but are not followed unless FOLLOW_EXTERNAL_DOMAINS), within the job's depth and page budget. Returns pages examined."""
+    at depth+1 (external ones stay in the graph but are not followed unless FOLLOW_EXTERNAL_DOMAINS), within the job's depth and page budget. Returns pages examined.
+    Set-based: the links of all ready pages, the candidate URL rows and the page budget are read once, the rows are walked in the same
+    (depth, url_id) order the per-page version used (earlier pages claim a URL first, the budget shrinks as URLs are added), and the writes are
+    one INSERT, one UPDATE and one `expanded` update for the whole batch instead of ~6 statements per page."""
     ready = conn.execute(
         "SELECT ju.url_id, ju.depth, u.url, u.domain, u.crawl_status FROM job_urls ju JOIN discovered_urls u ON u.id=ju.url_id"
         " WHERE ju.job_id=? AND ju.expanded=0 AND u.crawl_status IN ('completed','failed','skipped') ORDER BY ju.depth, ju.url_id LIMIT 200", (job["id"],)).fetchall()
+    if not ready:
+        return 0
+    room = job["max_pages"] - conn.execute("SELECT COUNT(*) FROM job_urls WHERE job_id=?", (job["id"],)).fetchone()[0]
+    sources = [r["url"] for r in ready if r["crawl_status"] == "completed" and r["depth"] < job["max_depth"]]
+    links: dict[str, set[str]] = {}  # source page -> normalized destinations of its active html links
+    cands: dict[str, tuple[int, str]] = {}  # normalized url -> (id, domain) of the stored URLs that are not yet in this job and not on the target's own domain
+    if sources and room > 0:
+        for x in conn.execute("SELECT source_url, destination_url FROM outgoing_links WHERE source_url = ANY(?::text[]) AND link_type='html' AND is_active=1", (sources,)):
+            if n := core.normalize_url(x["destination_url"]):
+                links.setdefault(x["source_url"], set()).add(n)
+        norms = set().union(*links.values())
+        if norms:
+            cands = {x["normalized_url"]: (x["id"], x["domain"]) for x in conn.execute(
+                "SELECT id, normalized_url, domain FROM discovered_urls d WHERE normalized_url = ANY(?::text[]) AND domain<>? AND NOT EXISTS"
+                " (SELECT 1 FROM job_urls j WHERE j.job_id=? AND j.url_id=d.id)", (sorted(norms), job["target_domain"], job["id"]))}
+    added: dict[int, int] = {}  # url id -> depth, in the order the pages added them
     for r in ready:
-        room = job["max_pages"] - conn.execute("SELECT COUNT(*) FROM job_urls WHERE job_id=?", (job["id"],)).fetchone()[0]
-        if r["crawl_status"] == "completed" and r["depth"] < job["max_depth"] and room > 0:
-            norms = {n for n in (core.normalize_url(x["destination_url"]) for x in conn.execute(
-                "SELECT destination_url FROM outgoing_links WHERE source_url=? AND link_type='html' AND is_active=1", (r["url"],)).fetchall()) if n}
-            if norms:
-                new = [x["id"] for x in conn.execute(
-                    "SELECT id FROM discovered_urls d WHERE normalized_url = ANY(?::text[]) AND domain<>? AND (?::boolean OR domain=?) AND NOT EXISTS"
-                    " (SELECT 1 FROM job_urls j WHERE j.job_id=? AND j.url_id=d.id) ORDER BY id LIMIT ?",
-                    (sorted(norms), job["target_domain"], FOLLOW_EXTERNAL_DOMAINS, r["domain"], job["id"], room)).fetchall()]
-                if new:
-                    conn.execute("INSERT INTO job_urls (job_id, url_id, depth) SELECT ?, unnest(?::bigint[]), ? ON CONFLICT DO NOTHING", (job["id"], new, r["depth"] + 1))
-                    # skipped only because ANOTHER crawl reached it too deep: within this job's reach it is crawlable again
-                    conn.execute("UPDATE discovered_urls SET crawl_status='pending', skip_reason=NULL, crawl_depth=LEAST(crawl_depth, ?) WHERE id = ANY(?::bigint[])"
-                                 " AND crawl_status='skipped' AND skip_reason='max_depth'", (r["depth"] + 1, new))
-        conn.execute("UPDATE job_urls SET expanded=1 WHERE job_id=? AND url_id=?", (job["id"], r["url_id"]))
+        if room > 0 and r["crawl_status"] == "completed" and r["depth"] < job["max_depth"]:
+            new = sorted({c[0] for n in links.get(r["url"], ()) if (c := cands.get(n)) and c[0] not in added and (FOLLOW_EXTERNAL_DOMAINS or c[1] == r["domain"])})[:room]
+            for i in new:
+                added[i] = r["depth"] + 1
+            room -= len(new)
+    if added:
+        ids, depths = list(added), list(added.values())
+        conn.execute("INSERT INTO job_urls (job_id, url_id, depth) SELECT ?, u, d FROM unnest(?::bigint[], ?::int[]) AS t(u, d) ON CONFLICT DO NOTHING", (job["id"], ids, depths))
+        # skipped only because ANOTHER crawl reached it too deep: within this job's reach it is crawlable again (rows locked in process_page's (domain, url) order)
+        conn.execute(
+            "WITH t AS (SELECT * FROM unnest(?::bigint[], ?::int[]) AS t(u, d)),"
+            " k AS (SELECT x.id FROM discovered_urls x JOIN t ON x.id=t.u WHERE x.crawl_status='skipped' AND x.skip_reason='max_depth'"
+            "  ORDER BY x.domain, x.normalized_url FOR UPDATE OF x)"
+            " UPDATE discovered_urls x SET crawl_status='pending', skip_reason=NULL, crawl_depth=LEAST(x.crawl_depth, t.d) FROM t, k WHERE x.id=t.u AND x.id=k.id", (ids, depths))
+    conn.execute("UPDATE job_urls SET expanded=1 WHERE job_id=? AND url_id = ANY(?::bigint[])", (job["id"], [r["url_id"] for r in ready]))
     return len(ready)
 
 
@@ -445,36 +475,39 @@ def autonomous_allowed(conn, owner: str, total: int, reserved: int) -> bool:
     return not waiting(conn) or _owners(conn, owner, False) < total - reserved
 
 
+def _pick(conn, owner: str, cfg) -> list:
+    """The URLs claim() tries to lease, best first: [(url id, job depth, job id)], chosen entirely in PostgreSQL.
+    Same rule the Python loop applied to every pending row: jobs already served by max_jobs_per_business other workers are out; candidates are
+    ordered by (job priority, rank inside the job by (depth, id), job id); a URL wanted by several jobs is taken at its first occurrence; at most
+    per_batch URLs of one domain; the first claim_batch survive. Not pre-limited by rank: domain caps can make the pick reach deep into one job."""
+    now = core.now()
+    return conn.execute(
+        "WITH full_jobs AS (SELECT ju.job_id FROM job_urls ju JOIN discovered_urls u ON u.id=ju.url_id WHERE u.crawl_status='crawling' AND u.lease_expires>?"
+        "  AND u.lease_owner<>? GROUP BY ju.job_id HAVING COUNT(DISTINCT u.lease_owner)>=?),"
+        " c AS (SELECT u.id, u.domain, ju.job_id, ju.depth, j.priority, ROW_NUMBER() OVER (PARTITION BY ju.job_id ORDER BY ju.depth, u.id) rn"
+        "  FROM job_urls ju JOIN business_jobs j ON j.id=ju.job_id AND j.status='crawling' JOIN discovered_urls u ON u.id=ju.url_id"
+        "  WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?)) AND ju.job_id NOT IN (SELECT job_id FROM full_jobs)),"
+        " d AS (SELECT DISTINCT ON (id) id, domain, job_id, depth, priority, rn FROM c ORDER BY id, priority, rn, job_id),"
+        " r AS (SELECT d.*, ROW_NUMBER() OVER (PARTITION BY domain ORDER BY priority, rn, job_id) dr FROM d)"
+        " SELECT id, depth, job_id FROM r WHERE dr<=? ORDER BY priority, rn, job_id LIMIT ?",
+        (now, owner, cfg.max_jobs_per_business, now, cfg.per_batch, max(0, cfg.claim_batch))).fetchall()
+
+
 def claim(conn, owner: str, cfg) -> list[tuple[str, int]]:
     """Lease up to cfg.claim_batch business URLs [(url, job depth)]: globally capped by MAX_CRAWL_WORKERS, at most
     MAX_CONCURRENT_JOBS_PER_BUSINESS workers per business, round-robin between businesses (P0 before P1), one lease per URL even when
     several jobs want it. Call under LOCK, in the transaction that also decides autonomous capacity."""
     if _owners(conn, owner) >= cfg.max_crawl_workers:
         return []
-    full = [r[0] for r in conn.execute(
-        "SELECT ju.job_id FROM job_urls ju JOIN discovered_urls u ON u.id=ju.url_id WHERE u.crawl_status='crawling' AND u.lease_expires>?"
-        " AND u.lease_owner<>? GROUP BY ju.job_id HAVING COUNT(DISTINCT u.lease_owner)>=?", (core.now(), owner, cfg.max_jobs_per_business))]
-    cands = conn.execute(
-        "SELECT u.id, u.domain, ju.job_id, ju.depth, j.priority, ROW_NUMBER() OVER (PARTITION BY ju.job_id ORDER BY ju.depth, u.id) rn"
-        " FROM job_urls ju JOIN business_jobs j ON j.id=ju.job_id AND j.status='crawling' JOIN discovered_urls u ON u.id=ju.url_id"
-        " WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?)) AND ju.job_id<>ALL(?::bigint[])",
-        (core.now(), full)).fetchall()
-    picked: dict[int, int] = {}
-    per_domain: dict[str, int] = {}
-    for r in sorted(cands, key=lambda r: (r["priority"], r["rn"], r["job_id"])):
-        if len(picked) >= cfg.claim_batch:
-            break
-        if r["id"] in picked or per_domain.get(r["domain"], 0) >= cfg.per_batch:
-            continue
-        picked[r["id"]] = r["depth"]
-        per_domain[r["domain"]] = per_domain.get(r["domain"], 0) + 1
-    if not picked:
+    picks = _pick(conn, owner, cfg)
+    if not picks:
         return []
+    picked = {r["id"]: r["depth"] for r in picks}
     got = conn.execute(
         "UPDATE discovered_urls SET crawl_status='crawling', lease_owner=?, lease_expires=?, lease_gen=lease_gen+1 WHERE id IN ("
         " SELECT id FROM discovered_urls WHERE id = ANY(?::bigint[]) AND crawl_status IN ('pending','retry_pending') FOR UPDATE SKIP LOCKED)"
         " RETURNING id, url, normalized_url, lease_gen", (owner, core.later(seconds=cfg.lease_seconds), list(picked))).fetchall()
     engine.FENCE.update({r["normalized_url"]: r["lease_gen"] for r in got})
-    jobs = sorted({r["job_id"] for r in cands if r["id"] in picked})
+    jobs = sorted({r["job_id"] for r in picks})
     log.info(">>> BUSINESS-CLAIM %s: %d URL(s) for job(s) %s", owner[-12:], len(got), jobs)
     return [(r["url"], picked[r["id"]]) for r in got]

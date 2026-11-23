@@ -3,6 +3,7 @@ backlink gap. Real PostgreSQL (isolated schema), real local HTTP fixtures, real 
 
 import asyncio
 import copy
+import threading
 import time
 
 import pytest
@@ -327,3 +328,97 @@ def test_competitors_crawl_to_completion_one_slot_at_a_time_across_timeout_and_c
     assert rows("SELECT COUNT(*) n FROM (SELECT source_url FROM crawl_history GROUP BY source_url HAVING COUNT(*)>1) x")[0]["n"] == 0  # no page stored twice
     assert all(t["next_run_at"] > core.now() and t["last_success_at"] for t in targets().values())
     assert bj.schedule_due() == 0  # a finished target is not requeued at once
+
+
+def _done(d):
+    db(lambda c: c.execute("UPDATE business_jobs SET status='done', finished_at=? WHERE target_domain=? AND status<>'done'", (core.now(), d)))
+    db(bj._reschedule, d, True)
+
+
+def _jobs():
+    return rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"]
+
+
+def test_resubmitting_competitors_never_rescans_them(env):
+    """The same list POSTed again (or by a second business sharing a competitor) adds no scan; a new one gets exactly one; the scheduler owns the rest."""
+    req = crawler_api.CompetitorsRequest
+    first = crawler_api.add_business_competitors("own.localhost", req(domains=["r1.localhost", "r2.localhost"]))
+    assert [x["discovery"] for x in first["results"]] == ["queued", "queued"] and _jobs() == 3  # the business + 2 competitors
+    for d in ("r1.localhost", "r2.localhost", "own.localhost"):
+        _done(d)
+    keep = "SELECT domain, next_run_at FROM businesses WHERE domain IN ('r1.localhost','r2.localhost','own.localhost') ORDER BY domain"
+    nxt = rows(keep)
+    for _ in range(3):
+        again = crawler_api.add_business_competitors("own.localhost", req(domains=["r1.localhost", "r2.localhost"]))
+        assert [x["status"] for x in again["results"]] == ["duplicate", "duplicate"]
+    shared = crawler_api.add_business_competitors("other.localhost", req(domains=["r1.localhost"]))
+    assert shared["results"][0]["discovery"].startswith("already monitored")  # within its 24h: no extra scan for the second owner
+    added = crawler_api.add_business_competitors("own.localhost", req(domains=["r1.localhost", "r3.localhost"]))
+    assert [x["status"] for x in added["results"]] == ["duplicate", "registered"] and added["results"][1]["discovery"] == "queued"
+    assert _jobs() == 5  # + other.localhost's own first scan + r3's first scan; none for r1/r2
+    assert rows(keep) == nxt  # schedules untouched
+    _done("other.localhost")
+    _done("r3.localhost")
+    db(lambda c: c.execute("UPDATE businesses SET next_run_at=? WHERE domain='r1.localhost'", (core.later(seconds=-60),)))
+    assert bj.schedule_due() == 1  # overdue r1: the scheduler runs it, as a recurring competitor job
+    assert rows("SELECT target_domain, priority FROM business_jobs ORDER BY id DESC LIMIT 1")[0] == \
+        {"target_domain": "r1.localhost", "priority": bj.CrawlPriority.COMPETITOR_RECURRING}
+
+
+def test_concurrent_competitor_requests_create_no_duplicate_jobs(env):
+    import threading
+    crawler_api.add_business_competitors("own2.localhost", crawler_api.CompetitorsRequest(domains=["x1.localhost"]))
+    barrier = threading.Barrier(6)
+
+    def hit():
+        barrier.wait()
+        try:
+            crawler_api.add_business_competitors("own2.localhost", crawler_api.CompetitorsRequest(domains=["x1.localhost", "x2.localhost"]))
+        except Exception:  # noqa: BLE001 - a request that loses a race may fail; it must never leave an extra job
+            pass
+    ts = [threading.Thread(target=hit) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert {r["target_domain"]: r["n"] for r in rows("SELECT target_domain, COUNT(*) n FROM business_jobs GROUP BY 1")} == \
+        {"own2.localhost": 1, "x1.localhost": 1, "x2.localhost": 1}
+
+
+def test_three_competitors_registered_at_once_never_exceed_the_single_slot_under_polling(env, monkeypatch):
+    """Phase 9.1 D3 regression: one engine polls (search_pending's claim) while three competitors are registered concurrently. A poll with one free
+    slot returns at most one job and at no moment are two competitor jobs past 'pending'. (The 9.0 live run once claimed all three in one poll;
+    that was not reproduced, see PHASE9_1 report: this test pins the contract.)"""
+    monkeypatch.setattr(bj, "DDG_CONCURRENCY", 1)
+    monkeypatch.setattr(bj, "MAX_ACTIVE_COMPETITOR_JOBS", 1)
+    onboard("own.localhost")
+    with core.connect() as c:
+        c.execute("UPDATE business_jobs SET status='done'")
+    stop, errors, seen = threading.Event(), [], []
+
+    def register(d):
+        with core.connect() as c:
+            competitors.register(c, "own.localhost", d)
+
+    def poll():
+        while not stop.is_set():
+            got = bj._claim_search(1)
+            active = rows("SELECT COUNT(*) n FROM business_jobs j JOIN businesses b ON b.domain=j.target_domain AND b.target_type='competitor'"
+                          " WHERE j.status IN ('searching','crawling')")[0]["n"]
+            if len(got) > 1 or active > 1:
+                errors.append((len(got), active))
+            if got:
+                seen.extend(j["target_domain"] for j in got)
+                with core.connect() as c:  # the claimed search "finishes": frees the slot for the next competitor
+                    c.execute("UPDATE business_jobs SET status='done' WHERE id=ANY(?::bigint[])", ([j["id"] for j in got],))
+            time.sleep(0.01)
+    t = threading.Thread(target=poll)
+    t.start()
+    regs = [threading.Thread(target=register, args=(f"c{i}.localhost",)) for i in range(3)]
+    [r.start() for r in regs]
+    [r.join() for r in regs]
+    deadline = time.time() + 30
+    while len(seen) < 3 and time.time() < deadline:
+        time.sleep(0.05)
+    stop.set()
+    t.join()
+    assert not errors, errors
+    assert sorted(seen) == ["c0.localhost", "c1.localhost", "c2.localhost"]  # all served, one at a time

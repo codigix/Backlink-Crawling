@@ -9,6 +9,9 @@ if not os.environ.get("DATABASE_URL") or ":5433" in os.environ["DATABASE_URL"]:
                 ".env points at the production tunnel", returncode=2)
 
 # .env may say USE_CELERY=1 (production); tests must never push work into the real Redis queue. Celery tests set it themselves.
+# Several tests simulate N workers as N threads of ONE process, each holding a connection (a barrier, an advisory lock plus a nested claim). In production
+# every worker is its own process with its own pool; the test process gets the per-process capacity these tests were written against (the old cap of 20).
+os.environ.setdefault("DB_POOL_MAX", "20")
 os.environ["USE_CELERY"] = "0"
 os.environ["DOGPILE"] = "0"  # tests fake the search engines; none may start a real browser (the dogpile tests turn it back on)
 # .env holds a real, paid serper.dev key; set (empty) here, load_dotenv never overrides it, so serper is not among the backends.

@@ -6,10 +6,6 @@ classification (businesses.target_type) and the backlink gap, which is computed 
 import business_jobs as bj
 import crawler_core as core
 
-LINKS = ("SELECT source_url, source_domain, destination_url, anchor_text, rel_attributes, is_nofollow, is_sponsored, is_ugc, first_seen, last_seen"
-         " FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND is_active=1 AND source_domain<>? ORDER BY id")
-
-
 GLOBAL = "*"  # owner of a competitor registered once for every business (POST /competitors)
 
 
@@ -57,8 +53,8 @@ def register(conn, owner: str, domain: str, name: str | None = None) -> dict:
     elif not bj.COMPETITOR_ENABLED:
         note = "disabled (COMPETITOR_DISCOVERY_ENABLED=false)"
     else:
-        job, _ = bj.create_job(conn, comp, name=name, target_type="competitor")
-        note = "queued"
+        job, created = bj.create_job(conn, comp, name=name, target_type="competitor")
+        note = "queued" if created else "already monitored: runs on its 24h schedule"  # shared with another business; no extra scan
     _sync_target(conn, comp)
     return {"domain": comp, "status": "registered", "job_id": job and job["id"], "priority": job and f"P{job['priority']}",
             "target_type": conn.execute("SELECT target_type FROM businesses WHERE domain=?", (comp,)).fetchone()[0] if (job or existing) else None,
@@ -76,10 +72,12 @@ def detail(conn, owner: str, comp: str) -> dict | None:
             "schedule": dict(sched) if sched else None, "known_backlinks": known_backlinks(conn, comp)}
 
 
-def listing(conn, owner: str) -> list[dict]:
+def listing(conn, owner: str, limit: int | None = None, offset: int = 0) -> list[dict]:
+    """Competitors of `owner` in registration order (id is unique); limit/offset are applied in SQL so only the requested page is built (each entry
+    costs several queries). limit=None = all, as before."""
     owner = _o(owner)
     return [detail(conn, owner, r["competitor_domain"]) for r in conn.execute(
-        "SELECT competitor_domain FROM business_competitors WHERE business_domain=? ORDER BY id", (owner,)).fetchall()]
+        "SELECT competitor_domain FROM business_competitors WHERE business_domain=? ORDER BY id LIMIT ? OFFSET ?", (owner, limit, offset)).fetchall()]
 
 
 def set_active(conn, owner: str, comp: str, active: bool) -> bool:
@@ -102,11 +100,20 @@ def is_competitor(conn, domain: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM business_competitors WHERE competitor_domain=?", (_reg(domain),)).fetchone())
 
 
-def gap(conn, owner: str, only: str | None = None, limit: int = 200) -> dict:
+_ACTIVE = "l.link_type='html' AND l.is_active=1"  # the one definition of an eligible link: html, active; "not from the target's own domain" is added per query
+_COMP_LINK = f"FROM outgoing_links l JOIN unnest(?::text[]) AS comps(c) ON l.destination_domain=comps.c WHERE {_ACTIVE} AND l.source_domain<>comps.c"
+_LISTS = (("opportunities", "g", "ic AND NOT io"), ("shared_domains", "s", "ic AND io"), ("own_only_domains", "o", "io AND NOT ic"))  # response key, tag, filter on j
+
+
+def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int = 0, after: dict | None = None) -> dict:
     """Backlink gap of `owner` against its active competitors (or just `only`), over the DISCOVERED index.
     Referring-domain level: registrable source domains classified competitor_only / shared / own_only (many pages of one domain = one domain).
-    Source-page level: individual pages that link a competitor but not the owner. Pure SQL reads of the shared graph; no crawling."""
-    owner = _reg(owner)
+    Source-page level: individual pages that link a competitor but not the owner. Pure SQL reads of the shared graph; no crawling.
+    The comparison and the paging run in PostgreSQL: every list is ordered by its unique key (domain / source_url, code-point order) and cut with
+    LIMIT, so Python only receives the requested page (+1 row to know whether another page exists), never the link sets.
+    `after` = {list name: last key of that list's previous page}: keyset paging per list; `offset` instead makes every list skip that many entries.
+    The summary counts always describe the whole comparison."""
+    owner, after = _reg(owner), after or {}
     if not own_business(conn, owner):
         raise LookupError(f"{owner} is not an onboarded business")
     comps = [r["competitor_domain"] for r in conn.execute(  # only this business's own competitors (never itself)
@@ -117,32 +124,71 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200) -> dict:
         if not conn.execute("SELECT 1 FROM business_competitors WHERE business_domain=? AND competitor_domain=?", (owner, only)).fetchone():
             raise LookupError(f"{only} is not a competitor of {owner}")
         comps = [only]
-    own_rows = conn.execute(LINKS, (owner, owner)).fetchall()
-    own_domains = {r["source_domain"] for r in own_rows}
-    own_pages = {r["source_url"] for r in own_rows}
-    cdom: dict[str, dict[str, set]] = {}  # source domain -> competitor -> pages
-    pages: dict[str, dict] = {}  # source page -> info
-    for c in comps:
-        for r in conn.execute(LINKS, (c, c)).fetchall():
-            cdom.setdefault(r["source_domain"], {}).setdefault(c, set()).add(r["source_url"])
+    # ---- referring domains: competitor set (cd) against own set (od) in one pass: the counts plus one page of each classification ----
+    parts, args = [], [comps, owner, owner]
+    for key, tag, flt in _LISTS:
+        cur = after.get(key)
+        parts.append(f"(SELECT '{tag}' AS k, d, NULL::bigint AS a, NULL::bigint AS b, NULL::bigint AS g, NULL::bigint AS s, NULL::bigint AS o FROM j WHERE {flt}"
+                     + (' AND d COLLATE "C" > ?' if cur is not None else "") + ' ORDER BY d COLLATE "C" OFFSET ? LIMIT ?)')
+        args += ([cur] if cur is not None else []) + [offset, limit + 1]
+    rows = conn.execute(
+        f"WITH cd AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d {_COMP_LINK}),"
+        " od AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>?),"
+        " j AS MATERIALIZED (SELECT COALESCE(cd.d, od.d) AS d, cd.d IS NOT NULL AS ic, od.d IS NOT NULL AS io FROM cd FULL JOIN od ON cd.d=od.d)"
+        " SELECT 'n' AS k, NULL::text AS d, COUNT(*) FILTER (WHERE io) AS a, COUNT(*) FILTER (WHERE ic) AS b, COUNT(*) FILTER (WHERE ic AND NOT io) AS g,"
+        " COUNT(*) FILTER (WHERE ic AND io) AS s, COUNT(*) FILTER (WHERE io AND NOT ic) AS o FROM j UNION ALL " + " UNION ALL ".join(parts), args).fetchall()
+    cnt = next(r for r in rows if r["k"] == "n")
+    domains = {key: [r["d"] for r in rows if r["k"] == tag] for key, tag, _ in _LISTS}
+    # ---- source pages: pages that link a competitor but no page of the owner (an own page counts only if it is an eligible own link) ----
+    pcur = after.get("source_page_gap")
+    prow = conn.execute(
+        f"WITH cp AS MATERIALIZED (SELECT DISTINCT l.source_url AS u {_COMP_LINK}),"
+        " gp AS MATERIALIZED (SELECT u FROM cp WHERE NOT EXISTS (SELECT 1 FROM outgoing_links l WHERE l.source_url=cp.u AND l.destination_domain=? AND " + _ACTIVE +
+        " AND l.source_domain<>?))"
+        " SELECT NULL::text AS u, COUNT(*) AS n FROM gp UNION ALL"
+        " (SELECT u, NULL::bigint FROM gp WHERE TRUE" + (' AND u COLLATE "C" > ?' if pcur is not None else "") + ' ORDER BY u COLLATE "C" OFFSET ? LIMIT ?)',
+        [comps, owner, owner] + ([pcur] if pcur is not None else []) + [offset, limit + 1]).fetchall()
+    gap_pages = next(r["n"] for r in prow if r["u"] is None)
+    urls = [r["u"] for r in prow if r["u"] is not None]
+    more = {key: len(domains[key]) > limit for key, _, _ in _LISTS} | {"source_page_gap": len(urls) > limit}
+    urls, domains = urls[:limit], {k: v[:limit] for k, v in domains.items()}
+    # ---- details of the (at most `limit`) entries that are returned ----
+    detail: dict[str, dict] = {}
+    if domains["opportunities"]:
+        for r in conn.execute(
+                "WITH pairs AS (SELECT DISTINCT l.source_domain AS d, l.destination_domain AS c, l.source_url AS u FROM outgoing_links l"
+                " WHERE l.source_domain=ANY(?::text[]) AND l.destination_domain=ANY(?::text[]) AND " + _ACTIVE + " AND l.source_domain<>l.destination_domain)"
+                ' SELECT d, array_agg(DISTINCT c) AS targets, (array_agg(u ORDER BY u COLLATE "C"))[1:50] AS pages FROM pairs GROUP BY d', (domains["opportunities"], comps)):
+            detail[r["d"]] = r
+    pages: dict[str, dict] = {}
+    own_domains: set = set()
+    if urls:
+        for r in conn.execute(  # competitor order, then id: the order the links of a page have always been listed in
+                "SELECT l.source_url, l.source_domain, comps.c, l.destination_url, l.anchor_text, l.rel_attributes, l.is_nofollow, l.is_sponsored, l.is_ugc, l.last_seen"
+                " FROM outgoing_links l JOIN unnest(?::text[]) WITH ORDINALITY AS comps(c, i) ON l.destination_domain=comps.c"
+                " WHERE l.source_url=ANY(?::text[]) AND " + _ACTIVE + " AND l.source_domain<>comps.c ORDER BY comps.i, l.id", (comps, urls)):
             p = pages.setdefault(r["source_url"], {"source_url": r["source_url"], "referring_domain": r["source_domain"], "competitor_targets": set(), "links": []})
-            p["competitor_targets"].add(c)
-            p["links"].append({"competitor": c, "destination_url": r["destination_url"], "anchor_text": r["anchor_text"], "rel": r["rel_attributes"],
+            p["competitor_targets"].add(r["c"])
+            p["links"].append({"competitor": r["c"], "destination_url": r["destination_url"], "anchor_text": r["anchor_text"], "rel": r["rel_attributes"],
                                "nofollow": bool(r["is_nofollow"]), "sponsored": bool(r["is_sponsored"]), "ugc": bool(r["is_ugc"]), "last_seen": r["last_seen"]})
-    gap_domains = sorted(set(cdom) - own_domains)
-    shared = sorted(set(cdom) & own_domains)
-    own_only = sorted(own_domains - set(cdom))
-    page_gap = [{**p, "competitor_targets": sorted(p["competitor_targets"]), "domain_links_to_own_business": p["referring_domain"] in own_domains}
-                for u, p in sorted(pages.items()) if u not in own_pages]
+        own_domains = {r["source_domain"] for r in conn.execute(
+            "SELECT DISTINCT l.source_domain FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>? AND l.source_domain=ANY(?::text[])",
+            (owner, owner, [p["referring_domain"] for p in pages.values()]))}
+    page_gap = [{**pages[u], "competitor_targets": sorted(pages[u]["competitor_targets"]), "domain_links_to_own_business": pages[u]["referring_domain"] in own_domains}
+                for u in urls]
     states = {t: bj.api_state(bj.latest(conn, t)) for t in [owner, *comps]}
     warnings = []
     if not states[owner].startswith("completed"):
         warnings.append(f"discovery for {owner} is '{states[owner]}': its backlinks may be incomplete, so gap domains may be overstated")
     warnings += [f"discovery for competitor {c} is '{states[c]}': its backlinks may be incomplete" for c in comps if not states[c].startswith("completed")]
+    totals = {"opportunities": cnt["g"], "shared_domains": cnt["s"], "own_only_domains": cnt["o"], "source_page_gap": gap_pages}
+    last = {**{k: domains[k][-1:] for k, _, _ in _LISTS}, "source_page_gap": urls[-1:]}
     return {"business_domain": owner, "competitors": comps,
-            "summary": {"own_referring_domains": len(own_domains), "competitor_referring_domains": len(cdom), "gap_domains": len(gap_domains),
-                        "shared_domains": len(shared), "own_only_domains": len(own_only), "gap_pages": len(page_gap)},
+            "summary": {"own_referring_domains": cnt["a"], "competitor_referring_domains": cnt["b"], "gap_domains": cnt["g"],
+                        "shared_domains": cnt["s"], "own_only_domains": cnt["o"], "gap_pages": gap_pages},
             "coverage": {"basis": "discovered index only (pages crawled so far), not the whole internet", "discovery_status": states, "warnings": warnings},
-            "opportunities": [{"referring_domain": d, "classification": "competitor_only", "competitor_targets": sorted(cdom[d]), "links_to_own_business": False,
-                               "source_pages": sorted(u for ps in cdom[d].values() for u in ps)[:50]} for d in gap_domains[:limit]],
-            "shared_domains": shared[:limit], "own_only_domains": own_only[:limit], "source_page_gap": page_gap[:limit]}
+            "opportunities": [{"referring_domain": d, "classification": "competitor_only", "competitor_targets": sorted(detail[d]["targets"]), "links_to_own_business": False,
+                               "source_pages": detail[d]["pages"]} for d in domains["opportunities"]],
+            "shared_domains": domains["shared_domains"], "own_only_domains": domains["own_only_domains"], "source_page_gap": page_gap,
+            "pagination": {"limit": limit, "offset": offset, "has_more": any(more.values()), "next_offset": offset + limit if any(more.values()) else None,
+                           "lists": {k: {"total": totals[k], "has_more": more[k], "next_after": last[k][0] if more[k] else None} for k in totals}}}

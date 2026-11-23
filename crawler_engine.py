@@ -590,6 +590,16 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         concurrent_robots(crawler)
         await asyncio.gather(*(crawler._get_robots_txt_file_for_url(u) for u, _ in items))  # all sites at once, before add_requests checks them one by one
         workers = [asyncio.create_task(writer()) for _ in range(WRITERS)] if writes is not None else []
+        interrupted, run_crawler = False, crawler._run_crawler
+
+        async def tracked() -> None:  # crawlee turns Ctrl+C into "pause this round" and swallows it: the process would then never stop
+            nonlocal interrupted
+            try:
+                await run_crawler()
+            except asyncio.CancelledError:
+                interrupted = True
+                raise
+        crawler._run_crawler = tracked
         try:
             try:
                 await crawler.run(valid_reqs(items))
@@ -605,6 +615,10 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
                 await asyncio.to_thread(resched)
             if writes is not None:
                 await writes.join()  # callers release leases right after the round, so every queued page must be stored first
+            if interrupted:  # pages already fetched are stored above; the caller's finally returns the rest of the leases
+                if (t := asyncio.current_task()) is not None and t.cancelling():
+                    raise asyncio.CancelledError  # a real cancellation (task time limit) that crawlee swallowed: keep it a cancellation
+                raise KeyboardInterrupt
         finally:  # on cancellation the queue is abandoned; leases expire / the callers' release() returns the URLs
             for w in workers:
                 w.cancel()

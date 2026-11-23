@@ -164,6 +164,17 @@ def legacy_history(target_domain, limit):
 TARGETS = [TARGET, SUB, EVIL, "nothing-here.org"]
 
 
+NEW_KEYS = {"next_after_id", "next_offset", "total_anchors", "has_more", "next_cursor"}  # additive response fields; every other key must be exactly what the replaced code returned
+
+
+def old_shape(r: dict) -> dict:
+    """The response without the additive paging fields (limit/offset of the list-all endpoints are echoed only where the old response had them)."""
+    out = {k: v for k, v in r.items() if k not in NEW_KEYS}
+    if "anchors" in out or "referring_domains" in out and "backlinks" not in out:
+        out.pop("limit", None), out.pop("offset", None)
+    return out
+
+
 def populate(scale):
     with core.connect() as c:
         info = load(c, scale=scale)
@@ -177,9 +188,9 @@ def test_backlink_endpoints_match_the_replaced_algorithms(db, scale):
     for t in TARGETS:
         for removed in (False, True):
             for limit, offset in ((100, 0), (7, 0), (7, 21), (1000, 0), (50, 10**6)):
-                assert crawler_api.backlinks(t, removed, limit, offset) == legacy_backlinks(t, removed, limit, offset), (t, removed, limit, offset)
-        assert crawler_api.referring_domains(t) == legacy_referring_domains(t), t
-        assert crawler_api.backlink_anchors(t) == legacy_anchors(t), t
+                assert old_shape(crawler_api.backlinks(t, removed, limit, offset)) == legacy_backlinks(t, removed, limit, offset), (t, removed, limit, offset)
+        assert old_shape(crawler_api.referring_domains(t, crawler_api.MAX_LIMIT)) == legacy_referring_domains(t), t
+        assert old_shape(crawler_api.backlink_anchors(t, crawler_api.MAX_LIMIT)) == legacy_anchors(t), t
         for limit in (1, 2, 7, 50, 200, 1000):
             assert crawler_api.backlink_history(t, limit) == legacy_history(t, limit), (t, limit)
 
@@ -216,8 +227,8 @@ def test_invalid_target_domain_is_rejected_by_every_endpoint(db):
 
 
 def test_empty_database(db, client):
-    assert crawler_api.backlinks(TARGET, False, 10, 0) == legacy_backlinks(TARGET, False, 10, 0)
-    assert crawler_api.referring_domains(TARGET) == {"domain": TARGET, "status": "not_found_in_current_index", "total_referring_domains": 0, "referring_domains": []}
+    assert old_shape(crawler_api.backlinks(TARGET, False, 10, 0)) == legacy_backlinks(TARGET, False, 10, 0)
+    assert old_shape(crawler_api.referring_domains(TARGET)) == {"domain": TARGET, "status": "not_found_in_current_index", "total_referring_domains": 0, "referring_domains": []}
     assert crawler_api.backlink_anchors(TARGET)["anchors"] == [] and crawler_api.backlink_history(TARGET, 10)["events"] == []
     zero = {"discovered_domains": 0, "discovered_urls": 0, "outgoing_links": 0, "domains_by_status": {}, "urls_by_status": {}, "urls_by_source": {}}
     assert engine_stats.counts() == zero == client.get("/discovery/statistics").json()
@@ -432,3 +443,134 @@ def test_simultaneous_requests_return_the_same_answers(db, client):
     with ThreadPoolExecutor(12) as ex:
         for u, r in ex.map(hit, urls * 4):
             assert r.status_code == 200 and r.json() == want[u].json(), u
+
+
+# ------------------------------------------------------------------ bounded lists, keyset paging, explicit columns ------------------------------------------------------------------
+
+def test_unbounded_endpoints_have_a_default_limit_and_a_maximum(db, client):
+    import inspect
+    for fn in (crawler_api.backlinks, crawler_api.all_backlinks, crawler_api.referring_domains, crawler_api.backlink_anchors,
+               crawler_api.competitor_backlinks, crawler_api.competitor_referring_domains, crawler_api.competitor_anchors):
+        assert inspect.signature(fn).parameters["limit"].default == crawler_api.DEFAULT_LIMIT, fn.__name__
+    for path in (f"/backlinks/{TARGET}", "/backlinks", f"/backlinks/{TARGET}/referring-domains", f"/backlinks/{TARGET}/anchors"):
+        assert client.get(path + "?limit=0").status_code == 422, path
+        assert client.get(path + f"?limit={crawler_api.MAX_LIMIT + 1}").status_code == 422, path
+        assert client.get(path + "?offset=-1").status_code == 422, path
+    assert client.get(f"/backlinks/{TARGET}?offset=5&after_id=3").status_code == 422
+
+
+def test_omitting_limit_returns_one_bounded_page_and_keyset_walks_every_link_once(db, client):
+    populate(10)  # thousands of links into TARGET: more than one default page
+    full = client.get(f"/backlinks/{TARGET}?include_removed=true&limit={crawler_api.MAX_LIMIT}").json()
+    first = client.get(f"/backlinks/{TARGET}?include_removed=true").json()  # no limit given
+    assert full["total_backlinks"] > crawler_api.DEFAULT_LIMIT, "fixture too small to show truncation"
+    assert first["limit"] == crawler_api.DEFAULT_LIMIT and len(first["backlinks"]) == crawler_api.DEFAULT_LIMIT
+    assert first["total_backlinks"] == full["total_backlinks"] and first["backlinks"] == full["backlinks"][:crawler_api.DEFAULT_LIMIT]
+    assert first["next_after_id"] is not None
+    got, after = [], None
+    while True:  # follow next_after_id until the last page (null)
+        r = client.get(f"/backlinks/{TARGET}?include_removed=true&limit=700" + (f"&after_id={after}" if after else "")).json()
+        got += r["backlinks"]
+        after = r["next_after_id"]
+        if after is None:
+            break
+    assert got == full["backlinks"]  # same rows, same order, no gap, no overlap
+    assert client.get(f"/backlinks/{TARGET}?limit=5&offset=10").json()["backlinks"] == client.get(f"/backlinks/{TARGET}?limit=15").json()["backlinks"][10:]  # offset clients still work
+    assert full["next_after_id"] is None  # everything fitted in one page
+
+
+def test_all_backlinks_default_page_is_bounded_and_reports_next_offset(db, client):
+    populate(10)
+    with core.connect() as c:  # /backlinks lists the links of monitored targets only
+        c.execute("INSERT INTO businesses (domain, search_interval_seconds, next_run_at) VALUES (?, 3600, '2099-01-01 00:00:00')", (TARGET,))
+    r = client.get("/backlinks?include_removed=true").json()
+    assert r["limit"] == crawler_api.DEFAULT_LIMIT and len(r["backlinks"]) == crawler_api.DEFAULT_LIMIT and r["total_backlinks"] > crawler_api.DEFAULT_LIMIT
+    assert r["next_offset"] == crawler_api.DEFAULT_LIMIT
+    rest = client.get(f"/backlinks?include_removed=true&limit={crawler_api.MAX_LIMIT}").json()
+    assert rest["next_offset"] is None and rest["backlinks"][:crawler_api.DEFAULT_LIMIT] == r["backlinks"]
+
+
+@pytest.mark.parametrize("path,key,ident", [("referring-domains", "referring_domains", "domain"), ("anchors", "anchors", "anchor_text")])
+def test_referring_domains_and_anchors_are_paged_with_exact_totals(db, client, path, key, ident):
+    populate(1)
+    everything = client.get(f"/backlinks/{TARGET}/{path}?limit={crawler_api.MAX_LIMIT}").json()
+    total = everything["total_referring_domains" if path == "referring-domains" else "total_anchors"]
+    assert total == len(everything[key]) > 3
+    paged = []
+    for offset in range(0, total + 4, 4):
+        page = client.get(f"/backlinks/{TARGET}/{path}?limit=4&offset={offset}").json()
+        assert page["total_referring_domains" if path == "referring-domains" else "total_anchors"] == total  # the total is the group count, not the page size
+        assert len(page[key]) <= 4
+        paged += page[key]
+    assert paged == everything[key]
+    past = client.get(f"/backlinks/{TARGET}/{path}?limit=4&offset=10000").json()  # past the end: empty page, true total
+    assert past[key] == [] and past["total_referring_domains" if path == "referring-domains" else "total_anchors"] == total
+    assert past.get("status", "ok") == "ok"
+    nothing = client.get(f"/backlinks/nothing-here.org/{path}").json()
+    assert nothing[key] == [] and nothing["total_referring_domains" if path == "referring-domains" else "total_anchors"] == 0
+
+
+def test_competitor_endpoints_forward_the_same_bounds(db, client):
+    populate(1)
+    with core.connect() as c:
+        c.execute("INSERT INTO business_competitors (business_domain, competitor_domain) VALUES ('owner.example', ?)", (TARGET,))
+    a = client.get(f"/competitors/{TARGET}/backlinks?limit=5").json()
+    b = client.get(f"/backlinks/{TARGET}?limit=5").json()
+    assert a == {**b, "target_type": "competitor"} and len(a["backlinks"]) == 5
+    assert client.get(f"/competitors/{TARGET}/backlinks?after_id={a['next_after_id']}&limit=5").json()["backlinks"] == client.get(f"/backlinks/{TARGET}?limit=10").json()["backlinks"][5:]
+    assert client.get(f"/competitors/{TARGET}/referring-domains?limit=2").json() == client.get(f"/backlinks/{TARGET}/referring-domains?limit=2").json()
+    assert len(client.get(f"/competitors/{TARGET}/anchors?limit=1").json()["anchors"]) == 1
+
+
+def _columns(table):
+    with core.connect() as c:
+        return {r[0] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=?", (table,))}
+
+
+def test_list_items_keep_every_column_the_select_star_returned_except_the_heavy_text(db, client):
+    populate(1)
+    with core.connect() as c:
+        c.execute("UPDATE outgoing_links SET context='some surrounding text', img_alt='alt text' WHERE id=(SELECT MIN(id) FROM outgoing_links)")
+        c.execute("UPDATE discovered_urls SET title='t', crawl_error='e' WHERE id=(SELECT MIN(id) FROM discovered_urls)")
+    heavy = {"context", "img_alt"}
+    light = client.get("/crawler/outgoing-links?limit=3").json()["items"]
+    assert light and set(light[0]) == _columns("outgoing_links") - heavy
+    full = client.get("/crawler/outgoing-links?limit=3&include_details=true").json()["items"]
+    assert set(full[0]) == _columns("outgoing_links") and full[0]["context"] == "some surrounding text" and full[0]["img_alt"] == "alt text"
+    assert [{k: v for k, v in r.items() if k not in heavy} for r in full] == light  # the same rows in the same order
+    for path, table in (("/crawler/discovered-urls", "discovered_urls"), ("/crawler/discovered-domains", "discovered_domains")):
+        items = client.get(path + "?limit=3").json()["items"]
+        assert items and set(items[0]) == _columns(table), path  # nothing dropped, nothing new
+
+
+def test_discovered_domains_keyset_paging_and_offset_compat(db, client):
+    populate(1)
+    with core.connect() as c:
+        ids = [r[0] for r in c.execute("SELECT id FROM discovered_domains ORDER BY id")]
+    got, after = [], 0
+    while True:
+        page = client.get(f"/crawler/discovered-domains?limit=3&after_id={after}").json()["items"]
+        if not page:
+            break
+        got += [i["id"] for i in page]
+        after = page[-1]["id"]
+    assert got == ids
+    assert [i["id"] for i in client.get("/crawler/discovered-domains?limit=3&offset=2").json()["items"]] == ids[2:5]
+    assert client.get("/crawler/discovered-domains?offset=1&after_id=1").status_code == 422
+    with core.connect() as c:
+        one = c.execute("SELECT discovery_status FROM discovered_domains WHERE id=?", (ids[0],)).fetchone()[0]
+    filtered = client.get(f"/crawler/discovered-domains?discovery_status={one}&limit=2&after_id={ids[0]}").json()
+    assert all(i["discovery_status"] == one and i["id"] > ids[0] for i in filtered["items"])
+    with core.connect() as c:
+        assert filtered["total"] == c.execute("SELECT COUNT(*) FROM discovered_domains WHERE discovery_status=?", (one,)).fetchone()[0]
+
+
+def test_record_backlink_explicit_columns_keep_the_event_sequence(db):
+    with core.connect() as c:
+        tid = core.add_target(c, "codigix.co")
+        core.record_backlink(c, tid, "https://a.example/p", "https://codigix.co/", "x", None)
+        core.record_backlink(c, tid, "https://a.example/p", "https://codigix.co/", "y", "nofollow")  # anchor/rel changed -> link_changed
+        c.execute("UPDATE backlinks SET is_active=0, link_status='removed'")
+        core.record_backlink(c, tid, "https://a.example/p", "https://codigix.co/", "y", "nofollow")  # -> reappeared
+        events = [r[0] for r in c.execute("SELECT event_type FROM backlink_history ORDER BY id")]
+    assert events == ["first_discovered", "verified", "link_changed", "reappeared"]

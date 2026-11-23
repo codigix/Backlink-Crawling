@@ -438,6 +438,9 @@ def test_engine_end_to_end_via_api_with_only_the_ddgs_client_faked(env, monkeypa
 
     monkeypatch.setattr(ddg_lookup, "DDGS", FakeDDGS)
     monkeypatch.setattr(ddg_lookup.time, "sleep", lambda s: None)
+    # three concurrent searches share the process-wide backend health: an exhausted page of one would cool a backend for the others, so which pages
+    # they read depended on thread start order. Backend cooldown has its own tests; this one is about cursors.
+    monkeypatch.setattr(ddg_lookup, "BACKEND_STRIKES", 10**9)
     monkeypatch.setattr(bj, "DDG_RESULTS", 10)
     monkeypatch.setattr(bj, "COMPETITOR_RESULTS", 10)
     monkeypatch.setattr(bj, "DDG_CONCURRENCY", 3)

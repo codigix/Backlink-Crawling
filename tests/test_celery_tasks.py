@@ -107,7 +107,8 @@ def test_dispatch_is_bounded_and_respects_pause(env, monkeypatch):
 
 
 def test_connection_cap_fails_loudly_and_releases(env, monkeypatch):
-    monkeypatch.setattr(core, "_SLOTS", threading.BoundedSemaphore(2))
+    monkeypatch.setattr(core, "POOL_MAX", 2)  # a pool of two connections for this test (the pool is rebuilt when its settings change)
+    monkeypatch.setattr(core, "POOL_MIN", 1)
     monkeypatch.setattr(core, "DB_POOL_WAIT", 0.2)
     c1, c2 = core.connect(), core.connect()
     with pytest.raises(TimeoutError, match="connection limit"):
@@ -120,4 +121,102 @@ def test_connection_cap_fails_loudly_and_releases(env, monkeypatch):
     c2.close(); c3.close()
     with core.connect() as c:  # `with` releases it too
         c.execute("SELECT 1")
-    assert core._SLOTS._value == 2
+    assert core.OPEN_CONNS == 0  # everything was returned ...
+    d1, d2 = core.connect(), core.connect()  # ... so both connections are available again, and only two
+    with pytest.raises(TimeoutError):
+        core.connect()
+    d1.close(); d2.close()
+    assert core.OPEN_CONNS == 0
+
+
+# ---- Phase 9.1 D1: business URLs waiting for a due retry must be dispatched (a job could stay 'crawling' forever) ----
+
+def _business_url(env, job_id, host, n, status, next_at=None, domain_status="unreachable"):
+    with core.connect() as c:
+        c.execute("INSERT INTO business_jobs (id, target_domain, status, max_depth, max_pages) VALUES (?,?, 'crawling', 3, 10) ON CONFLICT DO NOTHING",
+                  (job_id, f"biz{job_id}.localhost"))
+        for i in range(n):
+            core.save_url(c, env(host, f"/p{i}"), None, "ddg", 0, False)
+        c.execute("UPDATE discovered_domains SET discovery_status=? WHERE domain=?", (domain_status, f"{host}.localhost"))
+        c.execute("UPDATE discovered_urls SET crawl_status=?, next_crawl_at=? WHERE domain=?", (status, next_at, f"{host}.localhost"))
+        c.execute("INSERT INTO job_urls (job_id, url_id, depth) SELECT ?, id, 0 FROM discovered_urls WHERE domain=?", (job_id, f"{host}.localhost"))
+
+
+@pytest.fixture()
+def sent(monkeypatch):
+    out = []
+    monkeypatch.setattr(tasks, "queue_length", lambda: 0)
+    monkeypatch.setattr(tasks.crawl_batch, "delay", lambda: out.append(1))
+    return out
+
+
+@pytest.mark.parametrize("status, when, expected", [("pending", None, 1), ("retry_pending", "past", 1), ("retry_pending", "future", 0)])
+def test_dispatch_counts_business_pending_and_due_retry_but_not_future_retry(env, sent, status, when, expected):
+    at = {"past": core.later(seconds=-60), "future": core.later(seconds=3600), None: None}[when]
+    _business_url(env, 1, "bz", 2, status, at)  # the domain is NOT admitted: the business path must not need it
+    assert tasks._dispatch() == expected
+    assert len(sent) == expected
+
+
+def test_dispatch_with_several_business_jobs_one_due_one_future(env, sent):
+    _business_url(env, 1, "bza", 2, "retry_pending", core.later(seconds=3600))
+    assert tasks._dispatch() == 0
+    _business_url(env, 2, "bzb", 2, "retry_pending", core.later(seconds=-5))
+    assert tasks._dispatch() == 1
+
+
+def test_due_retry_is_claimed_once_and_the_job_waiting_predicate_agrees_with_the_dispatcher(env, sent):
+    import business_jobs as bj
+    _business_url(env, 1, "bz", 4, "retry_pending", core.later(seconds=-5))
+    with core.connect() as c:
+        assert bj.waiting(c) and tasks._dispatch() == 1  # the 9.0 defect: waiting() True, dispatch 0
+    cfg = autonomous.AutoConfig()
+    got, lock = [], threading.Lock()
+
+    def worker(o):
+        w = autonomous.claim_work(o, cfg)
+        with lock:
+            got.extend(w)
+    ts = [threading.Thread(target=worker, args=(f"w{i}",)) for i in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(got) == 4 == len({u for u, _ in got})  # every due URL leased exactly once across 4 concurrent claimers
+
+
+def test_concurrent_dispatchers_never_exceed_the_queue_bound(env, monkeypatch):
+    _business_url(env, 1, "bz", 3, "retry_pending", core.later(seconds=-5))
+    queued, lk = [0], threading.Lock()
+
+    class FakeRedis:  # the real dispatcher serialises on a Redis lock; the same contract with a thread lock
+        def lock(self, *a, **k):
+            return self
+        def __enter__(self):
+            lk.acquire()
+        def __exit__(self, *a):
+            lk.release()
+    monkeypatch.setattr(tasks, "r", lambda: FakeRedis())
+    monkeypatch.setattr(tasks, "queue_length", lambda: queued[0])
+    monkeypatch.setattr(tasks.crawl_batch, "delay", lambda: queued.__setitem__(0, queued[0] + 1))
+    ts = [threading.Thread(target=tasks.dispatch) for _ in range(5)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert queued[0] <= tasks.MAX_QUEUED and queued[0] >= 1
+
+
+# ---- Phase 9.1 D2: the task's loop must be able to spawn subprocesses (Playwright) even after flower set the selector policy ----
+
+def test_crawl_task_loop_can_spawn_a_subprocess_under_the_flower_selector_policy():
+    import asyncio
+    import sys
+    old = asyncio.get_event_loop_policy()
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # what flower/app.py does at import
+    try:
+        async def spawn():
+            p = await asyncio.create_subprocess_exec(sys.executable, "-c", "print(1)", stdout=asyncio.subprocess.PIPE)
+            return (await p.communicate())[0].strip()
+        with pytest.raises(NotImplementedError) if sys.platform == "win32" else __import__("contextlib").nullcontext():
+            asyncio.run(spawn())  # the old call: proves the test reproduces the defect on Windows
+        assert tasks.run_loop(spawn()) == b"1"
+    finally:
+        asyncio.set_event_loop_policy(old)

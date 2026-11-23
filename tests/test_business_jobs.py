@@ -434,3 +434,82 @@ def test_a_search_stuck_in_searching_is_returned_to_pending_without_a_restart(en
                   (core.now(),))  # a search running right now is left alone
     assert bj.reset_interrupted(bj.STALE_SEARCH) == 1
     assert job_status("stuck.localhost")["status"] == "pending" and job_status("live.localhost")["status"] == "searching"
+
+
+def _finish(domain):
+    """The engine closing a job: done, and the business rescheduled one interval away (what _progress does)."""
+    with core.connect() as c:
+        c.execute("UPDATE business_jobs SET status='done', finished_at=? WHERE target_domain=? AND status IN ('pending','searching','crawling')",
+                  (core.now(), domain))
+        bj._reschedule(c, domain, True)
+
+
+def _sched(domain):
+    return rows("SELECT next_run_at, last_run_at, search_interval_seconds FROM businesses WHERE domain=?", domain)[0]
+
+
+def test_repeated_onboarding_and_dashboard_polling_never_start_another_scan(env):
+    """A client that POSTs /discovery/onboard on every page view (seen live: ~30 jobs/hour) gets one scan; the scheduler owns the rest."""
+    first = crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="dash.localhost"))
+    assert first["created"] and first["priority"] == "P0"  # a brand-new business: its first scan, immediately
+    again = crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="https://www.dash.localhost/"))
+    assert not again["created"] and again["job_id"] == first["job_id"]  # running: the same active job
+    _finish("dash.localhost")
+    before = _sched("dash.localhost")
+    assert before["search_interval_seconds"] == bj.SEARCH_INTERVAL and before["next_run_at"] > core.later(seconds=bj.SEARCH_INTERVAL - 60)
+    for _ in range(5):  # dashboard opened / refreshed: onboard + status, over and over, inside the 6h interval
+        r = crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="dash.localhost"))
+        assert not r["created"] and r["job_id"] == first["job_id"] and r["status"] == "completed_no_results"
+        assert r["next_run_at"] == before["next_run_at"]
+        crawler_api.onboard_business(crawler_api.OnboardRequest(domain="dash.localhost"))  # the older POST /businesses form
+        crawler_api.discovery_business_status("dash.localhost")
+        crawler_api.business_status("dash.localhost")
+    assert rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"] == 1
+    assert _sched("dash.localhost") == before  # next_run_at / last_run_at untouched by any of it
+    with core.connect() as c:  # overdue: onboarding still does not run it; the scheduler does, once, as a recurring (P2) job
+        c.execute("UPDATE businesses SET next_run_at=? WHERE domain='dash.localhost'", (core.later(seconds=-60),))
+    assert not crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="dash.localhost"))["created"]
+    assert rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"] == 1
+    assert bj.schedule_due() == 1 and bj.schedule_due() == 0
+    assert rows("SELECT priority FROM business_jobs ORDER BY id DESC LIMIT 1")[0]["priority"] == bj.CrawlPriority.RECURRING
+
+
+def test_explicit_rescan_is_the_only_way_to_scan_again_now(env):
+    onboard("again.localhost")
+    r = crawler_api.discovery_rescan("again.localhost")
+    assert not r["created"]  # a scan is already active: rescanning cannot stack a second one
+    _finish("again.localhost")
+    r = crawler_api.discovery_rescan("https://again.localhost/x")
+    assert r["created"] and r["priority"] == "P0" and r["status"] == "queued"
+    assert crawler_api.discovery_rescan("again.localhost")["job_id"] == r["job_id"]  # double click: the same job
+    assert rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"] == 2
+    with pytest.raises(crawler_api.HTTPException) as e:
+        crawler_api.discovery_rescan("never.localhost")
+    assert e.value.status_code == 404 and rows("SELECT COUNT(*) n FROM businesses WHERE domain='never.localhost'")[0]["n"] == 0
+
+
+def test_concurrent_onboarding_requests_create_exactly_one_job(env):
+    barrier, out = threading.Barrier(8), []
+
+    def hit():
+        with core.connect() as c:
+            barrier.wait()
+            out.append(bj.create_job(c, "race.localhost"))
+    for wave in (1, 2):  # wave 1: a new business, 8 simultaneous requests; wave 2: the same after its scan finished
+        out.clear()
+        ts = [threading.Thread(target=hit) for _ in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert sum(made for _, made in out) == (1 if wave == 1 else 0) and len({j["id"] for j, _ in out}) == 1
+        assert rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"] == 1
+        _finish("race.localhost")
+
+
+def test_competitor_turned_customer_gets_its_first_customer_scan_and_interval(env):
+    with core.connect() as c:
+        bj.create_job(c, "was-rival.localhost", target_type="competitor")
+    _finish("was-rival.localhost")
+    assert _sched("was-rival.localhost")["search_interval_seconds"] == bj.COMPETITOR_INTERVAL
+    r = crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="was-rival.localhost"))
+    assert r["created"] and r["priority"] == "P0"
+    assert _sched("was-rival.localhost")["search_interval_seconds"] == bj.SEARCH_INTERVAL

@@ -113,7 +113,7 @@ def diagnostics(stats: dict) -> dict:
     """10-second diagnostic snapshot: frontier counts, our connections, PostgreSQL's own view (pg_stat_activity / pg_locks /
     pg_stat_database), and HTTP timings. `stats` is crawler_engine.HTTP. Uses its own short-lived connection with timeouts."""
     with core.connect() as c:
-        c.execute("SET statement_timeout='5s'")
+        c.execute("SET LOCAL statement_timeout='5s'")  # transaction-scoped: a session-level SET would stay on the pooled connection
         q = lambda sql, *a: [list(r.values()) for r in c.execute(sql, a).fetchall()]  # noqa: E731 - plain lists
         urls = {r[0]: r[1] for r in q("SELECT crawl_status, COUNT(*) FROM discovered_urls GROUP BY 1")}
         act = q("SELECT state, wait_event_type, COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()"
@@ -130,7 +130,7 @@ def diagnostics(stats: dict) -> dict:
     return {
         "discovered": sum(urls.values()), "pending": urls.get("pending", 0) + urls.get("retry_pending", 0),
         "processing": urls.get("crawling", 0) + urls.get("recrawling", 0), "completed": urls.get("completed", 0), "failed": urls.get("failed", 0),
-        "inflight_fetches": stats["started"] - n, "pool_size": f"none (new connection per call); open now={core.OPEN_CONNS}",
+        "inflight_fetches": stats["started"] - n, "pool_size": f"max {core.POOL_MAX} per process; checked out now={core.OPEN_CONNS}", "pool": {k: v for k, v in core.pool_stats().items() if k in ("pool_size", "pool_available", "requests_waiting", "requests_wait_ms", "connections_num", "usage_ms")},
         "pg_conns": {f"{a}/{b}": k for a, b, k in act}, "waiting_conns": sum(k for a, b, k in act if b == "Lock"),
         "ungranted_locks": locks[0], "advisory_locks": locks[1], "advisory_waiting": locks[2], "idle_in_tx_10s+": idle_tx,
         "long_queries": [list(map(str, r)) for r in long],

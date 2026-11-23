@@ -225,7 +225,7 @@ def try_scheduler_lock(owner: str):
     """(connection, owner) when this engine now owns the scheduler, else (None, current owner). The lock is a session-level advisory lock on a
     dedicated idle connection (autocommit: no transaction stays open for the whole cycle). It disappears with the connection, so a crashed or
     killed engine can never leave the scheduler locked."""
-    c = core.connect()
+    c = core.connect_unpooled()  # session-level advisory lock: this connection must never be handed to anybody else, so it is not from the pool
     try:
         c.autocommit = True
         if c.execute("SELECT pg_try_advisory_lock(?, hashtext(current_schema()))", (SCHED_LOCK,)).fetchone()[0]:

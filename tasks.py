@@ -7,6 +7,7 @@ released by recover() (never blindly re-queued)."""
 
 import asyncio
 import logging
+import sys
 import time
 
 import psycopg
@@ -19,6 +20,14 @@ import crawler_engine as engine
 from celery_app import BROKER_URL, MAX_QUEUED, MAX_RETRIES, RETRY_BACKOFF_MAX, TASK_TIME_LIMIT, app
 
 log = logging.getLogger("crawler.celery")
+
+
+@signals.worker_shutdown.connect
+@signals.worker_process_shutdown.connect
+def _close_db_pool(**_) -> None:
+    core.close_pool()
+
+
 RETRYABLE = (psycopg.OperationalError, TimeoutError, *core.TRANSIENT)  # temporary database trouble only
 _redis: redis.Redis | None = None
 _t0: dict[str, float] = {}
@@ -47,13 +56,20 @@ def dispatch(force: bool = False) -> int:
         return 0  # someone else is dispatching right now
 
 
+def run_loop(coro):
+    """asyncio.run with a loop Playwright can start its browser subprocess on. The `celery` command imports flower, which sets the Windows
+    selector policy process-wide; a selector loop cannot spawn subprocesses, so JS rendering silently fell back to static HTML. Linux: default loop."""
+    return asyncio.run(coro, **({"loop_factory": asyncio.ProactorEventLoop} if sys.platform == "win32" else {}))  # loop_factory needs Python 3.12+
+
+
 def _dispatch() -> int:
     with core.connect() as c:  # LIMIT keeps this cheap on a frontier of hundreds of thousands of rows
         avail = c.execute("SELECT COUNT(*) n FROM (SELECT 1 FROM discovered_urls u JOIN discovered_domains d ON d.domain=u.domain"
                           " WHERE (u.crawl_status='pending' OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?))"
                           " AND d.discovery_status='admitted' LIMIT 1000) t", (core.now(),)).fetchone()["n"]
         avail += c.execute("SELECT COUNT(*) n FROM (SELECT 1 FROM job_urls ju JOIN business_jobs j ON j.id=ju.job_id AND j.status='crawling'"
-                           " JOIN discovered_urls u ON u.id=ju.url_id WHERE u.crawl_status='pending' LIMIT 1000) t").fetchone()["n"]
+                           " JOIN discovered_urls u ON u.id=ju.url_id WHERE u.crawl_status='pending'"
+                           " OR (u.crawl_status='retry_pending' AND u.next_crawl_at<=?) LIMIT 1000) t", (core.now(),)).fetchone()["n"]
     queued = queue_length()
     n = min(max(0, MAX_QUEUED - queued), -(-avail // autonomous.AutoConfig().claim_batch))
     for _ in range(n):
@@ -75,7 +91,7 @@ def crawl_batch(self) -> int:
         work = autonomous.claim_work(owner, cfg)  # business onboarding first, then autonomous within the reserved-capacity rules
         if work:
             # The pool may not enforce time limits (Windows solo), so enforce the soft limit here, on every platform.
-            asyncio.run(asyncio.wait_for(autonomous.with_lease(  # lease renewal: a slow batch keeps its URLs
+            run_loop(asyncio.wait_for(autonomous.with_lease(  # lease renewal: a slow batch keeps its URLs
                 owner, cfg, engine.crawl_round(cfg.crawl, None, work, engine._approved(), False, len(work))), TASK_TIME_LIMIT - 60))
         return len(work)
     finally:

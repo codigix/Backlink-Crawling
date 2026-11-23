@@ -4,6 +4,7 @@ Run: .venv/Scripts/python -m uvicorn backlink_api:app --reload
 Docs: http://127.0.0.1:8000/docs
 """
 
+import contextlib
 import logging
 
 from fastapi import FastAPI, Security
@@ -28,7 +29,13 @@ with crawler_core.connect() as conn:
 
 
 # Only adds an "Authorize" button to /docs so the X-API-Key can be typed once. auto_error=False: nginx does the real key check.
-app = FastAPI(title="Backlink Crawler", dependencies=[Security(APIKeyHeader(name="X-API-Key", auto_error=False))])
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    yield
+    crawler_core.close_pool()  # idle connections are closed now; a request still running returns its own
+
+
+app = FastAPI(title="Backlink Crawler", lifespan=lifespan, dependencies=[Security(APIKeyHeader(name="X-API-Key", auto_error=False))])
 app.include_router(crawler_router)
 app.include_router(discovery_router)
 api_timing.install(app)  # Server-Timing header (db_connect / db_sql / db_fetch / app / total) and a WARNING for requests over API_SLOW_MS

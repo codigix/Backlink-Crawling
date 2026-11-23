@@ -3,7 +3,10 @@
 The PostgreSQL database (DATABASE_URL) is the permanent link graph. Crawlee's RequestQueue is only a per-round work list fed from it.
 """
 
+import atexit
+import contextvars
 import ipaddress
+import logging
 import os
 import re
 import random
@@ -18,6 +21,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 import psycopg
 import tldextract
+from psycopg_pool import ConnectionPool, PoolClosed, PoolTimeout
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")  # real environment variables still win
@@ -306,43 +310,226 @@ class Cursor(psycopg.Cursor):
         return super().executemany(_sql(query, ()), params_seq, **kw)
 
 
-OPEN_CONNS = 0  # connections this process has open right now
-# Per-process cap on simultaneously open connections (several workers x threads would otherwise exceed PostgreSQL's max_connections).
-# Callers over the cap wait up to DB_POOL_WAIT seconds, then fail loudly instead of hanging or exhausting the server.
-DB_MAX_CONN = int(os.environ.get("DB_MAX_CONNECTIONS", 20))
-DB_POOL_WAIT = float(os.environ.get("DB_POOL_WAIT", 30))
-_SLOTS = threading.BoundedSemaphore(DB_MAX_CONN)
+OPEN_CONNS = 0  # connections this process has checked out of the pool or opened unpooled right now (monitoring)
+_count_lock = threading.Lock()
+
+# Connection budget. DB_MAX_CONNECTIONS is the budget of the WHOLE deployment (API + engine + every Celery worker process + the dedicated
+# unpooled connections), NOT a per-process cap: each process gets DB_MAX_CONNECTIONS // DB_APP_PROCESSES unless DB_POOL_MAX says otherwise.
+# Keep  sum(pool max of every process) + one unpooled connection per engine  below PostgreSQL's max_connections minus
+# superuser_reserved_connections and whatever else connects (psql, backups, monitoring). Pools are per process and never shared across fork().
+DB_MAX_CONN = int(os.environ.get("DB_MAX_CONNECTIONS", 60))
+DB_APP_PROCESSES = max(1, int(os.environ.get("DB_APP_PROCESSES", 6)))  # API 1 + engine 1 + Celery worker processes (4): how many processes share the budget
+POOL_FLOOR = 6  # a process needs a few connections at once (a claim holds one while its frontier query takes a second), whatever the budget says
+POOL_MAX = int(os.environ.get("DB_POOL_MAX") or max(POOL_FLOOR, DB_MAX_CONN // DB_APP_PROCESSES))
+POOL_MIN = min(int(os.environ.get("DB_POOL_MIN", 1)), POOL_MAX)
+class DatabaseUnavailable(TimeoutError):
+    """No pooled connection within the wait (database down, overloaded, or the pool exhausted). A TimeoutError, so existing handlers still match."""
+
+
+_WAIT = contextvars.ContextVar("db_wait", default=None)  # per-request override of DB_POOL_WAIT: the API sets it, workers and the engine never do
+DB_POOL_WAIT = float(os.environ.get("DB_POOL_WAIT", 30))  # a caller waits this long for a free connection, then fails loudly with TimeoutError
+POOL_MAX_IDLE = float(os.environ.get("DB_POOL_MAX_IDLE", 300))  # connections above POOL_MIN that stay unused this long are closed
+POOL_MAX_LIFETIME = float(os.environ.get("DB_POOL_MAX_LIFETIME", 1800))  # a connection is replaced after this long (tunnels / proxies drop old ones)
+POOL_CHECK_IDLE = float(os.environ.get("DB_POOL_CHECK_IDLE", 30))  # a connection idle longer than this is tested (one round trip) when it is handed out
+logging.getLogger("psycopg.pool").setLevel(logging.WARNING)  # the pool logs every checkout at INFO
 
 
 class Connection(psycopg.Connection):
-    def close(self):
-        global OPEN_CONNS
-        if not self.closed:
-            OPEN_CONNS -= 1
-            _SLOTS.release()  # exactly once per opened connection
-        super().close()
-
     def executemany(self, query, params_seq):  # sqlite3 had it on the connection, psycopg only on cursors
         cur = self.cursor()
         cur.executemany(query, params_seq)
         return cur
 
 
-def connect() -> Connection:
-    """New connection (committed and closed by `with`). DB_SCHEMA isolates tests in their own schema."""
+def _opened(n: int) -> None:
     global OPEN_CONNS
+    with _count_lock:
+        OPEN_CONNS += n
+
+
+class Unpooled(Connection):
+    """A connection opened outside the pool (connect_unpooled). Closing it really closes it."""
+    def close(self):
+        if not self.closed:
+            _opened(-1)
+        super().close()
+
+
+def _options() -> str:
     # Server-side limits turn "waits forever" into a loud error: a lock wait, a statement or an abandoned transaction ends after 60s / 5min.
     options = "-c lock_timeout=60000 -c statement_timeout=300000 -c idle_in_transaction_session_timeout=300000"
-    if not _SLOTS.acquire(timeout=DB_POOL_WAIT):
-        raise TimeoutError(f"database connection limit reached ({DB_MAX_CONN} open, waited {DB_POOL_WAIT}s): leak or overload")
-    try:
-        conn = Connection.connect(DATABASE_URL, cursor_factory=Cursor, row_factory=_row_factory, application_name="backlink-crawler",
-                                  connect_timeout=10, options=options + (f" -c search_path={DB_SCHEMA}" if DB_SCHEMA else ""))
-    except BaseException:
-        _SLOTS.release()
-        raise
-    OPEN_CONNS += 1
+    return options + (f" -c search_path={DB_SCHEMA}" if DB_SCHEMA else "")  # DB_SCHEMA isolates tests in their own schema
+
+
+def _conn_kwargs() -> dict:
+    return dict(cursor_factory=Cursor, row_factory=_row_factory, application_name="backlink-crawler", connect_timeout=10, options=_options())
+
+
+def connect_unpooled() -> Connection:
+    """A dedicated connection that is never part of the pool, closed (really) by the caller. For connections whose SESSION state matters:
+    a session-level advisory lock (autonomous.try_scheduler_lock) lives and dies with its connection, so that connection must never be handed to
+    another caller. Counts against the connection budget (one per engine process), not against the pool's maximum."""
+    conn = Unpooled.connect(DATABASE_URL, **_conn_kwargs())
+    _opened(1)
     return conn
+
+
+_pool: ConnectionPool | None = None
+_pool_key: tuple | None = None
+_pool_lock = threading.RLock()
+_inherited_pools: list = []  # pools a forked child inherited: their sockets belong to the parent, so they are kept alive here, never closed or collected
+
+
+def _check(conn) -> None:
+    """Called by the pool whenever it hands a connection out: only a connection that sat idle for a while is tested (one cheap round trip)."""
+    returned = getattr(conn, "_returned_at", None)
+    if returned is not None and time.monotonic() - returned > POOL_CHECK_IDLE:
+        ConnectionPool.check_connection(conn)
+
+
+def _get_pool() -> ConnectionPool:
+    """The process's pool, created on first use (never at import: a process that forks first must not own one). It is re-created when the
+    connection settings change (tests switch DB_SCHEMA per test); the old one is closed, connections still out of it are closed on return."""
+    global _pool, _pool_key
+    key = (DATABASE_URL, DB_SCHEMA, POOL_MIN, POOL_MAX, POOL_MAX_IDLE, POOL_MAX_LIFETIME)
+    pool = _pool
+    if pool is not None and _pool_key == key and not pool.closed:
+        return pool
+    with _pool_lock:
+        if _pool is not None and (_pool_key != key or _pool.closed):
+            old, _pool, _pool_key = _pool, None, None
+            old.close()
+        if _pool is None:
+            if POOL_MAX * DB_APP_PROCESSES > DB_MAX_CONN:
+                logging.getLogger("crawler.db").warning("DB pool: %d connections x %d processes exceeds the DB_MAX_CONNECTIONS budget of %d", POOL_MAX, DB_APP_PROCESSES, DB_MAX_CONN)
+            _pool = ConnectionPool(DATABASE_URL, connection_class=Connection, kwargs=_conn_kwargs() | {"prepare_threshold": None},
+                                   min_size=POOL_MIN, max_size=POOL_MAX, timeout=DB_POOL_WAIT, max_idle=POOL_MAX_IDLE, max_lifetime=POOL_MAX_LIFETIME,
+                                   check=_check, name="backlink-db", open=False)
+            _pool.open(wait=False)  # prepare_threshold=None: no server-side prepared statements, so a long-lived connection never meets "cached plan must not change result type" after a migration
+            _pool_key = key
+            logging.getLogger("crawler.db").info("DB pool opened: min=%d max=%d wait=%.0fs (budget %d over %d processes)", POOL_MIN, POOL_MAX, DB_POOL_WAIT, DB_MAX_CONN, DB_APP_PROCESSES)
+        return _pool
+
+
+def close_pool(timeout: float = 10.0) -> None:
+    """Close this process's pool (idempotent): idle connections are closed now, a connection still checked out is closed when it is returned.
+    Called at interpreter exit, by the API's shutdown and by Celery's worker shutdown; the next connect() simply opens a new pool."""
+    global _pool, _pool_key
+    with _pool_lock:
+        pool, _pool, _pool_key = _pool, None, None
+    if pool is not None:
+        pool.close(timeout)
+
+
+def _forget_pool_after_fork() -> None:
+    global _pool, _pool_key, _pool_lock, _count_lock, OPEN_CONNS
+    if _pool is not None:
+        _inherited_pools.append(_pool)
+    _pool = _pool_key = None
+    _pool_lock, _count_lock, OPEN_CONNS = threading.RLock(), threading.Lock(), 0  # a parent thread may have held a lock at the moment of fork
+
+
+atexit.register(close_pool)
+if hasattr(os, "register_at_fork"):  # Celery's prefork pool: each child builds its own pool on first use
+    os.register_at_fork(after_in_child=_forget_pool_after_fork)
+
+
+def pool_stats() -> dict:
+    """Pool counters for diagnostics and measurements (requests, wait time, connection setup time, usage time, size, idle)."""
+    pool = _pool
+    base = {"pool_max": POOL_MAX, "pool_min": POOL_MIN, "checked_out": OPEN_CONNS}
+    return base | (pool.get_stats() if pool is not None and not pool.closed else {})
+
+
+class Lease:
+    """One checkout from the pool. `with connect() as c:` yields the connection and, on exit, commits (rolls back on an exception) and returns it
+    to the pool; used without `with`, it behaves like the connection and close() returns it. Releasing is idempotent per lease, so a repeated
+    close() can never return a connection that has meanwhile been handed to somebody else, and a lease that is dropped without close() is
+    returned when it is garbage collected."""
+    __slots__ = ("_conn", "_pool", "_open")
+
+    def __init__(self, conn, pool):
+        self._conn, self._pool, self._open = conn, pool, True
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._open and not self._conn.closed:
+                if exc_type:
+                    self._rollback()
+                else:
+                    try:
+                        self._conn.commit()
+                    except BaseException:
+                        self._rollback()
+                        raise
+        finally:
+            self.release()
+
+    def _rollback(self) -> None:
+        try:
+            self._conn.rollback()
+        except Exception:  # noqa: BLE001 - a broken connection is discarded by the pool when it is returned
+            pass
+
+    def release(self) -> None:
+        if not self._open:
+            return
+        self._open = False
+        conn = self._conn
+        conn.cursor_factory = Cursor  # api_timing swaps it for one checkout
+        conn._returned_at = time.monotonic()
+        _opened(-1)
+        self._pool.putconn(conn)  # rolls back an open transaction, replaces a broken or expired connection
+
+    def close(self) -> None:
+        if self._open:
+            self._rollback()  # like closing a plain connection: uncommitted work is discarded
+            self.release()
+
+    @property
+    def closed(self) -> bool:
+        return not self._open or self._conn.closed
+
+    @property
+    def cursor_factory(self):  # api_timing swaps it for one checkout; release() puts the plain Cursor back
+        return self._conn.cursor_factory
+
+    @cursor_factory.setter
+    def cursor_factory(self, factory) -> None:
+        self._conn.cursor_factory = factory
+
+    def __getattr__(self, name):  # only reached for names Lease does not define itself
+        if not self._open:
+            raise psycopg.InterfaceError("the connection was already returned to the pool")
+        return getattr(self._conn, name)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter shutdown
+            pass
+
+
+def connect() -> Lease:
+    """A pooled connection (committed and returned by `with`). Waits up to DB_POOL_WAIT for a free one, then raises
+    TimeoutError (database connection limit reached) instead of hanging or exhausting the server. DB_SCHEMA isolates tests in their own schema."""
+    wait = _WAIT.get() or DB_POOL_WAIT
+    for attempt in (0, 1):
+        pool = _get_pool()
+        try:
+            conn = pool.getconn(timeout=wait)
+        except PoolClosed:  # another thread replaced the pool (settings changed): use the new one
+            if attempt:
+                raise
+            continue
+        except PoolTimeout as e:
+            raise DatabaseUnavailable(f"database connection limit reached ({pool.max_size} max per process, waited {wait}s): leak, overload or database unreachable") from e
+        break
+    _opened(1)
+    return Lease(conn, pool)
 
 
 BUSY_ERRORS = 0  # transient lock/deadlock errors seen by retry_locked in this process (monitoring)
@@ -574,7 +761,7 @@ def event(conn, backlink_id: int, kind: str, details: str | None = None) -> None
 def record_backlink(conn, target_id: int, source: str, dest: str, anchor: str, rel: str | None, method: str = "forward_crawl",
                     status: str = "verified") -> None:
     """Create or refresh a backlink and log history. Only called after a live fetch of the source page saw the link."""
-    row = conn.execute("SELECT * FROM backlinks WHERE target_domain_id=? AND source_url=? AND destination_url=?",
+    row = conn.execute("SELECT id, is_active, link_status, anchor_text, rel_attributes FROM backlinks WHERE target_domain_id=? AND source_url=? AND destination_url=?",
                        (target_id, source, dest)).fetchone()
     stamp = now() if status == "verified" else None
     if row is None:
@@ -602,7 +789,7 @@ def match_target_from_graph(conn, target: str) -> int:
     target_id = add_target(conn, target)
     target = clean_target(target)
     n = 0
-    for r in conn.execute("SELECT * FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND is_active=1",
+    for r in conn.execute("SELECT source_url, destination_url, anchor_text, rel_attributes FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND is_active=1",
                           (registrable_domain(target),)).fetchall():
         if host_matches(hostname(r["destination_url"]), target) and not host_matches(hostname(r["source_url"]), target):
             record_backlink(conn, target_id, r["source_url"], r["destination_url"], r["anchor_text"], r["rel_attributes"])
