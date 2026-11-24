@@ -143,6 +143,24 @@ def test_junk_url_is_rejected_and_stored_junk_does_not_fail_the_batch(env):
     assert status(JUNK)["crawl_status"] == "skipped"
 
 
+SOFT = "http://quickstats.\xadnass.\xadusda.\xadgov/x"  # soft hyphens: crawlee's per-host throttler (yarl) raised ValueError for the whole batch
+
+
+def test_soft_hyphen_host_is_skipped_per_url_and_the_valid_url_is_still_crawled(env):
+    u = env
+    SITES["goodmix.localhost"] = {"/": (200, "text/html", "<html><body>ok</body></html>")}
+    good = u("goodmix")
+    with core.connect() as c:
+        core.save_url(c, good, None, "t", 0, True, "crawling")
+        c.execute("INSERT INTO discovered_urls (url, normalized_url, domain, hostname, discovery_method, crawl_depth, is_internal, is_external,"
+                  " crawl_status) VALUES (?,?,?,?,?,?,?,?,?)", (SOFT, SOFT, "usda.gov", "usda.gov", "t", 0, 1, 0, "crawling"))
+    n_before = rows("SELECT COUNT(*) n FROM discovered_urls")[0]["n"]
+    asyncio.run(engine.crawl_round(cfg(), None, [(SOFT, 0), (good, 0)], set(), False, 2))  # must not raise
+    assert status(SOFT)["crawl_status"] == "skipped" and status(SOFT)["skip_reason"] == "invalid_url"
+    assert status(good)["crawl_status"] == "completed"  # the valid URL of the same batch went through
+    assert rows("SELECT COUNT(*) n FROM discovered_urls")[0]["n"] == n_before  # nothing deleted
+
+
 def test_unsafe_domain_is_never_admitted(env, monkeypatch):
     monkeypatch.setattr(core, "ALLOW_PRIVATE", False)
     assert asyncio.run(engine.admit_domain(cfg(), None, "localhost", "http://localhost:80/")) is False

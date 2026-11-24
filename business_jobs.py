@@ -244,35 +244,53 @@ def _search_done(job: dict, urls: list[str], run: "ddg_lookup.Run | None" = None
     sets. Candidates are capped by the job's page budget. With a Run, the pagination cursors and the query provenance of every hit are stored in
     this same transaction: a cursor never moves past a page whose URLs were not stored, and a URL already known globally is still associated."""
     reg = job["target_domain"]
-    ids: list[int] = []
-    dup = 0
-    done: set[str] = set()
-    with core.connect() as c:
-        own = c.execute("UPDATE business_jobs SET status='crawling', last_error=NULL, updated_at=? WHERE id=? AND status='searching' AND search_gen=? RETURNING max_pages",
-                        (core.now(), job["id"], job["search_gen"])).fetchone()
-        if not own:
-            log.warning("BUSINESS-JOB %s: result of a superseded search discarded (%d url(s))", reg, len(urls))
-            return
-        room = own["max_pages"] - c.execute("SELECT COUNT(*) FROM job_urls WHERE job_id=?", (job["id"],)).fetchone()[0]
-        for u in urls:
-            if len(ids) >= max(room, 0):
-                break
-            norm = core.normalize_url(u)
-            dom = core.registrable_domain(core.hostname(u))
-            if not norm or dom == reg:  # the business's own pages are not backlinks
-                continue
-            dup += bool(c.execute("SELECT 1 FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone())  # already known: another run or business
-            ok = core.crawlable(u) and dom not in engine.NO_CRAWL_DOMAINS
-            core.save_url(c, u, None, "ddg", 0, False, "pending" if ok else "skipped", None, None if ok else "no_crawl")
-            ids.append(c.execute("SELECT id FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone()["id"])
-            done.add(norm)
-        if run:
-            _store_run(c, reg, run, done, cut=len(done) < len({core.normalize_url(u) for u in urls} - {None}))
-        if ids:
-            c.execute("INSERT INTO job_urls (job_id, url_id, depth) SELECT ?, unnest(?::bigint[]), 0 ON CONFLICT DO NOTHING", (job["id"], ids))
-        c.execute("UPDATE business_jobs SET search_results=(SELECT COUNT(*) FROM job_urls WHERE job_id=? AND depth=0), duplicate_candidates=? WHERE id=?",
-                  (job["id"], dup, job["id"]))
-    log.info(">>> BUSINESS-JOB %s: DuckDuckGo gave %d candidate page(s)", reg, len(ids))
+
+    def once() -> list[int] | None:  # the WHOLE transaction: a deadlock victim is rolled back completely and this runs again from the fenced UPDATE
+        ids: list[int] = []
+        dup = 0
+        done: set[str] = set()
+        with core.connect() as c:
+            own = c.execute("UPDATE business_jobs SET status='crawling', last_error=NULL, updated_at=? WHERE id=? AND status='searching' AND search_gen=? RETURNING max_pages",
+                            (core.now(), job["id"], job["search_gen"])).fetchone()
+            if not own:
+                log.warning("BUSINESS-JOB %s: result of a superseded search discarded (%d url(s))", reg, len(urls))
+                return None
+            room = own["max_pages"] - c.execute("SELECT COUNT(*) FROM job_urls WHERE job_id=?", (job["id"],)).fetchone()[0]
+            picked = []  # which candidates are kept follows the search order (page budget); only the WRITE order below is sorted
+            for u in urls:
+                if len(picked) >= max(room, 0):
+                    break
+                norm = core.normalize_url(u)
+                dom = core.registrable_domain(core.hostname(u))
+                if not norm or dom == reg:  # the business's own pages are not backlinks
+                    continue
+                dup += bool(c.execute("SELECT 1 FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone())  # already known: another run or business
+                picked.append((dom, norm, u))
+            # Lock order = process_page's: every domain row first, in sorted order (the former per-URL upsert in search order was the discovered_domains
+            # deadlock), then the URL rows. The URLs keep their search order (ids = crawl priority); the new-page counts are added to the rows already locked.
+            for dom in sorted({p[0] for p in picked}):
+                core.upsert_domain(c, dom, "ddg", 0)
+            new_per_domain: dict[str, int] = {}
+            for dom, norm, u in picked:
+                ok = core.crawlable(u) and dom not in engine.NO_CRAWL_DOMAINS
+                new = core.save_url(c, u, None, "ddg", 0, False, "pending" if ok else "skipped", None, None if ok else "no_crawl", touch_domain=False)
+                new_per_domain[dom] = new_per_domain.get(dom, 0) + int(new)
+                ids.append(c.execute("SELECT id FROM discovered_urls WHERE normalized_url=?", (norm,)).fetchone()["id"])
+                done.add(norm)
+            for dom, n in new_per_domain.items():
+                if n:
+                    c.execute("UPDATE discovered_domains SET pages_discovered=pages_discovered+? WHERE domain=?", (n, dom))
+            if run:
+                _store_run(c, reg, run, done, cut=len(done) < len({core.normalize_url(u) for u in urls} - {None}))
+            if ids:
+                c.execute("INSERT INTO job_urls (job_id, url_id, depth) SELECT ?, unnest(?::bigint[]), 0 ON CONFLICT DO NOTHING", (job["id"], ids))
+            c.execute("UPDATE business_jobs SET search_results=(SELECT COUNT(*) FROM job_urls WHERE job_id=? AND depth=0), duplicate_candidates=? WHERE id=?",
+                      (job["id"], dup, job["id"]))
+        return ids
+
+    ids = core.retry_locked(once)  # bounded exponential backoff with jitter; the last failure is raised, never swallowed
+    if ids is not None:
+        log.info(">>> BUSINESS-JOB %s: DuckDuckGo gave %d candidate page(s)", reg, len(ids))
 
 
 def _load_run(domain: str) -> "ddg_lookup.Run":

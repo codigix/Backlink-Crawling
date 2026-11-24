@@ -124,6 +124,12 @@ def test_monitoring_counters_match_database(env):
         for i in range(3):
             core.save_url(c, f"http://m.localhost/{i}", None, "t", 1, True, "completed" if i else "pending")
         c.execute("UPDATE discovered_urls SET next_crawl_at='2000-01-01 00:00:00' WHERE crawl_status='completed'")
+    engine_stats._slow.clear()
+    engine_stats.metrics()  # the full-table aggregates are cached and refreshed in the background (monitoring only): the first call starts it
+    for _ in range(100):
+        if not engine_stats._slow_running:
+            break
+        time.sleep(0.05)
     m = engine_stats.metrics()
     assert m["urls"] == {"completed": 2, "pending": 1} and m["recrawl_backlog"] == 2 and m["domains"] == {"discovered": 1}
     assert m["urls"] == engine_stats.counts()["urls_by_status"]

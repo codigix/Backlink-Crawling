@@ -15,7 +15,7 @@ log = logging.getLogger("crawler.stats")
 # last snapshot is served (flagged X-Stats-Stale) for at most STATS_MAX_STALE_SECONDS, after that StatsUnavailable.
 STATS_TTL = min(30.0, max(10.0, float(os.environ.get("STATS_TTL_SECONDS", 15))))
 STATS_MAX_STALE = float(os.environ.get("STATS_MAX_STALE_SECONDS", 300))
-STATS_RETRY = 5.0  # after a failed refresh, no other attempt for this long (a down database must not cost every request a connect timeout)
+STATS_RETRY = float(os.environ.get("STATS_RETRY_SECONDS", 60))  # after a failed refresh, no other attempt for this long (a down database must not cost every request a connect timeout, and a timing-out full scan must not be repeated every few seconds)
 
 _lock = threading.Lock()
 _snap: tuple[float, dict] | None = None  # (monotonic time taken, counts()-shaped dict): one entry per process, so memory is constant
@@ -90,17 +90,57 @@ def reset_snapshot() -> None:
         _snap, _retry_at = None, 0.0
 
 
+# Monitoring-only full-table aggregates (engine log lines; NO scheduling decision reads them). They used to run every 10-60 s and, on 10M+ rows,
+# were cancelled by the statement timeout every time: pure load. Now: at most one refresh per SLOW_TTL, in ONE background thread, with its own
+# longer timeout; a failed refresh waits a full SLOW_TTL before the next attempt; callers never wait and get the last value (or None) + its age.
+SLOW_TTL = float(os.environ.get("MONITOR_SLOW_TTL_SECONDS", 600))
+SLOW_TIMEOUT = os.environ.get("MONITOR_SLOW_TIMEOUT_SECONDS", "90")
+_slow: dict[str, dict] = {}
+_slow_lock = threading.Lock()
+_slow_running: set[str] = set()
+
+
+def slow_cached(key: str, sql: str, shape):
+    """(value, age_seconds) of a monitoring aggregate, or (None, None) until the first refresh succeeds. `shape(cursor)` turns the result into the value."""
+    now = time.monotonic()
+    with _slow_lock:
+        e = _slow.setdefault(key, {"value": None, "at": None, "next": 0.0})
+        due = now >= e["next"] and key not in _slow_running
+        if due:
+            _slow_running.add(key)
+            e["next"] = now + SLOW_TTL  # also the back-off after a failure: success or not, no second attempt before SLOW_TTL
+        value, at = e["value"], e["at"]
+
+    def refresh():
+        try:
+            with core.connect() as c:
+                c.execute(f"SET LOCAL statement_timeout='{int(float(SLOW_TIMEOUT))}s'")  # transaction-scoped: pooled connection stays clean
+                v = shape(c.execute(sql))
+            with _slow_lock:
+                _slow[key].update(value=v, at=time.monotonic())
+        except Exception as ex:  # noqa: BLE001 - monitoring only: keep the previous value
+            log.warning("monitoring aggregate %s failed (%s); next attempt in %.0fs", key, type(ex).__name__, SLOW_TTL)
+        finally:
+            with _slow_lock:
+                _slow_running.discard(key)
+    if due:
+        threading.Thread(target=refresh, name=f"stats-{key}", daemon=True).start()
+    return value, (None if at is None else round(now - at))
+
+
 def metrics() -> dict:
-    """Real-database snapshot for the engine's 60s log line. Rates are over the last 60 seconds."""
+    """Real-database snapshot for the engine's 60s log line. Rates are over the last 60 seconds. The full-table aggregates are cached (see slow_cached)."""
+    urls, urls_age = slow_cached("urls_by_status", "SELECT crawl_status, COUNT(*) FROM discovered_urls GROUP BY 1", lambda cur: {r[0]: r[1] for r in cur})
+    repeats, _ = slow_cached("repeat_fetches", "SELECT COUNT(*)-COUNT(DISTINCT source_url) FROM crawl_history", lambda cur: cur.fetchone()[0])
     with core.connect() as c:
         by = lambda sql: {r[0]: r[1] for r in c.execute(sql)}  # noqa: E731
         one = lambda sql, *a: c.execute(sql, a).fetchone()[0]  # noqa: E731
         minute = core.later(seconds=-60)
         return {
             "domains": by("SELECT discovery_status, COUNT(*) FROM discovered_domains GROUP BY 1"),
-            "urls": by("SELECT crawl_status, COUNT(*) FROM discovered_urls GROUP BY 1"),
+            "urls": urls, "urls_age_s": urls_age,
             "recrawl_backlog": one("SELECT COUNT(*) FROM discovered_urls WHERE crawl_status='completed' AND next_crawl_at<=?", core.now()),
-            "repeat_fetches": one("SELECT COUNT(*)-COUNT(DISTINCT source_url) FROM crawl_history"),
+            "repeat_fetches": repeats,
             "backlinks": by("SELECT link_status, COUNT(*) FROM backlinks GROUP BY 1"),
             "pages_per_min": one("SELECT COUNT(*) FROM crawl_history WHERE crawl_completed>=? AND error_message IS NULL", minute),
             "urls_discovered_per_min": one("SELECT COUNT(*) FROM discovered_urls WHERE first_seen>=?", minute),
@@ -112,11 +152,12 @@ def metrics() -> dict:
 def diagnostics(stats: dict) -> dict:
     """10-second diagnostic snapshot: frontier counts, our connections, PostgreSQL's own view (pg_stat_activity / pg_locks /
     pg_stat_database), and HTTP timings. `stats` is crawler_engine.HTTP. Uses its own short-lived connection with timeouts."""
+    urls, urls_age = slow_cached("urls_by_status", "SELECT crawl_status, COUNT(*) FROM discovered_urls GROUP BY 1", lambda cur: {r[0]: r[1] for r in cur})
+    urls = urls or {}
     with core.connect() as c:
         c.execute("SET LOCAL statement_timeout='5s'")  # transaction-scoped: a session-level SET would stay on the pooled connection
         q = lambda sql, *a: [list(r.values()) for r in c.execute(sql, a).fetchall()]  # noqa: E731 - plain lists
-        urls = {r[0]: r[1] for r in q("SELECT crawl_status, COUNT(*) FROM discovered_urls GROUP BY 1")}
-        act = q("SELECT state, wait_event_type, COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()"
+        act =q("SELECT state, wait_event_type, COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()"
                 " AND application_name='backlink-crawler' GROUP BY 1,2")
         locks = q("SELECT COUNT(*) FILTER (WHERE NOT granted) a, COUNT(*) FILTER (WHERE locktype='advisory') b,"
                   " COUNT(*) FILTER (WHERE locktype='advisory' AND NOT granted) c FROM pg_locks")[0]
@@ -128,6 +169,7 @@ def diagnostics(stats: dict) -> dict:
         db = q("SELECT numbackends, xact_commit, xact_rollback, deadlocks, temp_files FROM pg_stat_database WHERE datname=current_database()")[0]
     n = stats["done"]
     return {
+        "frontier_counts_age_s": urls_age,  # None until the first cached aggregate exists; monitoring only
         "discovered": sum(urls.values()), "pending": urls.get("pending", 0) + urls.get("retry_pending", 0),
         "processing": urls.get("crawling", 0) + urls.get("recrawling", 0), "completed": urls.get("completed", 0), "failed": urls.get("failed", 0),
         "inflight_fetches": stats["started"] - n, "pool_size": f"max {core.POOL_MAX} per process; checked out now={core.OPEN_CONNS}", "pool": {k: v for k, v in core.pool_stats().items() if k in ("pool_size", "pool_available", "requests_waiting", "requests_wait_ms", "connections_num", "usage_ms")},

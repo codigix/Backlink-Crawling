@@ -198,17 +198,40 @@ def _all_cursor(cursor: str | None, offset: int) -> tuple[str, list]:
     return " AND (b.target_type, l.destination_domain, l.id) > (?, ?, ?)", [ttype, dom, int(rid)]
 
 
+def _all_page_sql(cols: str, active: str, target_type: str | None, cursor: str | None, kargs: list, n: int, offset: int) -> tuple[str, list]:
+    """The page query of GET /backlinks, target by target. The former join + global sort read and sorted EVERY link of every monitored target
+    (~2.3M rows, a full scan of the 38M-row table) to return 100 of them. Here the targets are walked in their final order and, for each, only
+    its first `offset+n` links by id are read through idx_outgoing_dest_active, so the work stops after the first target(s) that fill the page.
+    Same rows, same order (target_type, target domain, link id), same cursor and offset meaning as before."""
+    tcond, targs = [], []
+    if target_type:
+        tcond.append("target_type=?")
+        targs.append(target_type)
+    lcond, largs = "", []
+    if cursor is not None:  # kargs = [type, domain, id]: targets from the cursor's one on; inside that target only links after the cursor's id
+        tcond.append("(target_type, domain) >= (?, ?)")
+        targs += [kargs[0], kargs[1]]
+        lcond, largs = " AND (t.domain<>? OR l.id>?)", [kargs[1], kargs[2]]
+    where = (" WHERE " + " AND ".join(tcond)) if tcond else ""
+    order = "domain" if target_type else "target_type, domain"  # with a type filter target_type is constant: leaving it out lets the planner see that the outer order is already the final one
+    sql = (f"SELECT {cols.replace('l.', 'x.')}, t.target_type, (SELECT crawl_status FROM discovered_urls u WHERE u.url=x.source_url) AS src_status FROM"
+           f" (SELECT domain, target_type FROM businesses{where} ORDER BY {order}) t"
+           f" CROSS JOIN LATERAL (SELECT {cols} FROM outgoing_links l WHERE l.destination_domain=t.domain AND l.link_type='html' AND l.source_domain<>t.domain"
+           f"{active}{lcond} ORDER BY l.id LIMIT ?) x ORDER BY {'t.' + order.replace(', ', ', t.')}, x.id LIMIT ? OFFSET ?")
+    return sql, [*targs, *largs, offset + n, n, offset]
+
+
 @router.get("/backlinks")
 def all_backlinks(target_type: str | None = Query(None, pattern="^(own_business|competitor)$"), include_removed: bool = False,
                   limit: Limit = DEFAULT_LIMIT, offset: Offset = 0, cursor: Cursor = None) -> dict:
     """Backlinks of EVERY monitored target, our businesses and all competitors together (filter with target_type), straight from the link graph.
     Ordered by (target_type, target domain, link id), a unique key: with `cursor` a deep page costs the same as the first one, `offset` still works."""
     active = "" if include_removed else " AND l.is_active=1"
-    cond = " FROM outgoing_links l JOIN businesses b ON b.domain=l.destination_domain WHERE l.link_type='html' AND l.source_domain<>b.domain" + active + (" AND b.target_type=?" if target_type else "")
     args = [target_type] if target_type else []
     kcond, kargs = _all_cursor(cursor, offset)
     cols = ", ".join("l." + x for x in ("id", "destination_domain", "source_url", "destination_url", "anchor_text", "rel_attributes", "source_domain",
                                         "first_seen", "last_seen", "is_active", "lost_at"))
+    page_sql, page_args = _all_page_sql(cols, active, target_type, cursor, kargs, limit + 1, offset)
 
     def per_target(c) -> list:
         """backlinks and distinct referring domains of every target: a hash aggregate over (target, source domain) pairs (COUNT(DISTINCT) sorted every link on disk)."""
@@ -221,8 +244,7 @@ def all_backlinks(target_type: str | None = Query(None, pattern="^(own_business|
 
     with connect() as c:
         per = per_target(c)  # live, like the page (the read cache covers only the per-target summary, referring-domain and anchor reads)
-        rows = c.execute(f"SELECT {cols}, b.target_type, (SELECT crawl_status FROM discovered_urls u WHERE u.url=l.source_url) AS src_status" + cond + kcond +
-                         " ORDER BY b.target_type, l.destination_domain, l.id LIMIT ? OFFSET ?", (*args, *kargs, limit + 1, offset)).fetchall()
+        rows = c.execute(page_sql, page_args).fetchall()
     more, rows = len(rows) > limit, rows[:limit]
     return {"total_backlinks": sum(r["backlinks"] for r in per), "limit": limit, "offset": offset, "has_more": more,
             "next_offset": offset + limit if more else None,

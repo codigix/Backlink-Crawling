@@ -27,6 +27,7 @@ from crawlee.request_loaders import ThrottlingRequestManager
 from crawlee.http_clients import ImpitHttpClient
 from crawlee.storage_clients import MemoryStorageClient
 from crawlee.storages import RequestQueue
+from yarl import URL
 
 import crawler_core as core
 import egress_proxy
@@ -448,8 +449,10 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         ok, bad = [], []
         for u, d in items:
             try:
-                ok.append(req(u, d))
-            except Exception:  # noqa: BLE001 - pydantic ValidationError and friends
+                r = req(u, d)
+                URL(u).host  # crawlee's per-host throttler does exactly this in add_requests; a bad host (e.g. soft hyphens) raised ValueError for the WHOLE batch
+                ok.append(r)
+            except Exception:  # noqa: BLE001 - pydantic ValidationError, yarl ValueError and friends
                 bad.append(u)
         if bad:
             with core.connect() as c:

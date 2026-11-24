@@ -542,10 +542,13 @@ def retry_locked(fn, tries: int = 4):
     for i in range(tries):
         try:
             return fn()
-        except TRANSIENT:
+        except TRANSIENT as e:
             BUSY_ERRORS += 1
+            name = getattr(fn, "__qualname__", "operation")
             if i == tries - 1:
+                logging.getLogger("crawler.db").error("%s: %s still failing after %d attempts, giving up: %s", name, type(e).__name__, tries, e)
                 raise
+            logging.getLogger("crawler.db").warning("%s: %s (attempt %d/%d), transaction rolled back, retrying", name, type(e).__name__, i + 1, tries)
             time.sleep(0.2 * 2 ** i * random.uniform(0.5, 1.5))
 
 

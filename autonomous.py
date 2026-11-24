@@ -196,8 +196,11 @@ def release(owner: str | None = None) -> int:
 
 
 def renew(owner: str, seconds: int) -> int:
+    # SKIP LOCKED + id order: a renewal never WAITS for a row (a page transaction is writing it right now), so it cannot be one side of a lock
+    # cycle (it was a production deadlock victim). A skipped row keeps its old expiry and is renewed on the next tick; leases are 3 ticks long.
     with core.connect() as c:
-        return c.execute("UPDATE discovered_urls SET lease_expires=? WHERE lease_owner=? AND crawl_status IN ('crawling','recrawling')",
+        return c.execute("UPDATE discovered_urls SET lease_expires=? WHERE id IN (SELECT id FROM discovered_urls WHERE lease_owner=?"
+                         " AND crawl_status IN ('crawling','recrawling') ORDER BY id FOR UPDATE SKIP LOCKED)",
                          (core.later(seconds=seconds), owner)).rowcount
 
 
@@ -207,7 +210,7 @@ async def with_lease(owner: str, cfg: AutoConfig, work):
         while True:
             await asyncio.sleep(cfg.lease_seconds / 3)
             try:
-                await asyncio.to_thread(renew, owner, cfg.lease_seconds)
+                await asyncio.to_thread(core.retry_locked, lambda: renew(owner, cfg.lease_seconds))  # a deadlock victim is rolled back whole and retried (bounded)
             except Exception:  # noqa: BLE001 - a missed renewal only matters if it repeats for a whole lease
                 log.warning("lease renewal failed for %s", owner, exc_info=True)
     t = asyncio.create_task(keep())
@@ -266,6 +269,7 @@ def record_cycle(status: str, detail: dict) -> None:
 
 ADMIT_TIMEOUT = float(os.environ.get("ADMIT_TIMEOUT_SECONDS", 30))  # one domain's admission (robots, sitemaps: many requests); a slow host must not stall the cycle
 RETIRE_BATCH = int(os.environ.get("RETIRE_BATCH_ROWS", 5000))  # rows per retirement transaction
+RETIRE_DOMAINS = int(os.environ.get("RETIRE_DOMAINS_PER_STATEMENT", 25))  # over-budget domains per retirement statement (keeps the plan on the domain index)
 RETIRE_BUDGET_S = float(os.environ.get("RETIRE_BUDGET_SECONDS", 120))  # retirement stops starting batches after this; the rest resumes next cycle
 ADMIT_CYCLE_BUDGET =float(os.environ.get("ADMIT_CYCLE_BUDGET_SECONDS", 60))  # no new admission is started after this much time in one cycle
 ADMIT_MAX_FAILURES = 3  # consecutive failed/timed-out admissions after which a domain is marked unreachable instead of blocking the head of the queue again
@@ -347,30 +351,42 @@ def retire_exhausted(cfg: AutoConfig) -> int:
     deadline = t0 + RETIRE_BUDGET_S
     # Bounded batches, one transaction (commit) each: a 300 s statement used to be cancelled and rolled back, so it never progressed. Now every
     # committed batch is permanent progress; the same eligibility rules apply and a skipped row leaves the predicate, so a re-run or restart resumes.
+    slowest = [0.0]  # the slowest batch of this cycle = the estimate of how long one more batch takes
+
     def batched(sql: str, args: tuple) -> int:
-        total = 0
-        while time.monotonic() < deadline:
+        """sql: ... AND id>? ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED) RETURNING id. Keyset by id: a batch continues after the previous one instead of
+        re-reading the rows already retired. No batch is started that would not finish before the deadline."""
+        total, last = 0, 0
+        while time.monotonic() + slowest[0] < deadline:
+            b0 = time.monotonic()
             with core.connect() as c:
-                n = c.execute(sql, (*args, RETIRE_BATCH)).rowcount
-            total += n
-            if n < RETIRE_BATCH:  # drained (or the rest is row-locked by crawls: next cycle)
+                ids = [r[0] for r in c.execute(sql, (*args, last, RETIRE_BATCH)).fetchall()]
+            total += len(ids)
+            slowest[0] = max(slowest[0], time.monotonic() - b0)
+            if len(ids) < RETIRE_BATCH:  # drained (or the rest is row-locked by crawls: next cycle)
                 break
+            last = max(ids)
         return total
 
     t1 = time.monotonic()
     depth = batched("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='max_depth', lease_owner=NULL, lease_expires=NULL WHERE id IN ("
-                    " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND crawl_depth>? ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED)",
+                    " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND crawl_depth>? AND id>? ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED) RETURNING id",
                     (cfg.crawl.max_depth,))
     t2 = time.monotonic()
     budget = 0
     if t2 < deadline:
-        with core.connect() as c:  # over-budget domains found once per cycle (read only), then their pending rows are retired in batches
-            over = [r[0] for r in c.execute("SELECT k.domain FROM discovered_urls k WHERE k.crawl_status='completed' GROUP BY k.domain HAVING COUNT(*)>=?",
-                                            (cfg.domain_page_budget,)).fetchall()]
-        budget = batched("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='domain_page_budget_exhausted' WHERE id IN ("
-                         " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND domain = ANY(?::text[])"
-                         "  AND domain IN (SELECT domain FROM discovered_domains WHERE discovery_status IN ('admitted','crawled')) ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED)",
-                         (over,)) if over else 0
+        with core.connect() as c:  # over-budget domains found once per cycle (an index-only read of the completed rows)
+            over = sorted(r[0] for r in c.execute("SELECT k.domain FROM discovered_urls k WHERE k.crawl_status='completed' GROUP BY k.domain HAVING COUNT(*)>=?",
+                                                  (cfg.domain_page_budget,)).fetchall())
+        # A few domains per statement: the planner then reaches their pending rows through idx_discovered_dom_status. One statement over ALL over-budget
+        # domains planned a sequential scan + sort of the whole 10M-row table for EVERY batch (~25 s each).
+        for i in range(0, len(over), RETIRE_DOMAINS):
+            if time.monotonic() + slowest[0] >= deadline:
+                break
+            budget += batched("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='domain_page_budget_exhausted' WHERE id IN ("
+                              " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND domain = ANY(?::text[])"
+                              "  AND EXISTS (SELECT 1 FROM discovered_domains d WHERE d.domain=discovered_urls.domain AND d.discovery_status IN ('admitted','crawled')) AND id>? ORDER BY id LIMIT ?"
+                              " FOR UPDATE SKIP LOCKED) RETURNING id", (over[i:i + RETIRE_DOMAINS],))
     t3 = time.monotonic()
     with core.connect() as c:
         retired = c.execute(
