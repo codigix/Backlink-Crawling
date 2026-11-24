@@ -22,6 +22,7 @@ from crawlee.crawlers import (
     BeautifulSoupCrawler, BeautifulSoupCrawlingContext, PlaywrightCrawler, PlaywrightCrawlingContext,
 )
 from crawlee._utils.robots import RobotsTxtFile
+from crawlee.crawlers._beautifulsoup._beautifulsoup_parser import BeautifulSoupParser  # shortcut: private crawlee module (pinned in requirements.txt); re-check when upgrading
 from crawlee.errors import PersistentRateLimitError, RequestThrottledError
 from crawlee.request_loaders import ThrottlingRequestManager
 from crawlee.http_clients import ImpitHttpClient
@@ -427,6 +428,26 @@ def needs_js(soup) -> bool:
     return noscript or (shell and text < 300) or (len(soup.find_all("script")) >= 3 and text < 200)
 
 
+class FallbackSoupParser(BeautifulSoupParser):
+    """crawlee's lxml parse with ONE narrow safety net. bs4's lxml builder assumes an attribute name that starts with '{' contains '}'
+    (Clark notation, `namespace, attr = tag[1:].split("}", 1)`); markup with such an attribute name ends in `ValueError: not enough values to
+    unpack` for the whole page, which then burned its retries and failed. Only that exact error is caught and the SAME bytes are re-parsed with the
+    lenient html.parser, so the page and its links are kept; every other error (and every other parser failure) is raised unchanged."""
+
+    def __init__(self, parser="lxml"):
+        super().__init__(parser)
+        self._lenient = BeautifulSoupParser("html.parser")
+
+    def _parse_body(self, body, content_type):
+        try:
+            return super()._parse_body(body, content_type)
+        except ValueError as e:
+            if not str(e).startswith("not enough values to unpack"):
+                raise
+            log.warning("lxml/bs4 rejected the markup (%s); re-parsed with html.parser", e)
+            return self._lenient._parse_body(body, content_type)
+
+
 async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int]], approved: set[str], follow: bool,
                       limit: int) -> None:
     """Run one Crawlee crawl over `work` [(url, depth)]; internal links found are queued dynamically if `follow`.
@@ -682,6 +703,7 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         return
 
     crawler = BeautifulSoupCrawler(request_manager=await queue_for(work), navigation_timeout=timedelta(seconds=cfg.timeout), **common())
+    crawler._parser = FallbackSoupParser()  # shortcut: replaces crawlee's private parser attribute (crawlee is pinned); same lxml parse plus the narrow fallback above
 
     @crawler.router.default_handler
     async def bs(context: BeautifulSoupCrawlingContext) -> None:
