@@ -68,6 +68,26 @@ def test_retirement_scales_and_domains_are_retired_in_one_pass(env):
     assert below == 0  # nothing left to do
 
 
+def test_retirement_batches_commit_progress_and_resume_after_the_time_budget(env, monkeypatch):
+    """Batches of 7 rows: every batch commits, an exhausted time budget stops early without losing progress, the next cycle finishes. No row is deleted."""
+    domain("big.localhost", completed=3, pending=30)
+    domain("deep.localhost", "discovered", pending=0)
+    with core.connect() as c:
+        for i in range(10):
+            core.save_url(c, f"http://deep.localhost/d{i}", None, "t", 9, True, "pending")  # depth 9 > max_depth
+    total_before = rows("SELECT COUNT(*) n FROM discovered_urls")[0]["n"]
+    monkeypatch.setattr(autonomous, "RETIRE_BATCH", 7)
+    monkeypatch.setattr(autonomous, "RETIRE_BUDGET_S", 0.0)  # budget already spent: no batch may start
+    autonomous.retire_exhausted(acfg(domain_page_budget=3))
+    assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status='skipped'")[0]["n"] == 0
+    monkeypatch.setattr(autonomous, "RETIRE_BUDGET_S", 60.0)
+    autonomous.retire_exhausted(acfg(domain_page_budget=3))
+    assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE skip_reason='domain_page_budget_exhausted'")[0]["n"] == 30
+    assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE skip_reason='max_depth'")[0]["n"] == 10
+    assert rows("SELECT COUNT(*) n FROM discovered_urls")[0]["n"] == total_before  # nothing deleted
+    assert rows("SELECT COUNT(*) n FROM discovered_urls WHERE crawl_status='completed'")[0]["n"] == 3  # completed rows untouched
+
+
 def test_locked_rows_are_skipped_not_waited_for_and_retired_next_cycle(env):
     domain("busy.localhost", completed=3, pending=4)
     cfg = acfg(domain_page_budget=3)

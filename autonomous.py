@@ -265,7 +265,9 @@ def record_cycle(status: str, detail: dict) -> None:
 
 
 ADMIT_TIMEOUT = float(os.environ.get("ADMIT_TIMEOUT_SECONDS", 30))  # one domain's admission (robots, sitemaps: many requests); a slow host must not stall the cycle
-ADMIT_CYCLE_BUDGET = float(os.environ.get("ADMIT_CYCLE_BUDGET_SECONDS", 60))  # no new admission is started after this much time in one cycle
+RETIRE_BATCH = int(os.environ.get("RETIRE_BATCH_ROWS", 5000))  # rows per retirement transaction
+RETIRE_BUDGET_S = float(os.environ.get("RETIRE_BUDGET_SECONDS", 120))  # retirement stops starting batches after this; the rest resumes next cycle
+ADMIT_CYCLE_BUDGET =float(os.environ.get("ADMIT_CYCLE_BUDGET_SECONDS", 60))  # no new admission is started after this much time in one cycle
 ADMIT_MAX_FAILURES = 3  # consecutive failed/timed-out admissions after which a domain is marked unreachable instead of blocking the head of the queue again
 
 
@@ -342,18 +344,35 @@ def retire_exhausted(cfg: AutoConfig) -> int:
     'completed' URLs, exactly the old per-row COUNT(*) rule) and only their pending rows are touched. Row updates use FOR UPDATE SKIP LOCKED:
     a URL a Celery worker is claiming right now is left for the next cycle instead of making this statement wait for the lock timeout."""
     t0 = time.monotonic()
+    deadline = t0 + RETIRE_BUDGET_S
+    # Bounded batches, one transaction (commit) each: a 300 s statement used to be cancelled and rolled back, so it never progressed. Now every
+    # committed batch is permanent progress; the same eligibility rules apply and a skipped row leaves the predicate, so a re-run or restart resumes.
+    def batched(sql: str, args: tuple) -> int:
+        total = 0
+        while time.monotonic() < deadline:
+            with core.connect() as c:
+                n = c.execute(sql, (*args, RETIRE_BATCH)).rowcount
+            total += n
+            if n < RETIRE_BATCH:  # drained (or the rest is row-locked by crawls: next cycle)
+                break
+        return total
+
+    t1 = time.monotonic()
+    depth = batched("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='max_depth', lease_owner=NULL, lease_expires=NULL WHERE id IN ("
+                    " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND crawl_depth>? ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED)",
+                    (cfg.crawl.max_depth,))
+    t2 = time.monotonic()
+    budget = 0
+    if t2 < deadline:
+        with core.connect() as c:  # over-budget domains found once per cycle (read only), then their pending rows are retired in batches
+            over = [r[0] for r in c.execute("SELECT k.domain FROM discovered_urls k WHERE k.crawl_status='completed' GROUP BY k.domain HAVING COUNT(*)>=?",
+                                            (cfg.domain_page_budget,)).fetchall()]
+        budget = batched("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='domain_page_budget_exhausted' WHERE id IN ("
+                         " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND domain = ANY(?::text[])"
+                         "  AND domain IN (SELECT domain FROM discovered_domains WHERE discovery_status IN ('admitted','crawled')) ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED)",
+                         (over,)) if over else 0
+    t3 = time.monotonic()
     with core.connect() as c:
-        t1 = time.monotonic()
-        depth = c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='max_depth', lease_owner=NULL, lease_expires=NULL WHERE id IN ("
-                          " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending') AND crawl_depth>? FOR UPDATE SKIP LOCKED)",
-                          (cfg.crawl.max_depth,)).rowcount
-        t2 = time.monotonic()
-        budget = c.execute("UPDATE discovered_urls SET crawl_status='skipped', skip_reason='domain_page_budget_exhausted' WHERE id IN ("
-                           " SELECT id FROM discovered_urls WHERE crawl_status IN ('pending','retry_pending')"
-                           "  AND domain IN (SELECT k.domain FROM discovered_urls k WHERE k.crawl_status='completed' GROUP BY k.domain HAVING COUNT(*)>=?)"
-                           "  AND domain IN (SELECT domain FROM discovered_domains WHERE discovery_status IN ('admitted','crawled')) FOR UPDATE SKIP LOCKED)",
-                           (cfg.domain_page_budget,)).rowcount
-        t3 = time.monotonic()
         retired = c.execute(
             "UPDATE discovered_domains SET discovery_status='crawled' WHERE id IN (SELECT d.id FROM discovered_domains d WHERE d.discovery_status='admitted'"
             " AND NOT EXISTS (SELECT 1 FROM discovered_urls u WHERE u.domain=d.domain AND u.crawl_status='crawling')"
