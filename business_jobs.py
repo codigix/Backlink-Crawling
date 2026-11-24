@@ -50,7 +50,9 @@ SEARCH_INTERVAL = int(float(os.environ.get("DDGS_INTERVAL_HOURS", 6)) * 3600)
 COMPETITOR_ENABLED = os.environ.get("COMPETITOR_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes")
 COMPETITOR_INTERVAL = int(float(os.environ.get("COMPETITOR_DDGS_INTERVAL_HOURS", 24)) * 3600)
 COMPETITOR_RESULTS = min(_env("COMPETITOR_DDGS_RESULTS", 50), _env("DDGS_MAX_RESULTS", 60))
-MAX_ACTIVE_COMPETITOR_JOBS = _env("MAX_ACTIVE_COMPETITOR_JOBS", 1)  # competitor jobs past 'pending' at once (searching or crawling)
+# Competitor jobs past 'pending' at once (searching or crawling). Searches stay serialized by DDG_CONCURRENCY whatever this says, so it only lets
+# competitor CRAWL phases overlap. 1 was saturated in production (23.5 of 24 h busy for 175 competitors); keep it <= MAX_CRAWL_WORKERS - 2.
+MAX_ACTIVE_COMPETITOR_JOBS = _env("MAX_ACTIVE_COMPETITOR_JOBS", 2)
 MAX_OUTSTANDING_URLS = _env("MAX_OUTSTANDING_URLS_PER_TARGET", 300)  # open (not yet crawled) URLs one target may hold; above it its next discovery is deferred
 COMPETITOR_STARVATION_SECONDS = _env("DDGS_COMPETITOR_MAX_WAIT_SECONDS", 1800)  # a competitor job waiting this long is claimed before customer re-runs
 FAIR_POLICY = os.environ.get("DDGS_FAIR_POLICY", "hierarchical")  # hierarchical: parent business first, then its own targets | target: every target equal
@@ -144,7 +146,13 @@ def schedule_due() -> int:
     if not DDGS_ENABLED:
         return 0
     with core.connect() as c:
-        slots = DDG_CONCURRENCY - c.execute("SELECT COUNT(*) FROM business_jobs WHERE status IN ('pending','searching')").fetchone()[0]
+        n = c.execute("SELECT COUNT(*) FILTER (WHERE j.status IN ('pending','searching') AND NOT comp) other, COUNT(*) FILTER (WHERE j.status='searching' AND comp) comp_searching,"
+                      " COUNT(*) FILTER (WHERE j.status='pending' AND comp) comp_pending, COUNT(*) FILTER (WHERE j.status IN ('searching','crawling') AND comp) comp_active"
+                      " FROM (SELECT j.status, COALESCE(b.target_type='competitor', FALSE) comp FROM business_jobs j LEFT JOIN businesses b ON b.domain=j.target_domain"
+                      " WHERE j.status IN ('pending','searching','crawling')) j").fetchone()
+        # A pending competitor job that cannot start (MAX_ACTIVE_COMPETITOR_JOBS full) does not hold a search slot: it used to block every customer re-run.
+        comp_room = MAX_ACTIVE_COMPETITOR_JOBS - n["comp_active"] - n["comp_pending"]  # competitor jobs that could still start if created now
+        slots = DDG_CONCURRENCY - n["other"] - n["comp_searching"] - min(n["comp_pending"], max(0, MAX_ACTIVE_COMPETITOR_JOBS - n["comp_active"]))
         if slots <= 0:
             return 0
         # least recently searched first (never searched = new targets first); the window is bounded, the cap check only runs on these rows
@@ -157,7 +165,14 @@ def schedule_due() -> int:
         for r in due:
             if len(take) >= slots:
                 break
-            (deferred if outstanding(c, r["domain"]) >= MAX_OUTSTANDING_URLS else take).append(r)
+            comp = r["target_type"] == "competitor"
+            if comp and comp_room <= 0:  # stays due; it gets its job once a competitor slot frees, without blocking customers meanwhile
+                continue
+            if outstanding(c, r["domain"]) >= MAX_OUTSTANDING_URLS:
+                deferred.append(r)
+                continue
+            comp_room -= comp
+            take.append(r)
         if deferred:  # stays due: the first pass after its backlog drops below the cap picks it up again, no other trigger needed
             c.execute("UPDATE businesses SET discovery_state='deferred_backlog' WHERE domain = ANY(?::text[])", ([r["domain"] for r in deferred],))
         return sum(1 for r in take if c.execute(

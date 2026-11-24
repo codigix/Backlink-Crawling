@@ -25,7 +25,7 @@ Tranco/feeds are off unless `AUTONOMOUS_SOURCES=tranco,feeds`. Reserved above to
 
 A competitor is a monitored target like a business (its own DuckDuckGo search, job, schedule and crawl progress) on the SAME shared graph: a page that links
 several targets is fetched once and its links stored once. Customer-business jobs always go first (P0-P2); a new competitor is P3, its reruns P4; at most
-`MAX_ACTIVE_COMPETITOR_JOBS` competitor jobs run at once. Reruns every `COMPETITOR_DDGS_INTERVAL_HOURS` (24).
+`MAX_ACTIVE_COMPETITOR_JOBS` (default 2) competitor jobs run at once; a competitor job waiting for that cap never holds back a customer re-run. Reruns every `COMPETITOR_DDGS_INTERVAL_HOURS` (24).
 
 - `POST /competitors` `{"domains":["competitor-a.com"]}`: registered ONCE for all businesses, crawled once, part of every
   business's `GET /businesses/{domain}/backlink-gap`. `GET /competitors`, `GET|PATCH {"active":false}|DELETE /competitors/{competitor}` (delete keeps all crawled data).

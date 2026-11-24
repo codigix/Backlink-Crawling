@@ -113,6 +113,7 @@ def test_existing_graph_links_show_up_before_any_crawl(env):
 # ---- scheduling: priorities, cap, schedule, search size ----
 def test_competitor_priorities_cap_and_recurring_schedule(env, monkeypatch):
     monkeypatch.setattr(bj, "DDG_CONCURRENCY", 5)
+    monkeypatch.setattr(bj, "MAX_ACTIVE_COMPETITOR_JOBS", 1)  # this test is about the single-slot behaviour
     monkeypatch.setattr(bj, "COMPETITOR_RESULTS", 7)
     onboard("own.localhost")
     reg_comp("own.localhost", ("c1.localhost", "C1"), ("c2.localhost", None), ("c3.localhost", None))
@@ -150,6 +151,41 @@ def test_competitor_priorities_cap_and_recurring_schedule(env, monkeypatch):
     assert bj.schedule_due() == 1
     assert rows("SELECT j.priority FROM business_jobs j JOIN businesses b ON b.domain=j.target_domain WHERE b.target_type='competitor' ORDER BY j.id DESC LIMIT 1")[0]["priority"] \
         == bj.CrawlPriority.COMPETITOR_RECURRING
+
+
+def test_a_competitor_waiting_for_the_cap_never_blocks_customer_reruns(env, monkeypatch):
+    """Production 2026-11-24: one competitor job crawling (cap 1 full), another pending behind it; that pending job held the only search slot,
+    so no customer re-run was created for hours."""
+    monkeypatch.setattr(bj, "DDG_CONCURRENCY", 1)
+    monkeypatch.setattr(bj, "MAX_ACTIVE_COMPETITOR_JOBS", 1)
+    reg_comp("own.localhost", ("c1.localhost", None), ("c2.localhost", None), ("c3.localhost", None))
+    with core.connect() as c:
+        c.execute("UPDATE business_jobs SET status='done' WHERE target_domain IN ('own.localhost','c3.localhost')")
+        c.execute("UPDATE business_jobs SET status='crawling' WHERE target_domain='c1.localhost'")  # c2 stays pending: it cannot start
+        c.execute("UPDATE businesses SET next_run_at=?", (core.later(seconds=-5),))  # own and c3 are due
+    assert bj.schedule_due() == 1
+    assert [(r["target_domain"], r["priority"]) for r in rows("SELECT * FROM business_jobs WHERE status='pending' ORDER BY id")] \
+        == [("c2.localhost", bj.CrawlPriority.COMPETITOR_INITIAL), ("own.localhost", bj.CrawlPriority.RECURRING)]  # the customer re-run, no unstartable c3 job
+    assert bj.schedule_due() == 0  # the customer job now holds the search slot; c3 waits for a competitor slot without a job piling up
+    assert [j["target_domain"] for j in bj._claim_search(1)] == ["own.localhost"]  # and is searched first
+
+
+def test_competitors_run_concurrently_within_the_cap_and_a_failed_search_frees_its_slot(env, monkeypatch):
+    monkeypatch.setattr(bj, "DDG_CONCURRENCY", 3)
+    monkeypatch.setattr(bj, "MAX_ACTIVE_COMPETITOR_JOBS", 2)
+    reg_comp("own.localhost", ("c1.localhost", None), ("c2.localhost", None), ("c3.localhost", None))
+    with core.connect() as c:
+        c.execute("UPDATE business_jobs SET status='done' WHERE target_domain='own.localhost'")
+    slow, fast = bj._claim_search(3)
+    assert (slow["target_domain"], fast["target_domain"]) == ("c1.localhost", "c2.localhost") and bj._claim_search(3) == []  # two at once, never three
+    with core.connect() as c:
+        c.execute("UPDATE business_jobs SET status='crawling' WHERE id=?", (fast["id"],))  # c2's search finished; c1's is still running
+    assert bj._claim_search(3) == []  # a crawling competitor still counts: the cap bounds competitor work, not just searches
+    monkeypatch.setattr(bj, "SEARCH_RETRIES", 1)
+    bj._search_failed(slow, RuntimeError("provider timeout"))  # c1's search fails for good
+    assert rows("SELECT status FROM business_jobs WHERE id=?", slow["id"])[0]["status"] == "failed"
+    assert [j["target_domain"] for j in bj._claim_search(3)] == ["c3.localhost"]  # its slot is free again
+    assert rows("SELECT COUNT(*) n FROM business_jobs WHERE target_domain LIKE 'c_.localhost' AND status IN ('pending','searching','crawling')")[0]["n"] == 2
 
 
 # ---- one crawled page serves several targets; gap on real crawled data ----
