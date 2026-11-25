@@ -302,7 +302,7 @@ def test_summary_counts_match_independent_sql_after_links_are_removed_and_reappe
         for active in (True, False):
             t, v, refs = crawler_api._graph_summary(c, CA, active)
             assert refs == refs_independent(c, CA, active) and t == c.execute(
-                "SELECT COUNT(*) FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND source_domain<>?" + (" AND is_active=1" if active else ""), (CA, CA)).fetchone()[0]
+                "SELECT COUNT(DISTINCT source_url) FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND source_domain<>?" + (" AND is_active=1" if active else ""), (CA, CA)).fetchone()[0]
         _, _, before = crawler_api._graph_summary(c, CA, True)
         doms = [r[0] for r in c.execute("SELECT DISTINCT source_domain FROM outgoing_links WHERE destination_domain=? AND is_active=1 AND source_domain<>? ORDER BY 1 LIMIT 3", (CA, CA))]
         c.execute("UPDATE outgoing_links SET is_active=0, lost_at='2026-04-01 00:00:00' WHERE destination_domain=? AND source_domain=ANY(?)", (CA, doms))  # removed

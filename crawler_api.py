@@ -146,6 +146,16 @@ def _graph_cond(target: str, active_only: bool = True) -> tuple[str, list]:
     return cond, args
 
 
+SITEWIDE_MIN = 10  # a source domain linking to the SAME destination from this many pages is a footer/credit link ("Design by ..."), not an editorial backlink
+
+
+def _no_sitewide(cond: str, args: list) -> tuple[str, list]:
+    """cond + args without the sitewide (footer/credit) links. shortcut: judged from link counts only (no HTML is stored), so a real site with
+    >= SITEWIDE_MIN pages linking the same URL is dropped too; raise SITEWIDE_MIN or add an allowlist if that bites."""
+    return (cond + " AND (COALESCE(source_domain,''), destination_url) NOT IN (SELECT COALESCE(source_domain,''), destination_url FROM outgoing_links" + cond +
+            f" GROUP BY 1, 2 HAVING COUNT(DISTINCT source_url) >= {SITEWIDE_MIN})", [*args, *args])
+
+
 _PLAIN_HOST = re.compile(r"https?://([a-z0-9.-]+)(?:[/?#]|$)")  # no userinfo/port/uppercase/unicode: such a URL's hostname() is exactly this group (minus a trailing dot)
 HISTORY_WINDOW = 100000  # /history reads at most this many (newest) link_history rows of a domain
 _SRC_STATUS = "(SELECT crawl_status FROM discovered_urls u WHERE u.url=outgoing_links.source_url)"
@@ -154,11 +164,15 @@ _LINK_COLS = "source_url, destination_url, anchor_text, rel_attributes, source_d
 
 def _graph_page(c, target: str, active_only: bool, limit: int, offset: int, after_id: int | None = None) -> list:
     """One page of links (only the columns the API returns, plus the source page's crawl status), ordered by id. after_id = keyset paging."""
-    cond, args = _graph_cond(target, active_only)
+    cond, args = _no_sitewide(*_graph_cond(target, active_only))
     if after_id is not None:
         cond, args = cond + " AND id>?", [*args, after_id]
+    # one row per source_url (its first link into the target): a page that links several times / with several anchors is one backlink
+    # shortcut: the MIN(id) subquery scans every link of the target per page, fine for thousands, add an index/materialised column for millions
+    base, bargs = _no_sitewide(*_graph_cond(target, active_only))
+    cond += " AND id IN (SELECT MIN(id) FROM outgoing_links" + base + " GROUP BY source_url)"
     return c.execute(f"SELECT id, {_LINK_COLS}, {_SRC_STATUS} AS src_status FROM outgoing_links" + cond + " ORDER BY id LIMIT ? OFFSET ?",
-                     (*args, limit, offset)).fetchall()
+                     (*args, *bargs, limit, offset)).fetchall()
 
 
 def _cached(kind: str, target: str, params: tuple, compute):
@@ -175,11 +189,11 @@ def _graph_summary(c, target: str, active_only: bool) -> tuple[int, int, int]:
     """(total links, verified links, referring domains) in ONE scan; same rules as link_status() and as counting the distinct source_domain values
     in Python (a NULL source_domain is one group there, as it is for GROUP BY here). The referring domains are the groups of a hash aggregate: the
     former COUNT(DISTINCT source_domain) sorted every row (an external merge sort on disk for a hot target) and was ~4x slower."""
-    cond, args = _graph_cond(target, active_only)
+    cond, args = _no_sitewide(*_graph_cond(target, active_only))
     # LEFT JOIN, not a per-row subquery, so the planner can hash-join the failed pages; url is UNIQUE, so the join never multiplies rows
     r = c.execute(
         "SELECT COALESCE(SUM(n), 0)::bigint AS total, COALESCE(SUM(v), 0)::bigint AS verified, COUNT(*) AS refs FROM ("
-        "SELECT t.source_domain, COUNT(*) AS n, COUNT(*) FILTER (WHERE COALESCE(t.is_active,0)<>0 AND COALESCE(t.lost_at,'')='' AND bad.url IS NULL) AS v"
+        "SELECT t.source_domain, COUNT(DISTINCT t.source_url) AS n, COUNT(DISTINCT t.source_url) FILTER (WHERE COALESCE(t.is_active,0)<>0 AND COALESCE(t.lost_at,'')='' AND bad.url IS NULL) AS v"
         " FROM (SELECT is_active, lost_at, source_domain, source_url FROM outgoing_links" + cond + ") t"
         " LEFT JOIN discovered_urls bad ON bad.url=t.source_url AND bad.crawl_status IN ('failed','retry_pending') GROUP BY t.source_domain) g", args).fetchone()
     return r["total"], r["verified"], r["refs"]
