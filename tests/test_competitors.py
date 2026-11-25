@@ -458,3 +458,39 @@ def test_three_competitors_registered_at_once_never_exceed_the_single_slot_under
     t.join()
     assert not errors, errors
     assert sorted(seen) == ["c0.localhost", "c1.localhost", "c2.localhost"]  # all served, one at a time
+
+
+def test_listing_counts_false_skips_the_count_query_and_jit_never_leaks(env):
+    link("http://old1.localhost/p", "http://newcomp.localhost/", "N")
+    link("http://old2.localhost/p", "http://newcomp.localhost/pricing", "N2")
+    link("http://newcomp.localhost/about", "http://newcomp.localhost/", "internal")  # same-domain link: never counted
+    onboard("own.localhost")
+    reg_comp("own.localhost", ("newcomp.localhost", None))
+    default = crawler_api.list_business_competitors("own.localhost")["competitors"]
+    with_counts = crawler_api.list_business_competitors("own.localhost", None, 0, True)["competitors"]
+    assert default == with_counts and default[0]["known_backlinks"] == 2  # default behaviour unchanged
+    seen = []
+    orig = core.Cursor.execute
+
+    def spy(self, q, p=None, **kw):
+        seen.append(q)
+        return orig(self, q, p, **kw)
+    core.Cursor.execute = spy
+    try:
+        light = crawler_api.list_business_competitors("own.localhost", None, 0, False)["competitors"]
+    finally:
+        core.Cursor.execute = orig
+    assert not [q for q in seen if "COUNT(*) FROM outgoing_links" in q]  # the aggregation did not run at all
+    assert [{**x, "known_backlinks": 2} for x in light] == default and light[0]["known_backlinks"] is None  # only that field differs
+    crawler_api.backlink_gap("own.localhost", None, 10)  # SET LOCAL jit=off ran in that request's transaction...
+    with core.connect() as c:
+        assert c.execute("SHOW jit").fetchone()[0] == "on"  # ...and the pooled connection is back to the server default
+
+
+def test_gap_same_domain_links_never_count(env):
+    link("http://ext.localhost/p", "http://cx.localhost/", "E")
+    link("http://cx.localhost/a", "http://cx.localhost/b", "internal")
+    onboard("own.localhost")
+    reg_comp("own.localhost", ("cx.localhost", None))
+    g = crawler_api.backlink_gap("own.localhost", None, 100)
+    assert g["summary"]["competitor_referring_domains"] == 1 and g["summary"]["gap_pages"] == 1

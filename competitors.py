@@ -72,12 +72,24 @@ def detail(conn, owner: str, comp: str) -> dict | None:
             "schedule": dict(sched) if sched else None, "known_backlinks": known_backlinks(conn, comp)}
 
 
-def listing(conn, owner: str, limit: int | None = None, offset: int = 0) -> list[dict]:
-    """Competitors of `owner` in registration order (id is unique); limit/offset are applied in SQL so only the requested page is built (each entry
-    costs several queries). limit=None = all, as before."""
+def listing(conn, owner: str, limit: int | None = None, offset: int = 0, counts: bool = True) -> list[dict]:
+    """Competitors of `owner` in registration order (id is unique); limit/offset are applied in SQL so only the requested page is built.
+    limit=None = all. counts=False skips the known-backlink aggregation (the one expensive query) and reports `known_backlinks: null`. The per-competitor facts (job, schedule, known backlinks) are read for the whole page in ONE query each (was ~4 per competitor)."""
     owner = _o(owner)
-    return [detail(conn, owner, r["competitor_domain"]) for r in conn.execute(
-        "SELECT competitor_domain FROM business_competitors WHERE business_domain=? ORDER BY id LIMIT ? OFFSET ?", (owner, limit, offset)).fetchall()]
+    rel = conn.execute("SELECT * FROM business_competitors WHERE business_domain=? ORDER BY id LIMIT ? OFFSET ?", (owner, limit, offset)).fetchall()
+    doms = [r["competitor_domain"] for r in rel]
+    if counts:
+        _no_jit(conn)  # only the count is JIT-prone
+    jobs = bj.latest_many(conn, doms)
+    sched = {r["domain"]: r for r in conn.execute("SELECT domain, target_type, next_run_at, last_run_at, active FROM businesses WHERE domain=ANY(?::text[])", (doms,))}
+    known = {} if not counts else {r[0]: r[1] for r in conn.execute(
+        "SELECT destination_domain, COUNT(*) FROM outgoing_links WHERE destination_domain=ANY(?::text[]) AND link_type='html' AND is_active=1"
+        " AND source_domain<>destination_domain GROUP BY destination_domain", (doms,)).fetchall()}
+    return [{"competitor_domain": r["competitor_domain"], "competitor_name": r["competitor_name"], "active": bool(r["active"]), "registered_at": r["created_at"],
+             "target_type": sched[r["competitor_domain"]]["target_type"] if r["competitor_domain"] in sched else "competitor",
+             "discovery_status": bj.api_state(jobs.get(r["competitor_domain"])), "job": jobs.get(r["competitor_domain"]),
+             "schedule": {k: v for k, v in sched[r["competitor_domain"]].items() if k != "domain"} if r["competitor_domain"] in sched else None,
+             "known_backlinks": known.get(r["competitor_domain"], 0) if counts else None} for r in rel]
 
 
 def set_active(conn, owner: str, comp: str, active: bool) -> bool:
@@ -96,12 +108,21 @@ def remove(conn, owner: str, comp: str) -> bool:
     return bool(n)
 
 
+def _no_jit(conn) -> None:
+    """Transaction-local: PostgreSQL ends a SET LOCAL at COMMIT/ROLLBACK, so the pooled connection goes back with the server's default and no other request
+    sees it. These statements are priced by the planner at millions of rows (it cannot see that ~98% of a competitor's links are internal) although
+    they return a few thousand, which makes it JIT-compile them: ~1.5 s of compilation for ~0.2 s of work. Outside a transaction block (autocommit)
+    PostgreSQL only warns and the setting simply does not apply."""
+    conn.execute("SET LOCAL jit = off")
+
+
 def is_competitor(conn, domain: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM business_competitors WHERE competitor_domain=?", (_reg(domain),)).fetchone())
 
 
 _ACTIVE = "l.link_type='html' AND l.is_active=1"  # the one definition of an eligible link: html, active; "not from the target's own domain" is added per query
-_COMP_LINK = f"FROM outgoing_links l JOIN unnest(?::text[]) AS comps(c) ON l.destination_domain=comps.c WHERE {_ACTIVE} AND l.source_domain<>comps.c"
+# source_domain<>destination_domain is source_domain<>comps.c (the join makes them equal) written so a partial index on exactly that predicate is provable
+_COMP_LINK = f"FROM outgoing_links l JOIN unnest(?::text[]) AS comps(c) ON l.destination_domain=comps.c WHERE {_ACTIVE} AND l.source_domain<>l.destination_domain"
 _LISTS = (("opportunities", "g", "ic AND NOT io"), ("shared_domains", "s", "ic AND io"), ("own_only_domains", "o", "io AND NOT ic"))  # response key, tag, filter on j
 
 
@@ -114,6 +135,7 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
     `after` = {list name: last key of that list's previous page}: keyset paging per list; `offset` instead makes every list skip that many entries.
     The summary counts always describe the whole comparison."""
     owner, after = _reg(owner), after or {}
+    _no_jit(conn)
     if not own_business(conn, owner):
         raise LookupError(f"{owner} is not an onboarded business")
     comps = [r["competitor_domain"] for r in conn.execute(  # only this business's own competitors (never itself)
@@ -124,32 +146,29 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
         if not conn.execute("SELECT 1 FROM business_competitors WHERE business_domain=? AND competitor_domain=?", (owner, only)).fetchone():
             raise LookupError(f"{only} is not a competitor of {owner}")
         comps = [only]
-    # ---- referring domains: competitor set (cd) against own set (od) in one pass: the counts plus one page of each classification ----
+    # ---- ONE scan of the competitors' links (cl) and ONE of the owner's (ol) feed both comparisons: the referring domains (counts + one page of each
+    # classification) and the source-page gap (pages that link a competitor but no eligible page of the owner = an anti-join against ol, not one index
+    # probe into outgoing_links per competitor page). Everything comes back in one statement / one round trip. ----
     parts, args = [], [comps, owner, owner]
+    nulls = "NULL::bigint AS a, NULL::bigint AS b, NULL::bigint AS g, NULL::bigint AS s, NULL::bigint AS o, NULL::bigint AS p"
     for key, tag, flt in _LISTS:
         cur = after.get(key)
-        parts.append(f"(SELECT '{tag}' AS k, d, NULL::bigint AS a, NULL::bigint AS b, NULL::bigint AS g, NULL::bigint AS s, NULL::bigint AS o FROM j WHERE {flt}"
-                     + (' AND d COLLATE "C" > ?' if cur is not None else "") + ' ORDER BY d COLLATE "C" OFFSET ? LIMIT ?)')
+        parts.append(f"(SELECT '{tag}' AS k, d, {nulls} FROM j WHERE {flt}" + (' AND d COLLATE "C" > ?' if cur is not None else "") + ' ORDER BY d COLLATE "C" OFFSET ? LIMIT ?)')
         args += ([cur] if cur is not None else []) + [offset, limit + 1]
+    pcur = after.get("source_page_gap")
+    parts.append(f"(SELECT 'u' AS k, u AS d, {nulls} FROM gp WHERE TRUE" + (' AND u COLLATE "C" > ?' if pcur is not None else "") + ' ORDER BY u COLLATE "C" OFFSET ? LIMIT ?)')
+    args += ([pcur] if pcur is not None else []) + [offset, limit + 1]
     rows = conn.execute(
-        f"WITH cd AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d {_COMP_LINK}),"
-        " od AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>?),"
-        " j AS MATERIALIZED (SELECT COALESCE(cd.d, od.d) AS d, cd.d IS NOT NULL AS ic, od.d IS NOT NULL AS io FROM cd FULL JOIN od ON cd.d=od.d)"
+        f"WITH cl AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d, l.source_url AS u {_COMP_LINK}),"
+        " ol AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d, l.source_url AS u FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>? AND l.source_domain<>l.destination_domain),"
+        " j AS MATERIALIZED (SELECT COALESCE(cd.d, od.d) AS d, cd.d IS NOT NULL AS ic, od.d IS NOT NULL AS io FROM (SELECT DISTINCT d FROM cl) cd FULL JOIN (SELECT DISTINCT d FROM ol) od ON cd.d=od.d),"
+        " gp AS MATERIALIZED (SELECT DISTINCT u FROM cl WHERE NOT EXISTS (SELECT 1 FROM ol WHERE ol.u=cl.u))"
         " SELECT 'n' AS k, NULL::text AS d, COUNT(*) FILTER (WHERE io) AS a, COUNT(*) FILTER (WHERE ic) AS b, COUNT(*) FILTER (WHERE ic AND NOT io) AS g,"
-        " COUNT(*) FILTER (WHERE ic AND io) AS s, COUNT(*) FILTER (WHERE io AND NOT ic) AS o FROM j UNION ALL " + " UNION ALL ".join(parts), args).fetchall()
+        " COUNT(*) FILTER (WHERE ic AND io) AS s, COUNT(*) FILTER (WHERE io AND NOT ic) AS o, (SELECT COUNT(*) FROM gp) AS p FROM j UNION ALL " + " UNION ALL ".join(parts), args).fetchall()
     cnt = next(r for r in rows if r["k"] == "n")
     domains = {key: [r["d"] for r in rows if r["k"] == tag] for key, tag, _ in _LISTS}
-    # ---- source pages: pages that link a competitor but no page of the owner (an own page counts only if it is an eligible own link) ----
-    pcur = after.get("source_page_gap")
-    prow = conn.execute(
-        f"WITH cp AS MATERIALIZED (SELECT DISTINCT l.source_url AS u {_COMP_LINK}),"
-        " gp AS MATERIALIZED (SELECT u FROM cp WHERE NOT EXISTS (SELECT 1 FROM outgoing_links l WHERE l.source_url=cp.u AND l.destination_domain=? AND " + _ACTIVE +
-        " AND l.source_domain<>?))"
-        " SELECT NULL::text AS u, COUNT(*) AS n FROM gp UNION ALL"
-        " (SELECT u, NULL::bigint FROM gp WHERE TRUE" + (' AND u COLLATE "C" > ?' if pcur is not None else "") + ' ORDER BY u COLLATE "C" OFFSET ? LIMIT ?)',
-        [comps, owner, owner] + ([pcur] if pcur is not None else []) + [offset, limit + 1]).fetchall()
-    gap_pages = next(r["n"] for r in prow if r["u"] is None)
-    urls = [r["u"] for r in prow if r["u"] is not None]
+    gap_pages = cnt["p"]
+    urls = [r["d"] for r in rows if r["k"] == "u"]
     more = {key: len(domains[key]) > limit for key, _, _ in _LISTS} | {"source_page_gap": len(urls) > limit}
     urls, domains = urls[:limit], {k: v[:limit] for k, v in domains.items()}
     # ---- details of the (at most `limit`) entries that are returned ----
@@ -176,7 +195,8 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
             (owner, owner, [p["referring_domain"] for p in pages.values()]))}
     page_gap = [{**pages[u], "competitor_targets": sorted(pages[u]["competitor_targets"]), "domain_links_to_own_business": pages[u]["referring_domain"] in own_domains}
                 for u in urls]
-    states = {t: bj.api_state(bj.latest(conn, t)) for t in [owner, *comps]}
+    jobs = bj.latest_many(conn, [owner, *comps])  # one query, not one per competitor
+    states = {t: bj.api_state(jobs.get(t)) for t in [owner, *comps]}
     warnings = []
     if not states[owner].startswith("completed"):
         warnings.append(f"discovery for {owner} is '{states[owner]}': its backlinks may be incomplete, so gap domains may be overstated")

@@ -95,6 +95,10 @@ class TTLCache:
             self._entries.clear()
             self._bytes = 0
 
+    def drop(self, key) -> None:
+        with self._lock:
+            self._drop(key)
+
     # ---- public ----
     def get(self, key, compute):
         """(value, status, age_seconds). status: HIT | MISS | STALE | OFF (cache disabled: compute() every time, nothing recorded).

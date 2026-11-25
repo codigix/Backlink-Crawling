@@ -544,14 +544,16 @@ def add_business_competitors(business_domain: str, body: CompetitorsRequest) -> 
                 out.append(competitors.register(c, owner, d))
             except ValueError as e:
                 out.append({"domain": d, "status": "rejected", "error": str(e)})
+    graph_cache.clear()  # the competitor set is part of every cached gap
     return {"business": owner, "results": out}
 
 
 @router.get("/businesses/{business_domain}/competitors")
 def list_business_competitors(business_domain: str, limit: Annotated[int | None, Query(ge=1, le=1000, description="page size; omitted = all competitors")] = None,
-                              offset: Offset = 0) -> dict:
+                              offset: Offset = 0,
+                              counts: Annotated[bool, Query(description="false skips the known-backlink count (the slow part): each competitor's `known_backlinks` is then null")] = True) -> dict:
     with connect() as c:
-        return {"business": _owner(business_domain), "competitors": competitors.listing(c, _owner(business_domain), limit, offset)}
+        return {"business": _owner(business_domain), "competitors": competitors.listing(c, _owner(business_domain), limit, offset, counts)}
 
 
 @router.delete("/businesses/{business_domain}/competitors/{competitor_domain}")
@@ -559,6 +561,7 @@ def remove_business_competitor(business_domain: str, competitor_domain: str) -> 
     with connect() as c:
         if not competitors.remove(c, _owner(business_domain), _clean(competitor_domain)):
             raise HTTPException(404, "not a competitor of this business")
+    graph_cache.clear()  # the competitor set is part of every cached gap
     return {"removed": True, "data_kept": True}
 
 
@@ -567,7 +570,8 @@ def backlink_gap(business_domain: str, competitor: str | None = None, limit: Ann
                  after_opportunity: Annotated[str | None, Query(description="keyset paging of `opportunities`: pagination.lists.opportunities.next_after of the previous page")] = None,
                  after_shared: Annotated[str | None, Query(description="keyset paging of `shared_domains` (next_after of the previous page)")] = None,
                  after_own_only: Annotated[str | None, Query(description="keyset paging of `own_only_domains` (next_after of the previous page)")] = None,
-                 after_page: Annotated[str | None, Query(description="keyset paging of `source_page_gap` (next_after of the previous page)")] = None) -> dict:
+                 after_page: Annotated[str | None, Query(description="keyset paging of `source_page_gap` (next_after of the previous page)")] = None,
+                 refresh: Annotated[bool, Query(description="bypass the read cache (GRAPH_CACHE_ENABLED) and recompute; the fresh result replaces the cached one")] = False) -> dict:
     """Referring domains and pages that link the competitors but not this business, over the discovered index (not the whole internet). Every list is
     cut in PostgreSQL to `limit` entries; `summary` and `pagination.lists.*.total` always describe the whole comparison. Page with `offset` or with the
     per-list `after_*` cursors (not both); with cursors each list advances on its own, so stop asking for a list once its has_more is false."""
@@ -575,9 +579,15 @@ def backlink_gap(business_domain: str, competitor: str | None = None, limit: Ann
                                ("source_page_gap", after_page)) if v is not None}
     if after and offset:
         raise HTTPException(422, "use either the after_* cursors or offset, not both")
-    try:
+    owner, comp = _owner(business_domain), _clean(competitor) if competitor else None
+
+    def compute():
         with connect() as c:
-            return competitors.gap(c, _owner(business_domain), _clean(competitor) if competitor else None, limit, offset, after)
+            return competitors.gap(c, owner, comp, limit, offset, after)
+    try:
+        if refresh:
+            graph_cache.drop(("gap", owner, comp, limit, offset, tuple(sorted(after.items()))))  # a Refresh must never be answered from (or re-stamp) an old entry
+        return _cached("gap", owner, (comp, limit, offset, tuple(sorted(after.items()))), compute)
     except LookupError as e:
         raise HTTPException(404, str(e)) from e
 

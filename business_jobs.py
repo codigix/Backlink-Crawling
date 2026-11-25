@@ -119,6 +119,12 @@ def latest(conn, domain: str) -> dict | None:
     return dict(r) if r else None
 
 
+def latest_many(conn, domains: list[str]) -> dict[str, dict]:
+    """latest() for many registrable domains in ONE query (idx_business_jobs_target). Domains without a job are absent."""
+    return {r["target_domain"]: dict(r) for r in conn.execute(
+        "SELECT DISTINCT ON (target_domain) * FROM business_jobs WHERE target_domain=ANY(?::text[]) ORDER BY target_domain, id DESC", (list(domains),)).fetchall()}
+
+
 def api_state(job: dict | None) -> str:
     """The status vocabulary of the API."""
     if not job:
