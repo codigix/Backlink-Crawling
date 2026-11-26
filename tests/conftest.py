@@ -17,6 +17,10 @@ os.environ["DOGPILE"] = "0"  # tests fake the search engines; none may start a r
 # .env holds a real, paid serper.dev key; set (empty) here, load_dotenv never overrides it, so serper is not among the backends.
 # Serper tests set a dummy key and fake the HTTP call themselves.
 os.environ["SERPER_API_KEY"] = ""
+# .env holds real Anthropic and Keenable keys: no test may reach them. Business-intelligence tests switch the feature on and fake the clients themselves.
+os.environ["BUSINESS_PROFILE_ENABLED"] = "0"
+os.environ["ANTHROPIC_API_KEY"] = ""
+os.environ["KEENABLE_API_KEY"] = ""
 
 
 @pytest.fixture(autouse=True)

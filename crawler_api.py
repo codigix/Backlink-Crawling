@@ -143,7 +143,8 @@ def _graph_cond(target: str, active_only: bool = True) -> tuple[str, list]:
     if target != reg:  # subdomain: the destination host must match, and links from the target's own host do not count
         cond = cond.replace("source_domain!=?", "TRUE") + " AND destination_url ~* ? AND source_url !~* ?"
         args = [reg, _host_re(target), _host_re(target)]
-    return cond, args
+    # a verified alias domain of the business is the business itself (business_aliases): its links are not independent backlinks. The rows stay in outgoing_links.
+    return cond + " AND NOT EXISTS (SELECT 1 FROM business_aliases al WHERE al.domain=? AND al.alias=outgoing_links.source_domain)", [*args, reg]
 
 
 SITEWIDE_MIN = 10  # a source domain linking to the SAME destination from this many pages is a footer/credit link ("Design by ..."), not an editorial backlink
@@ -159,7 +160,7 @@ def _no_sitewide(cond: str, args: list) -> tuple[str, list]:
 _PLAIN_HOST = re.compile(r"https?://([a-z0-9.-]+)(?:[/?#]|$)")  # no userinfo/port/uppercase/unicode: such a URL's hostname() is exactly this group (minus a trailing dot)
 HISTORY_WINDOW = 100000  # /history reads at most this many (newest) link_history rows of a domain
 _SRC_STATUS = "(SELECT crawl_status FROM discovered_urls u WHERE u.url=outgoing_links.source_url)"
-_LINK_COLS = "source_url, destination_url, anchor_text, rel_attributes, source_domain, first_seen, last_seen, is_active, lost_at"  # what the responses use
+_LINK_COLS = "source_url, destination_url, anchor_text, rel_attributes, source_domain, first_seen, last_seen, is_active, lost_at, position"  # what the responses use
 
 
 def _graph_page(c, target: str, active_only: bool, limit: int, offset: int, after_id: int | None = None) -> list:
@@ -272,7 +273,8 @@ def all_backlinks(target_type: str | None = Query(None, pattern="^(own_business|
 @router.get("/backlinks/{target_domain}")
 def backlinks(target_domain: str, include_removed: bool = False, limit: Limit = DEFAULT_LIMIT, offset: Offset = 0, after_id: AfterId = None) -> dict:
     """Backlinks for ANY domain, read from our own link graph; no network call here. A domain with nothing yet is queued for the
-    engine's discovery for a business is started by POST /discovery/onboard, never by this GET."""
+    engine's discovery for a business is started by POST /discovery/onboard, never by this GET. Each result includes its stored anchor text
+    and link position (nav, header, footer, aside, content, or unknown)."""
     target = _clean(target_domain)
     reg = core.registrable_domain(target)
     _keyset(after_id, offset)  # 422 when both are given
@@ -295,6 +297,7 @@ def backlinks(target_domain: str, include_removed: bool = False, limit: Limit = 
         "next_after_id": rows[-1]["id"] if more else None,  # pass as after_id for the next page; null = last page
         "backlinks": [{
             "source_url": r["source_url"], "destination_url": r["destination_url"], "anchor_text": r["anchor_text"],
+            "position": r["position"],
             "rel": r["rel_attributes"], "source_domain": r["source_domain"], "link_status": link_status(r),
             "verification_status": link_status(r), "discovery_method": "forward_crawl",
             "first_seen": r["first_seen"], "last_verified": r["last_seen"], "is_active": bool(r["is_active"]),
@@ -468,37 +471,13 @@ class OnboardRequest(BaseModel):
 def discovery_onboard(body: OnboardRequest) -> dict:
     """Register a business and queue its FIRST discovery job (P0); returns at once (the engine searches and crawls). Calling it again never
     starts another scan: it returns the active or latest job (created=false) and the scheduler runs the business every interval
-    (next_run_at). To show progress use GET /discovery/business/{domain}/status; to scan again now, POST .../rescan."""
+    (next_run_at). To show progress use GET /discovery/business/{domain}/status."""
     domain = _clean(body.domain)
     with connect() as c:
         job, created = business_jobs.create_job(c, domain)
         nxt = c.execute("SELECT next_run_at FROM businesses WHERE domain=?", (job["target_domain"],)).fetchone()[0]
     return {"domain": job["target_domain"], "job_id": job["id"], "status": "queued" if created else business_jobs.api_state(job),
             "priority": f"P{job['priority']}", "created": created, "next_run_at": nxt}
-
-
-@router.post("/discovery/business/{domain}/rescan", status_code=202)
-def discovery_rescan(domain: str) -> dict:
-    """Deliberate manual rescan of a registered business or competitor: one new job now, unless one is already active (then that one).
-    The only way besides the scheduler to search a target again; ordinary onboarding calls never do."""
-    with connect() as c:
-        reg = core.registrable_domain(_clean(domain))
-        b = c.execute("SELECT target_type, active FROM businesses WHERE domain=?", (reg,)).fetchone()
-        if not b:
-            raise HTTPException(404, "not onboarded")
-        if not b["active"]:
-            raise HTTPException(409, "not monitored (inactive): register it again to scan it")
-        job, created = business_jobs.create_job(c, reg, target_type=b["target_type"], force=True)
-    return {"domain": reg, "job_id": job["id"], "status": "queued" if created else business_jobs.api_state(job),
-            "priority": f"P{job['priority']}", "created": created}
-
-
-@router.post("/businesses", status_code=202)
-def onboard_business(body: OnboardRequest) -> dict:
-    """Older form of /discovery/onboard (returns the whole job)."""
-    with connect() as c:
-        job, created = business_jobs.create_job(c, _clean(body.domain))
-    return {"created": created, "job": job}
 
 
 @router.get("/discovery/business/{domain}/status")

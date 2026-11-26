@@ -658,6 +658,28 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (15, "businesses.rediscovery_days: optional per-target override of DDGS_REDISCOVERY_DAYS", [
         "ALTER TABLE businesses ADD COLUMN IF NOT EXISTS rediscovery_days REAL",  # NULL = the global default; set for no target by this migration
     ]),
+    (16, "business intelligence: validated business profiles, their source pages, ordered search themes", [
+        "CREATE TABLE IF NOT EXISTS business_profiles (id BIGSERIAL PRIMARY KEY, domain TEXT NOT NULL UNIQUE REFERENCES businesses(domain) ON DELETE CASCADE,"
+        " target_type TEXT, status TEXT NOT NULL DEFAULT 'pending', origin TEXT NOT NULL DEFAULT 'onboarding', profile_status TEXT, brand_name TEXT, business_description TEXT, primary_industry TEXT,"
+        " business_category TEXT, business_type TEXT, services JSONB, products JSONB, target_industries JSONB, target_audience JSONB, locations JSONB,"
+        " primary_keywords JSONB, secondary_keywords JSONB, search_modifiers JSONB, source_urls JSONB, evidence JSONB, unsupported_fields JSONB, confidence REAL,"
+        " model_name TEXT, profile_version INTEGER NOT NULL DEFAULT 0, content_hash TEXT, last_analyzed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0,"
+        " next_retry_at TEXT, last_error TEXT, gen INTEGER NOT NULL DEFAULT 0, created_at TEXT, updated_at TEXT)",
+        "CREATE INDEX IF NOT EXISTS idx_business_profiles_due ON business_profiles(status, next_retry_at)",
+        "CREATE TABLE IF NOT EXISTS profile_pages (domain TEXT NOT NULL REFERENCES businesses(domain) ON DELETE CASCADE, url TEXT NOT NULL, page_type TEXT, title TEXT,"
+        " meta_description TEXT, extraction_status TEXT, word_count INTEGER, text TEXT, schema_data JSONB, error TEXT, fetched_at TEXT, PRIMARY KEY (domain, url))",
+        "CREATE TABLE IF NOT EXISTS search_themes (id BIGSERIAL PRIMARY KEY, domain TEXT NOT NULL REFERENCES businesses(domain) ON DELETE CASCADE, seq INTEGER NOT NULL,"
+        " theme TEXT NOT NULL, query TEXT NOT NULL, query_hash TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1, kind TEXT NOT NULL DEFAULT 'topic', reason TEXT, status TEXT NOT NULL DEFAULT 'pending',"
+        " attempts INTEGER NOT NULL DEFAULT 0, job_id BIGINT, searched_at TEXT, UNIQUE (domain, query_hash))",
+        "CREATE INDEX IF NOT EXISTS idx_search_themes_next ON search_themes(domain, status, seq)",
+        "CREATE TABLE IF NOT EXISTS business_aliases (domain TEXT NOT NULL REFERENCES businesses(domain) ON DELETE CASCADE, alias TEXT NOT NULL, source TEXT NOT NULL,"
+        " evidence TEXT, verified_at TEXT, PRIMARY KEY (domain, alias))",
+        "ALTER TABLE url_discoveries ADD COLUMN IF NOT EXISTS provider TEXT",  # which search provider returned the URL (NULL = before providers were recorded)
+    ]),
+    (17, "business_jobs seed counters: eligible candidates of a batch and seeds whose stored crawl was reused", [
+        "ALTER TABLE business_jobs ADD COLUMN IF NOT EXISTS seed_candidates INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE business_jobs ADD COLUMN IF NOT EXISTS seeds_reused INTEGER NOT NULL DEFAULT 0",
+    ]),
 ]
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
@@ -754,6 +776,14 @@ def add_target(conn, domain: str) -> int:
     domain = clean_target(domain)
     conn.execute("INSERT OR IGNORE INTO target_domains (domain) VALUES (?)", (domain,))
     conn.execute("UPDATE target_domains SET is_active=1 WHERE domain=?", (domain,))
+    return conn.execute("SELECT id FROM target_domains WHERE domain=?", (domain,)).fetchone()["id"]
+
+
+def register_target(conn, domain: str) -> int:
+    """Make `domain` a backlink target (process_page matches links against target_domains) without ever touching an existing row: a target that was
+    deliberately switched off stays off, ids and histories are kept. Idempotent, and in the caller's transaction."""
+    domain = clean_target(domain)
+    conn.execute("INSERT INTO target_domains (domain) VALUES (?) ON CONFLICT (domain) DO NOTHING", (domain,))
     return conn.execute("SELECT id FROM target_domains WHERE domain=?", (domain,)).fetchone()["id"]
 
 

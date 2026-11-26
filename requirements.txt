@@ -16,3 +16,6 @@ redis==8.1.0
 flower==2.2.0
 ddgs==9.16.1
 pytest==8.4.2
+anthropic==0.125.0
+pydantic==2.14.1
+keenable==0.3.0

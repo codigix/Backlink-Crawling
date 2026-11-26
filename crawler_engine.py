@@ -5,8 +5,11 @@ crawled, when to recrawl) lives in PostgreSQL via crawler_core, so a restart los
 """
 
 import asyncio
+import functools
 import hashlib
+import json
 import logging
+import os
 import re
 import warnings
 import time
@@ -16,7 +19,7 @@ from datetime import timedelta
 from urllib.parse import urlsplit
 
 import httpx
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning
 from crawlee import ConcurrencySettings, Request, SkippedReason
 from crawlee.crawlers import (
     BeautifulSoupCrawler, BeautifulSoupCrawlingContext, PlaywrightCrawler, PlaywrightCrawlingContext,
@@ -37,6 +40,13 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)  # XML pages 
 
 # Dead or forbidden pages: retrying will not help and we must not push past access controls.
 PERMANENT_HTTP = [400, 401, 403, 404, 405, 406, 410, 451]
+ACCESS_RESTRICTED = (401, 403, 451)  # the site refuses us; recorded as such, retried only after the permanent-failure interval, never worked around
+
+
+def is_challenge(soup) -> bool:
+    """A bot-challenge interstitial served with a success status (Cloudflare's "Just a moment..."): its HTML says nothing about the page we wanted."""
+    t = soup.title.get_text(" ", strip=True).lower() if soup is not None and soup.title else ""
+    return t.startswith("just a moment") or t.startswith("attention required! | cloudflare")
 log = logging.getLogger("crawler.discovery")
 vlog = logging.getLogger("crawler.verification")
 xlog = logging.getLogger("crawler.extraction")
@@ -102,26 +112,703 @@ def _job_add(job_id: str | None, col: str, n: int = 1) -> None:
             c.execute(f"UPDATE crawl_jobs SET {col}={col}+? WHERE job_id=?", (n, job_id))
 
 
-def _position(a) -> str:
-    names = {p.name for p in a.parents}
-    return next((n for n in ("nav", "header", "footer", "aside") if n in names), "content")
+# ---------- link placement ----------
+# Where on the page a link sits: nav / header / footer / aside (GLOBAL site regions), content, or unknown. Evidence per ancestor, top-down:
+#  * strong: class / id tokens that name a site-level region (site-footer, primary-nav, sidebar, elementor-location-footer, ...). Matched on whole
+#    tokens, with exclusions for local words (entry-footer, card-header, page-header, post-navigation), so "header" alone never counts.
+#  * weak: the semantic tag (<nav> <header> <footer> <aside>) or ARIA role. A weak region INSIDE an <article> (or a <main> that is not the page
+#    wrapper) is article-local (article header / table of contents / article footer): it is content, not a site region. Strong evidence is never local.
+#    Directly in a <main> (no <article> around it) a weak header / nav / footer is ambiguous (page title or sloppy site chrome): unknown.
+# Nested regions resolve by precedence footer > aside > nav > header (a footer inside a <header> is a footer; a menu inside a header is navigation).
+# One element whose own signals contradict each other (<header class="site-footer">) gives "unknown" rather than a guess; so does no evidence at all. <body>/<html> are never evidence: themes put
+# "ehf-footer" and the like on <body>. State is computed once per element and shared by all links below it (no per-link ancestor walk).
+_TAG_KIND = {"nav": "nav", "header": "header", "footer": "footer", "aside": "aside"}
+_ROLE_KIND = {"navigation": "nav", "banner": "header", "contentinfo": "footer", "complementary": "aside"}
+_NOT_STRUCT = {"entry", "post", "posts", "article", "card", "modal", "dialog", "comment", "comments", "popup", "tab", "tabs", "panel", "product", "item"}
+_HEADER_QUAL = {"site", "global", "main", "top", "website", "primary", "sticky", "wrapper", "container", "location", "desktop", "mobile", "responsive", "fixed"}
+_NAV_QUAL = {"site", "primary", "main", "global", "top", "menu", "mobile", "desktop", "sticky", "secondary", "bar"}
+_NAV_LOCAL = {"toc", "contents", "breadcrumb", "breadcrumbs", "pagination", "pager", "paging", "tab", "tabs", "step", "steps", "post", "posts", "article", "entry", "comment", "comments"}
+_CONTENT_PAIRS = ({"main", "content"}, {"article", "content"}, {"post", "content"}, {"entry", "content"}, {"blog", "content"}, {"article", "body"}, {"post", "body"}, {"entry", "body"})
+_PROSE = {"p", "blockquote", "figcaption"}
+_SPLIT = re.compile(r"[^a-z0-9]+")
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
-def extract_links(soup, base: str) -> list[tuple[str, str, str | None, str, dict]]:
-    """(destination, anchor_text, rel, link_type, extra) for every <a href> and the canonical URL. Query strings kept.
-    extra: nofollow/sponsored/ugc flags, img_alt (image links), position (nav/header/footer/aside/content), context."""
+@functools.lru_cache(maxsize=8192)
+def _declares_local(item: str) -> bool:
+    """class / id such as entry-header, post-footer, card-header: the template says this header / footer belongs to one post or card."""
+    t = set(_SPLIT.split(_CAMEL.sub(" ", item).lower()))
+    return bool(t & {"entry", "post", "article", "card"}) and bool(t & {"header", "footer"})
+
+
+@functools.lru_cache(maxsize=8192)
+def _item_kinds(item: str) -> tuple[set, bool, bool, bool]:
+    """(strong region kinds, is a content container, is a local navigation such as a table of contents, bare nav token) for one class or id value.
+    A qualified nav name (site-nav, primary-navigation, main-menu-nav) is strong; a bare "nav" / "navbar" is only as strong as a <nav> tag (see _signal)."""
+    t = set(_SPLIT.split(_CAMEL.sub(" ", item).lower())) - {""}
+    kinds = set()
+    words = _SPLIT.split(_CAMEL.sub(" ", item).lower())
+    after_content = any(a == "content" and b == "footer" for a, b in zip(words, words[1:]))  # "content-footer" ends a page's content; "footer-content" is the site footer
+    if ("footer" in t or "copyright" in t or "colophon" in t) and not t & (_NOT_STRUCT | {"pre", "prefooter"}) and not after_content:  # "pre-footer" is a call-to-action band above the footer, not the footer
+        kinds.add("footer")
+    if ("masthead" in t or ("header" in t and t & _HEADER_QUAL)) and not t & (_NOT_STRUCT | {"page", "section", "table"}):
+        kinds.add("header")
+    local_nav = bool(t & {"toc", "breadcrumb", "breadcrumbs", "pagination", "pager", "paging"}) or {"table", "contents"} <= t
+    bare = False
+    if ("navbar" in t or "nav" in t or ("navigation" in t and t & _NAV_QUAL)) and not t & _NAV_LOCAL:
+        if t & _NAV_QUAL or ("navbar" not in t and "nav" not in t):
+            kinds.add("nav")
+        else:
+            bare = True
+    if "sidebar" in t or "sidebars" in t or {"side", "bar"} <= t or {"widget", "area"} <= t:
+        kinds.add("aside")
+    return kinds, any(p <= t for p in _CONTENT_PAIRS) or "maincontent" in t, local_nav, bare
+
+
+def _signal(el) -> tuple[frozenset, str | None, str | None, bool, bool, bool]:
+    """(strong kinds, weak kind from tag/role, container 'article'|'main'|None, local-navigation marker, contradiction, declared local) of ONE element."""
+    strong, container, local_nav, bare_nav, declared = set(), None, False, False, False
+    role = (el.get("role") or "").strip().lower()
+    cls = el.get("class")
+    for item in [*(cls if isinstance(cls, list) else cls.split() if cls else ()), el.get("id") or ""]:
+        k, is_content, ln, bare = _item_kinds(item)
+        bare_nav = bare_nav or bare
+        declared = declared or _declares_local(item)
+        strong |= k
+        container = "article" if is_content else container
+        local_nav = local_nav or ln
+    if local_nav:  # "navigation pagination", "toc": the item named it a local navigation, so no sibling class can make it a site menu
+        strong.discard("nav")
+    weak = _TAG_KIND.get(el.name) or _ROLE_KIND.get(role) or ("nav" if bare_nav else None)
+    etype = (el.get("data-elementor-type") or "").lower()  # Elementor states what a template is: site chrome or the page/post body
+    if etype in ("header", "footer"):
+        strong.add(etype)
+    elif etype in ("wp-page", "wp-post", "single", "single-post", "single-page", "archive"):
+        container = container or "article"
+    if weak == "nav":  # a table of contents / breadcrumb / pager is local to its page even when it is marked up as <nav>
+        label = (el.get("aria-label") or "").lower()
+        if local_nav or "table of contents" in label or "breadcrumb" in label or "pagination" in label:
+            weak, local_nav = None, True
+    if el.name == "article" or role == "article":
+        container = "article"
+    elif el.name == "main" or role == "main":  # <main id="main-content"> is the main landmark, not an article
+        container = "main"
+    clash = bool(weak and strong and weak not in strong and weak != "nav" and not (weak == "header" and "nav" in strong))
+    return frozenset(strong), weak, container, local_nav, clash, declared and weak in ("header", "footer")
+
+
+def _is_page_wrapper(el) -> bool:
+    """A <main> (or content-class element) that directly holds site-footer evidence (a <footer>, role=contentinfo, a footer class / id, an Elementor footer
+    template) is the whole page, not the article: it gives no locality. Footer evidence inside an <article> / <section> / <aside> / <nav> belongs to that
+    block (a showcase or card footer), not to the site."""
+    for d in el.find_all(True):
+        a = d.attrs
+        if d.name == "footer" or a.get("role") == "contentinfo" or str(a.get("data-elementor-type", "")).lower() == "footer" or (
+                ("class" in a or "id" in a) and any("footer" in _item_kinds(i)[0] for i in [*(a.get("class") or ()), a.get("id") or ""])):
+            for p in d.parents:
+                if p is el:
+                    return True
+                if p.name in ("article", "section", "aside", "nav") or p.get("role") == "article":
+                    break
+    return False
+
+
+def _resolve(kinds: frozenset) -> str | None:
+    return next((k for k in ("footer", "aside", "nav", "header") if k in kinds), None)
+
+
+_SEMANTIC = {"nav", "header", "footer", "aside", "main", "article"}
+_ROOT_STATE = (frozenset(), frozenset(), frozenset(), None, False, False)
+
+
+def _state(el, memo: dict) -> tuple:
+    """(strong kinds, weak global kinds, local kinds, container, inside prose, contradiction) for everything below `el`, inherited top-down and
+    memoized per element. Iterative (a pathological page can be thousands of elements deep) and elements without tag/class/id/role evidence just
+    share their parent's state."""
+    chain = []
+    while el is not None and id(el) not in memo and el.name not in (None, "[document]"):
+        chain.append(el)
+        el = el.parent
+    ps = memo[id(el)] if el is not None and id(el) in memo else _ROOT_STATE
+    for el in reversed(chain):
+        name = el.name
+        if name in ("html", "body"):
+            memo[id(el)] = ps
+            continue
+        gs, gw, loc, cont, prose, clash = ps
+        if name in _SEMANTIC or "class" in el.attrs or "id" in el.attrs or "role" in el.attrs or "data-elementor-type" in el.attrs or name == "section":
+            strong, weak, ctn, local_nav, bad, declared = _signal(el)
+            clash = clash or (bad and cont != "article")
+            if "!nav" in loc:  # below a pager / table of contents: nothing in it is a site menu ("nav-links" inside "navigation pagination")
+                strong, weak = strong - {"nav"}, None if weak == "nav" else weak
+            gs |= strong
+            if weak:
+                if cont == "article" or declared:
+                    loc |= {weak}
+                elif weak != "aside" and (cont == "main" or "§" in loc):  # directly in <main> / a <section>: a page title or block header, or site chrome in a sloppy template
+                    loc |= {"?" + weak}
+                else:
+                    gw |= {weak}
+            if local_nav:
+                loc |= {"nav", "!nav"}
+            if name == "section":
+                loc |= {"§"}
+            if ctn and (name == "article" or el.get("role") == "article" or el.get("data-elementor-type") or not _is_page_wrapper(el)):
+                cont = "article" if "article" in (ctn, cont) else "main"
+        prose = prose or name in _PROSE
+        ps = memo[id(el)] = (gs, gw, loc, cont, prose, clash)
+    return ps
+
+
+def _position(a, memo: dict | None = None) -> str:
+    """nav | header | footer | aside | content | unknown. See the block comment above; `memo` is shared by all links of one page."""
+    placement, _ = _placement(a, {} if memo is None else memo)
+    return placement
+
+
+def _placement(a, memo: dict) -> tuple[str, str | None]:
+    gs, gw, loc, cont, prose, clash = _state(a, memo)
+    if clash:
+        return "unknown", None
+    strong, weak = _resolve(gs), _resolve(gw)
+    if strong:
+        return (weak if strong == "nav" and weak in ("footer", "aside") else strong), None
+    if weak:
+        return weak, None
+    if any(k[0] == "?" for k in loc):  # ambiguous block header / footer / nav: not claimed as content, not as a site region
+        return "unknown", None
+    if cont or prose:  # article-local header / footer / nav stay content, remembered for later phases
+        local = next((k for k in ("nav", "footer", "header", "aside") if k in loc), None)
+        return "content", f"article_{local}" if local else None
+    return "unknown", None
+
+
+# ---------- Phase 2: page content, page-type evidence and link context (evidence only) ----------
+# Nothing here decides whether a link is an editorial backlink; Phase 3 reads this evidence. Everything is computed from the one BeautifulSoup tree that
+# extract_links already walks: ONE pass over the tags (_index) feeds the links, the headings, the text blocks and the page-type signals, the Phase 1
+# placement memo is shared (a text block is main content when Phase 1 places it in "content"), and every text is bounded.
+LINK_CONTEXT_CHARS = int(os.environ.get("LINK_CONTEXT_CHARS", 300))        # text kept on each side of a link
+BLOCK_SCAN_CHARS = int(os.environ.get("LINK_BLOCK_SCAN_CHARS", 6000))      # longest block (paragraph / row / parent) read for a link's context
+PAGE_TEXT_CHARS = int(os.environ.get("PAGE_CONTENT_MAX_CHARS", 20000))     # main-content text kept per page (counts are for the full text, up to the scan cap)
+PAGE_SCAN_CHARS = int(os.environ.get("PAGE_CONTENT_SCAN_CHARS", 250000))
+MIN_COMPLETE_WORDS = 50
+
+_HEADINGS = frozenset(("h1", "h2", "h3", "h4", "h5", "h6"))
+_TEXT_BLOCKS = frozenset(("p", "li", "blockquote", "pre", "figcaption", "dd", "dt"))
+_LINK_BLOCKS = _TEXT_BLOCKS | _HEADINGS | {"td", "th", "caption"}
+_BREAKS = _HEADINGS | {"br", "div", "p", "li", "ul", "ol", "dl", "tr", "td", "th", "table", "section", "article", "blockquote", "hr", "figure", "figcaption",
+                       "pre", "dd", "dt", "header", "footer", "nav", "aside", "form", "main"}
+_SKIP_TEXT = frozenset(("script", "style", "noscript", "template", "svg", "iframe", "head", "title"))
+_BLOCK_KIND = {"p": "paragraph", "li": "list_item", "dd": "definition", "dt": "definition", "td": "table_row", "th": "table_row", "tr": "table_row", "blockquote": "blockquote",
+               "figcaption": "caption", "caption": "caption", "pre": "preformatted"}
+_WS = re.compile(r"\s+")
+_SENT = re.compile(r"(?<=[.!?…])[\"')\]]*\s+(?=[A-Z0-9\"“(\[])")
+_BOILER_TOKENS = {"cookie", "cookies", "consent", "gdpr", "ccpa", "popup", "modal", "lightbox", "advert", "advertisement", "adsbygoogle", "adslot", "adunit", "ads", "ad"}
+_LINK_VOCAB = {"card", "listing", "directory", "profile", "comment", "comments", "reply", "resource", "resources", "reference", "references", "footnotes", "widget",
+               "author", "bio", "review", "testimonial", "partner", "partners", "sponsor", "client", "clients", "related", "share", "social"}
+_RESOURCE_HEADING = re.compile(r"\b(resources?|references?|further reading|useful links|related (links|reading)|sources|bibliography|recommended)\b", re.I)
+_URL_PATTERNS = tuple((k, re.compile(v, re.I)) for k, v in (
+    ("blog", r"/(blog|blogs|post|posts)(/|$)"), ("news", r"/(news|press|press-releases?)(/|$)"), ("article", r"/(articles?|stories|story)(/|$)"),
+    ("resource", r"/(resources?|guides?|learn|library|whitepapers?|case-stud(y|ies))(/|$)"), ("documentation", r"/(docs?|documentation|manual|reference|api)(/|$)"),
+    ("profile", r"/(profiles?|users?|members?|people|author|authors|company|organization|organisations?|in)/[^/]+"),
+    ("directory", r"/(directory|directories|listings?|business(es)?|companies|yellow-?pages|places?)(/|$)"),
+    ("forum", r"/(forums?|threads?|topics?|discussions?|community|questions?|viewtopic)(/|$)"), ("dated_path", r"/(19|20)\d{2}/\d{1,2}(/|$)"),
+    ("category_or_tag", r"/(category|categories|tag|tags)/"), ("product", r"/(products?|shop|store|collections?|item)(/|$)")))
+_SCHEMA_GROUPS = {"blog": {"blogposting", "blog", "liveblogposting"},
+                  "news": {"newsarticle", "reportagenewsarticle", "analysisnewsarticle", "opinionnewsarticle", "newsmediaorganization"},
+                  "article": {"article", "techarticle", "scholarlyarticle", "socialmediaposting", "report"}, "resource": {"howto", "course", "learningresource", "dataset"},
+                  "profile": {"profilepage", "person", "organization", "corporation", "ngo", "onlinebusiness"},
+                  "directory": {"itemlist", "collectionpage", "localbusiness", "store", "restaurant", "hospital", "medicalbusiness", "professionalservice", "realestateagent",
+                                "lodgingbusiness"},
+                  "forum": {"discussionforumposting", "qapage"}, "homepage": {"website"},
+                  "ecommerce": {"product", "offer", "aggregateoffer", "productgroup"}}
+
+
+@functools.lru_cache(maxsize=8192)
+def _toks(item: str) -> frozenset:
+    return frozenset(_SPLIT.split(_CAMEL.sub(" ", item).lower())) - {""}
+
+
+@functools.lru_cache(maxsize=8192)
+def _class_marks(items: tuple) -> tuple:
+    """Page-type markers named by one element's class / id values (whole tokens)."""
+    t = frozenset().union(*(_toks(i) for i in items)) if items else frozenset()
+    if t & {"fa", "fas", "far", "fab", "icon", "icons", "social", "badge"}:  # an icon or a social button named after the thing ("fa-comments", "social-link-threads")
+        return ()
     out = []
-    for a in soup.find_all("a", href=True):
+    if t & {"comments", "commentlist", "respond"} or {"comment", "list"} <= t:
+        out.append("comments_section")
+    if t & {"thread", "threads", "forum", "bbp", "phpbb", "vbulletin", "xenforo", "discourse"}:
+        out.append("forum_structure")
+    if t & {"listing", "listings"} or {"business", "card"} <= t or {"company", "card"} <= t or {"directory", "item"} <= t:
+        out.append("listing_block")
+    if t & {"byline", "author", "authors"}:
+        out.append("author_markup")
+    if t & {"published", "pubdate"} or {"entry", "date"} <= t or {"post", "date"} <= t:
+        out.append("date_markup")
+    if t & {"cart", "woocommerce"} or {"product", "price"} <= t:
+        out.append("shop_markup")
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=8192)
+def _link_marks(items: tuple) -> tuple:
+    return tuple(sorted(frozenset().union(*(_toks(i) for i in items)) & _LINK_VOCAB)) if items else ()
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_boiler_item(item: str) -> bool:
+    return bool(_toks(item) & _BOILER_TOKENS)
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_button_item(item: str) -> bool:
+    return bool(_toks(item) & {"btn", "button", "cta"})
+
+
+class _Index:
+    """Every element Phase 2 needs, collected in ONE pass over the tree (document order)."""
+    __slots__ = ("ah", "anchors", "headings", "blocks", "metas", "links", "ld", "imgs", "times", "itemtypes", "marks", "tel", "addresses", "has_body")
+
+    def __init__(self) -> None:
+        self.ah, self.anchors, self.headings, self.blocks, self.metas, self.links, self.ld = [], [], [], [], [], [], []
+        self.imgs, self.times, self.itemtypes, self.marks = [], [], [], {}
+        self.tel = self.addresses = 0
+        self.has_body = False
+
+
+def _index(soup) -> _Index:
+    ix = _Index()
+    marks = ix.marks
+    for el in soup.find_all(True):
+        n, at = el.name, el.attrs
+        if n == "a":
+            href = at.get("href")
+            if href is not None:
+                ix.anchors.append(el)
+                ix.ah.append(el)
+                if isinstance(href, str) and href[:4].lower() == "tel:":
+                    ix.tel += 1
+        elif n in _HEADINGS:
+            ix.headings.append(el)
+            ix.ah.append(el)
+        elif n in _TEXT_BLOCKS:
+            ix.blocks.append(el)
+        elif n == "meta":
+            ix.metas.append(el)
+        elif n == "link":
+            ix.links.append(el)
+        elif n == "script":
+            if (at.get("type") or "").lower() == "application/ld+json":
+                ix.ld.append(el)
+        elif n == "img":
+            ix.imgs.append(el)
+        elif n == "time":
+            ix.times.append(el)
+        elif n == "address":
+            ix.addresses += 1
+        elif n == "body":
+            ix.has_body = True
+        if "itemtype" in at:
+            ix.itemtypes.append(at["itemtype"])
+        if "class" in at or "id" in at:
+            cls = at.get("class")
+            for m in _class_marks((*(cls if isinstance(cls, list) else cls.split() if cls else ()), at.get("id") or "")):
+                marks[m] = marks.get(m, 0) + 1
+    return ix
+
+
+def _hidden(el, bmemo: dict) -> bool:
+    """True inside hidden UI, cookie / consent banners, pop-ups, ads, <noscript>, <template>, <svg>, <iframe>. Inherited top-down and memoized per element."""
+    chain = []
+    while el is not None and id(el) not in bmemo and el.name not in (None, "[document]"):
+        chain.append(el)
+        el = el.parent
+    flag = bmemo.get(id(el), False) if el is not None else False
+    for e in reversed(chain):
+        if not flag:
+            at = e.attrs
+            style = at.get("style")
+            if (e.name in ("noscript", "template", "svg", "iframe") or "hidden" in at or at.get("aria-hidden") == "true" or at.get("role") in ("dialog", "alertdialog")
+                    or (isinstance(style, str) and ("display:none" in style.replace(" ", "").lower() or "visibility:hidden" in style.replace(" ", "").lower()))
+                    or (("class" in at or "id" in at) and any(_is_boiler_item(i) for i in [*(at.get("class") or ()), at.get("id") or ""]))):
+                flag = True
+        bmemo[id(e)] = flag
+    return flag
+
+
+def _build(block, cap: int = BLOCK_SCAN_CHARS) -> tuple[str, dict, bool]:
+    """(text, {id(anchor): (start, end)}, truncated) of one block: inline text keeps its natural spacing, block-level boundaries become a space, scripts and
+    styles are skipped. The offsets of the links inside the block are recorded while the text is built, so every link of the block shares this one pass."""
+    parts: list[str] = []
+    size = 0
+    spans: dict = {}
+    space = True
+    cut = False
+
+    def add(s: str) -> None:
+        nonlocal size, space, cut
+        s = _WS.sub(" ", s)
+        if space and s[:1] == " ":
+            s = s[1:]
+        if s:
+            parts.append(s)
+            size += len(s)
+            space = s[-1] == " "
+            cut = size > cap
+
+    def walk(node, depth: int) -> None:
+        if depth > 60:
+            return
+        for ch in node.children:
+            if cut:
+                return
+            if isinstance(ch, Tag):
+                nm = ch.name
+                if nm in _SKIP_TEXT:
+                    continue
+                if nm in _BREAKS:
+                    add(" ")
+                if nm == "a" and ch.has_attr("href"):
+                    start = size
+                    walk(ch, depth + 1)
+                    spans[id(ch)] = (start, size)
+                else:
+                    walk(ch, depth + 1)
+                if nm in _BREAKS and nm not in ("br", "hr"):
+                    add(" ")
+            elif type(ch) is NavigableString:
+                add(str(ch))
+
+    walk(block, 0)
+    return "".join(parts).rstrip(), spans, cut
+
+
+def _sentences(text: str) -> list[tuple[int, int]]:
+    bounds, last = [], 0
+    for m in _SENT.finditer(text):
+        bounds.append((last, m.start() + 1))
+        last = m.end()
+    bounds.append((last, len(text)))
+    return bounds
+
+
+def _clip(s: str, n: int, keep_end: bool = False) -> str:
+    """At most n characters, without a cut-off word at the open end."""
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    if keep_end:
+        s = s[-n:]
+        return s.split(" ", 1)[1] if " " in s else s
+    s = s[:n]
+    return s.rsplit(" ", 1)[0] if " " in s else s
+
+
+def _enclosing_block(a):
+    for i, p in enumerate(a.parents):
+        if i > 7 or p.name in ("body", "html", "[document]"):
+            return None
+        if p.name in _LINK_BLOCKS:
+            return p.parent if p.name in ("td", "th") and p.parent is not None and p.parent.name == "tr" else p
+    return None
+
+
+def _link_context(a, anchor_text: str, img, heading, cache: dict) -> dict:
+    """Evidence about the text around one link. Empty strings, never invented text, when the block holds nothing but the link."""
+    parent = a.parent
+    block = _enclosing_block(a)
+    if block is None and parent is not None and parent.name not in ("body", "html", "[document]"):
+        block = parent  # text sitting straight in a <div> / <span> / <section>
+    bt = block.name if block is not None else None
+    cls = a.get("class")
+    item_cls = cls if isinstance(cls, list) else cls.split() if cls else []
+    pcls = parent.get("class") if parent is not None else None
+    ctx = {"parent_tag": parent.name if parent is not None else None,
+           "parent_class": (" ".join(pcls) if isinstance(pcls, list) else pcls or "")[:80] or None,
+           "parent_id": ((parent.get("id") or "")[:40] or None) if parent is not None else None,
+           "block_tag": bt, "block_kind": (_BLOCK_KIND.get(bt) or ("heading" if bt in _HEADINGS else "other")) if bt else None,
+           "link_kind": "image" if img is not None and not anchor_text else "button" if a.get("role") == "button" or any(_is_button_item(i) for i in item_cls) else "text",
+           "section_heading": heading[1] if heading else None, "heading_level": heading[0] if heading else None,
+           "text_before": "", "text_after": "", "sentence": "", "prev_sentence": "", "next_sentence": "", "surrounding_text": "", "lead_in": "",
+           "container_markers": [], "context_quality": "insufficient"}
+    marks: set = set()
+    for i, p in enumerate(a.parents):
+        if i > 5:
+            break
+        c = p.get("class")
+        marks.update(_link_marks((*(c if isinstance(c, list) else c.split() if c else ()), p.get("id") or "")))
+    ctx["container_markers"] = sorted(marks)
+    if block is None:
+        return ctx
+    got = cache.get(id(block))
+    if got is None:
+        text, spans, _ = _build(block)
+        got = cache[id(block)] = (text, spans, _sentences(text) if text else [])
+    text, spans, sents = got
+    span = spans.get(id(a))
+    if span is None or not text:
+        return ctx
+    s, e = span
+    before, after = text[:s], text[e:]
+    if len(_WS.sub(" ", before + after).split()) < 3:  # the block is the link and (almost) nothing else
+        if bt in ("li", "dd", "dt") and block.parent is not None:  # a list entry: the sentence that introduces the list is the useful context
+            lead = block.parent.find_previous_sibling()
+            while lead is not None and lead.name not in _TEXT_BLOCKS | _HEADINGS | {"div", "span"}:
+                lead = lead.find_previous_sibling()
+            if lead is not None:
+                ctx["lead_in"] = _clip(lead.get_text(" ", strip=True), LINK_CONTEXT_CHARS)
+        return ctx
+    i = next((k for k, (x, y) in enumerate(sents) if x <= s < y), len(sents) - 1)
+    b4, af = _clip(before, LINK_CONTEXT_CHARS, keep_end=True), _clip(after, LINK_CONTEXT_CHARS)
+    ctx.update(text_before=b4, text_after=af, sentence=_clip(text[sents[i][0]:sents[i][1]], 2 * LINK_CONTEXT_CHARS),
+               prev_sentence=_clip(text[sents[i - 1][0]:sents[i - 1][1]], LINK_CONTEXT_CHARS) if i > 0 else "",
+               next_sentence=_clip(text[sents[i + 1][0]:sents[i + 1][1]], LINK_CONTEXT_CHARS) if i + 1 < len(sents) else "",
+               surrounding_text=" ".join(x for x in (b4, anchor_text[:200], af) if x), context_quality="sufficient")
+    return ctx
+
+
+def _meta(ix: _Index) -> dict:
+    m: dict = {}
+    for el in ix.metas:
+        at = el.attrs
+        key = (at.get("name") or at.get("property") or at.get("http-equiv") or "").strip().lower()
+        val = at.get("content")
+        if key and isinstance(val, str) and val.strip() and key not in m:
+            m[key] = val.strip()
+    return m
+
+
+def _walk_ld(node, found: dict, budget: list, depth: int = 0) -> None:
+    if depth > 6 or budget[0] <= 0:
+        return
+    budget[0] -= 1
+    if isinstance(node, list):
+        for x in node:
+            _walk_ld(x, found, budget, depth + 1)
+    elif isinstance(node, dict):
+        t = node.get("@type")
+        for x in ([t] if isinstance(t, str) else t if isinstance(t, list) else []):
+            if isinstance(x, str):
+                name = x.rsplit("/", 1)[-1]
+                found["types"][name] = found["types"].get(name, 0) + 1
+        if node.get("datePublished") or node.get("dateCreated"):
+            found["date"] = True
+        if node.get("author") or node.get("creator"):
+            found["author"] = True
+        for k, v in node.items():
+            if k != "@context" and isinstance(v, (dict, list)):
+                _walk_ld(v, found, budget, depth + 1)
+
+
+def _page_type_signals(base: str, ix: _Index, meta: dict, headings: list, has_article: bool) -> dict:
+    """Evidence for what kind of page this is. Several types can be supported at once (an article page with Organization markup, a homepage that lists
+    businesses); no type is decided here, `type_evidence` only groups the signals under the type they would support."""
+    found = {"types": {}, "date": False, "author": False}
+    for s in ix.ld:
+        raw = s.string if s.string is not None else s.get_text()
+        if raw and len(raw) <= 200_000:
+            try:
+                _walk_ld(json.loads(raw), found, [2000])
+            except (ValueError, RecursionError):
+                pass
+    schema_types = dict(found["types"])
+    for it in ix.itemtypes:  # microdata: itemtype="https://schema.org/BlogPosting"
+        for part in (it if isinstance(it, str) else " ".join(it)).split():
+            t = part.rsplit("/", 1)[-1]
+            if t:
+                schema_types[t] = schema_types.get(t, 0) + 1
+    metadata_types = [f"og:type={meta['og:type']}"] if meta.get("og:type") else []
+    metadata_types += [k for k in ("article:published_time", "article:author", "article:section", "profile:first_name", "og:profile:username") if k in meta]
+    path = urlsplit(base).path or "/"
+    url_patterns = [name for name, rx in _URL_PATTERNS if rx.search(path)]
+    if path == "/":
+        url_patterns.insert(0, "root")
+    marks = ix.marks
+    markers = sorted(k for k in marks if k not in ("author_markup", "date_markup"))
+    heads = " ".join(t for _, t in headings).lower()
+    if _RESOURCE_HEADING.search(heads):
+        markers.append("resource_heading")
+    if re.search(r"\b(comments?|replies|reply|responses?)\b", heads) and "comments_section" not in markers:
+        markers.append("comments_heading")
+    if ix.tel >= 3:
+        markers.append(f"tel_links={ix.tel}")
+    if ix.addresses >= 3:
+        markers.append(f"address_elements={ix.addresses}")
+    if marks.get("listing_block", 0) >= 3:
+        markers.append(f"repeated_listing_blocks={marks['listing_block']}")
+    has_author = bool(found["author"] or "author" in meta or "article:author" in meta or marks.get("author_markup")
+                      or any("author" in (el.get("rel") or []) for el in ix.links + ix.anchors))
+    has_date = bool(found["date"] or "article:published_time" in meta or ix.times or marks.get("date_markup"))
+    low = {k.lower(): (k, v) for k, v in schema_types.items()}
+    ev: dict = {k: [] for k in ("blog", "news", "article", "resource", "documentation", "profile", "directory", "forum", "homepage", "ecommerce")}
+    for group, names in _SCHEMA_GROUPS.items():
+        for n in names:
+            if n in low:
+                ev[group].append(f"schema:{low[n][0]}" + (f"x{low[n][1]}" if low[n][1] > 1 and group == "directory" else ""))
+    og = (meta.get("og:type") or "").lower()
+    if og == "article":
+        ev["article"].append("og:type=article")
+    elif og.startswith("profile"):
+        ev["profile"].append(f"og:type={og}")
+    elif og == "website":
+        ev["homepage"].append("og:type=website")
+    elif og.startswith("product"):
+        ev["ecommerce"].append(f"og:type={og}")
+    for name in url_patterns:
+        if name == "category_or_tag":  # a taxonomy archive says nothing about the page type; it stays visible in url_patterns only
+            continue
+        ev[{"root": "homepage", "dated_path": "article", "product": "ecommerce"}.get(name, name)].append(f"url:{name}")
+    if "comments_section" in markers or "comments_heading" in markers:
+        ev["blog"].append("marker:comments")
+    if "forum_structure" in markers:
+        ev["forum"].append("marker:forum_structure")
+    if marks.get("listing_block", 0) >= 3 or ix.addresses >= 3:  # phone links alone are on every business homepage, so they are reported but not counted here
+        ev["directory"].append("marker:listing_blocks_or_contact_details")
+    if "resource_heading" in markers:
+        ev["resource"].append("marker:resource_heading")
+    if "shop_markup" in markers:
+        ev["ecommerce"].append("marker:shop_markup")
+    if has_author and has_date and has_article:
+        ev["article"].append("structure:author+date+article")
+    return {"schema_types": sorted(schema_types), "metadata_types": metadata_types, "url_patterns": url_patterns, "content_markers": markers,
+            "has_author": has_author, "has_published_date": has_date, "has_article_structure": has_article, "type_evidence": {k: v for k, v in ev.items() if v}}
+
+
+def page_content(soup, base: str, ix: "_Index | None" = None, memo: dict | None = None, status: int | None = None) -> dict:
+    """Page-level evidence: metadata, headings, main-content text and statistics, page-type signals and an extraction-quality verdict. Reuses the
+    Phase 1 placement memo: a text block is main content when Phase 1 places it in "content"; boilerplate regions, hidden UI, cookie banners and ads are left out."""
+    ix = ix if ix is not None else _index(soup)
+    memo = memo if memo is not None else {}
+    bmemo: dict = {}
+    meta = _meta(ix)
+    title = soup.title.get_text(strip=True)[:300] if soup.title else None
+    canonical = next((core.resolve(base, el["href"]) for el in ix.links if "canonical" in [r.lower() for r in (el.get("rel") or [])] and el.get("href")), None)
+    html_el = soup.find("html")
+    lang = ((html_el.get("lang") or html_el.get("xml:lang")) if html_el is not None else None) or meta.get("content-language") or meta.get("og:locale")
+    desc = meta.get("description", "")[:500] or None
+    og = {"title": meta["og:title"][:300] if meta.get("og:title") and meta["og:title"] != title else None,
+          "description": meta["og:description"][:500] if meta.get("og:description") and meta["og:description"][:500] != desc else None, "type": meta.get("og:type")}
+    # headings in order; a heading inside a site region (menu, footer, sidebar widget) or hidden UI is not an article heading
+    outline, by_level = [], {"h1": [], "h2": [], "h3": [], "other": []}
+    for h in ix.headings:
+        if _placement(h, memo)[0] in ("content", "unknown") and not _hidden(h, bmemo):
+            txt = _WS.sub(" ", h.get_text(" ", strip=True))[:200]
+            if txt and len(outline) < 60:
+                outline.append({"level": int(h.name[1]), "text": txt})
+                bucket = by_level.get(h.name, by_level["other"])
+                if len(bucket) < 30:
+                    bucket.append(txt)
+    # main content: the text blocks Phase 1 places in content (innermost block only, no link-only lines, no repeated boilerplate)
+    nested = set()
+    for b in ix.blocks:  # a block that holds another text block is skipped: its inner blocks carry the text
+        for i, p in enumerate(b.parents):
+            if i > 5:
+                break
+            if p.name in _TEXT_BLOCKS:
+                nested.add(id(p))
+                break
+    chosen, seen, kinds = [], set(), {}
+    stats = {"words": 0, "chars": 0, "kept": 0}
+
+    def take(text: str, spans: dict, container) -> bool:
+        w = len(text.split())
+        if len(text) < 15 or w < 3 or text in seen:
+            return False
+        if sum(e - s for s, e in spans.values()) > 0.8 * len(text) and w < 25:
+            return False  # a line of links (related posts, share buttons), not prose
+        seen.add(text)
+        stats["words"] += w
+        stats["chars"] += len(text)
+        if stats["kept"] < PAGE_TEXT_CHARS:
+            chosen.append(text[:PAGE_TEXT_CHARS - stats["kept"]])
+            stats["kept"] += len(text) + 1
+        kinds[container] = kinds.get(container, 0) + 1
+        return True
+
+    lists, paragraphs, blocks_n, fallback = set(), 0, 0, False
+    for b in ix.blocks:
+        if stats["chars"] > PAGE_SCAN_CHARS or id(b) in nested:
+            continue
+        if _placement(b, memo)[0] != "content" or _hidden(b, bmemo):
+            continue
+        text, spans, _ = _build(b)
+        if take(text, spans, _state(b, memo)[3]):
+            blocks_n += 1
+            paragraphs += b.name == "p"
+            if b.name == "li" and b.parent is not None:
+                lists.add(id(b.parent))
+    if stats["words"] < MIN_COMPLETE_WORDS:  # conservative fallback for div-soup pages: long loose text in regions Phase 1 could not place
+        for el in soup.find_all(("div", "span", "td", "section")):
+            if stats["chars"] > PAGE_SCAN_CHARS:
+                break
+            own = _WS.sub(" ", " ".join(s for s in el.find_all(string=True, recursive=False) if type(s) is NavigableString)).strip()
+            if len(own) >= 80 and _placement(el, memo)[0] == "unknown" and not _hidden(el, bmemo) and take(own, {}, "fallback"):
+                blocks_n += 1
+                fallback = True
+    words, chars = stats["words"], stats["chars"]
+    images = sum(1 for im in ix.imgs if im.get("width") != "1" and im.get("height") != "1" and _placement(im, memo)[0] == "content" and not _hidden(im, bmemo))
+    if words >= MIN_COMPLETE_WORDS:
+        quality, reason = ("fallback", "loose text outside any recognised content region") if fallback else ("complete", None)
+    elif words > 0:
+        quality, reason = "thin", f"only {words} words of main content"
+    elif not ix.has_body and not ix.anchors and not ix.blocks:
+        quality, reason = "insufficient", "empty_document"
+    else:
+        quality, reason = "insufficient", "js_shell_suspected" if needs_js(soup) else "no_text_in_content_regions"
+    has_article = bool(by_level["h1"] or by_level["h2"]) and any(
+        _state(b, memo)[3] == "article" and id(b) not in nested and _placement(b, memo)[0] == "content" for b in ix.blocks[:300])
+    return {"url": base, "http_status": status, "title": title, "meta_description": desc, "canonical_url": canonical, "language": (lang or "").strip()[:20] or None,
+            "meta_robots": (meta.get("robots") or meta.get("googlebot") or "")[:100] or None, "og": og, "headings": {**by_level, "outline": outline},
+            "main_content": {"text": "\n".join(chosen), "word_count": words, "character_count": chars, "paragraph_count": paragraphs, "heading_count": len(outline),
+                             "list_count": len(lists), "image_count": images, "block_count": blocks_n, "container": max(kinds, key=kinds.get) if kinds else None,
+                             "truncated": chars > PAGE_TEXT_CHARS, "has_main_content": quality in ("complete", "fallback")},
+            "page_type_signals": _page_type_signals(base, ix, meta, [(o["level"], o["text"]) for o in outline], has_article),
+            "extraction_quality": {"status": quality, "reason": reason}}
+
+
+class PageFacts(tuple):
+    """What page_facts returns: still the (links, content_hash, title) triple every caller unpacks, plus `.content`, the page-level evidence of page_content()."""
+    content: dict
+
+    def __new__(cls, links, digest, title, content):
+        self = super().__new__(cls, (links, digest, title))
+        self.content = content
+        return self
+
+
+EVIDENCE_SINK = None  # optional callable(page_url, content, links) that process_page calls with the Phase 2 evidence (Phase 3 plugs in here; nothing is persisted yet)
+
+
+def extract_links(soup, base: str, ix: "_Index | None" = None, memo: dict | None = None) -> list[tuple[str, str, str | None, str, dict]]:
+    """(destination, anchor_text, rel, link_type, extra) for every <a href> and the canonical URL. Query strings kept.
+    extra: nofollow/sponsored/ugc flags, img_alt (image links), position (nav/header/footer/aside/content/unknown), local_region
+    (article_header / article_footer / article_nav / article_aside when a content link sits in an article-local region; not persisted), context (the
+    direct parent's first 300 characters, unchanged) and link_context (Phase 2: the text around the link, see _link_context; not persisted).
+     ix / memo let page_facts share its one tree pass and the placement memo with the page-level extraction."""
+    ix = ix if ix is not None else _index(soup)
+    memo = {} if memo is None else memo
+    out, cache, heading_in = [], {}, {}
+    for el in ix.ah:  # anchors and headings in document order: a link's section heading is the latest heading of the same page region above it
+        if el.name != "a":
+            txt = _WS.sub(" ", el.get_text(" ", strip=True))[:200]
+            if txt:
+                heading_in[_placement(el, memo)[0]] = (int(el.name[1]), txt)
+            continue
+        a = el
         dest = core.resolve(base, a["href"])
         if dest:
             tokens = [t.lower() for t in (a.get("rel") or [])]
             img = a.find("img")
+            position, local = _placement(a, memo)
+            anchor = a.get_text(" ", strip=True)[:200]
             extra = {"nofollow": "nofollow" in tokens, "sponsored": "sponsored" in tokens, "ugc": "ugc" in tokens,
-                     "img_alt": (img.get("alt") or "").strip()[:200] if img else None, "position": _position(a),
-                     "context": (a.parent.get_text(" ", strip=True) if a.parent else "")[:300]}
-            out.append((dest, a.get_text(" ", strip=True)[:200], " ".join(tokens) or None, "html", extra))
-    for ln in soup.find_all("link", href=True):
-        if "canonical" in [r.lower() for r in (ln.get("rel") or [])]:
+                     "img_alt": (img.get("alt") or "").strip()[:200] if img else None, "position": position, "local_region": local,
+                     "context": (a.parent.get_text(" ", strip=True) if a.parent else "")[:300],
+                     "link_context": _link_context(a, anchor, img, heading_in.get(position), cache)}
+            out.append((dest, anchor, " ".join(tokens) or None, "html", extra))
+    for ln in ix.links:
+        if ln.get("href") is not None and "canonical" in [r.lower() for r in (ln.get("rel") or [])]:
             dest = core.resolve(base, ln["href"])
             if dest:
                 out.append((dest, "", None, "canonical", {}))
@@ -135,11 +822,12 @@ def link_event(conn, source: str, dest: str, ddom: str, anchor: str, kind: str) 
                  (source, dest, ddom, anchor, kind))
 
 
-def page_facts(soup, base: str) -> tuple[list, str, str | None]:
-    """The CPU-bound DOM work for one page (links, content hash, title). Run it in a thread BEFORE the database transaction, so parsing
-    never happens while the domain advisory lock is held."""
-    return (extract_links(soup, base), hashlib.sha256(str(soup).encode()).hexdigest(),
-            soup.title.get_text(strip=True)[:300] if soup.title else None)
+def page_facts(soup, base: str) -> "PageFacts":
+    """The CPU-bound DOM work for one page (links, content hash, title, and the Phase 2 page evidence). Run it in a thread BEFORE the database transaction, so
+    parsing never happens while the domain advisory lock is held. Unpacks as (links, content_hash, title) exactly as before; .content is page_content()."""
+    ix, memo = _index(soup), {}
+    return PageFacts(extract_links(soup, base, ix, memo), hashlib.sha256(str(soup).encode()).hexdigest(),
+                     soup.title.get_text(strip=True)[:300] if soup.title else None, page_content(soup, base, ix, memo))
 
 
 FENCE: dict[str, int] = {}  # normalized_url -> lease_gen this process got when it claimed the URL (set by autonomous.claim_urls / business_jobs.claim)
@@ -168,7 +856,16 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
     if stale_lease(conn, core.normalize_url(key_url)):
         log.warning("STALE LEASE: %s was re-claimed by another worker; result dropped", key_url)
         return []
-    links, digest, title = facts or page_facts(soup, base_url)
+    facts = facts or page_facts(soup, base_url)
+    links, digest, title = facts
+    if EVIDENCE_SINK is not None:  # Phase 2 evidence for the next phase; the facts object is shared across deadlock retries, so this is idempotent
+        content = getattr(facts, "content", None)
+        if content is not None:
+            content["http_status"] = status
+        try:  # the sink runs inside the page transaction under the domain lock: a faulty sink must never roll the page back
+            EVIDENCE_SINK(key_url, content, links)
+        except Exception:  # noqa: BLE001
+            log.exception("EVIDENCE_SINK failed for %s", key_url)
     links = list(links)  # a deadlock retry re-enters here; do not append the redirect twice
     if base_url != key_url:  # redirect
         links.append((base_url, "", None, "redirect", {}))
@@ -177,6 +874,12 @@ def process_page(conn, key_url: str, base_url: str, depth: int, soup, status: in
         prepared.setdefault((dest, anchor), (core.registrable_domain(core.hostname(dest)), core.normalize_url(dest) or dest, rel, ltype, ex))
     ordered = sorted(prepared.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0][1]))
     targets = core.active_targets(conn)
+    classifier = getattr(cfg, "classifier", None)  # Phase 3: an optional per-crawl PageClassifier set on the Config (not a dataclass field, so asdict(cfg) never sees it)
+    if classifier is not None:  # classifies, in memory only, the links of this page that point at a monitored target; a failure never aborts the page transaction
+        try:
+            classifier.classify_page_facts(base_url, facts, [d for _, d in targets])
+        except Exception:  # noqa: BLE001
+            log.exception("link classification failed for %s", key_url)
     # Set-based writes: a page is ~12 statements however many links it has (it was ~2 per link, and every statement is a network round trip).
     # Rows are still written in the same global (domain, URL) order, which is what keeps concurrent pages from deadlocking.
     items, urls = [], {}  # urls: normalized -> discovered_urls row (first occurrence wins, as the sequential code did)
@@ -546,10 +1249,11 @@ async def crawl_round(cfg: Config, job_id: str | None, work: list[tuple[str, int
         url, base = context.request.url, context.request.loaded_url or context.request.url
         _http_done(url)  # response received (body parsing and database work after this are not HTTP time)
         t0 = started.get(url, core.now())
-        if status is not None and status >= 400:  # ignored by Crawlee so it does not retry; recorded as a permanent failure
-            def fail():
+        restricted = status in ACCESS_RESTRICTED or (status is not None and status < 400 and is_challenge(soup))
+        if (status is not None and status >= 400) or restricted:  # ignored by Crawlee so it does not retry; recorded as a permanent failure
+            def fail():  # an access restriction (HTTP 401/403/451 or a challenge page) is never bypassed, and a challenge page is never a "completed" crawl: no link of it was seen
                 with core.connect() as c:
-                    mark_failed(c, url, f"HTTP {status}", status, cfg, t0, permanent=True)
+                    mark_failed(c, url, f"access_restricted: HTTP {status}" if restricted else f"HTTP {status}", status, cfg, t0, permanent=True)
             await asyncio.to_thread(fail)
             finished.add(url)
             _job_add(job_id, "pages_failed")
@@ -821,6 +1525,12 @@ async def run_crawl(cfg: Config, source_urls: list[str], job_id: str | None = No
             break
         for d in cand:
             await admit_domain(cfg, job_id, d)
+    finalize = getattr(getattr(cfg, "classifier", None), "finalize", None)
+    if finalize is not None:
+        try:
+            finalize()
+        except Exception:
+            log.exception("end-of-crawl classification failed")
     log.info("job %s crawl loop finished | pages crawled this run: %d", job_id, done)
     with core.connect() as c:
         c.execute("UPDATE discovered_domains SET discovery_status='crawled' WHERE discovery_status='admitted' AND domain NOT IN"

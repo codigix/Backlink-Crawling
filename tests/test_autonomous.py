@@ -63,7 +63,7 @@ def test_autonomous_pipeline_and_database_first_search(env, monkeypatch):
     assert miss["status"] == "discovering" and miss["total_backlinks"] == 0  # onboarded: the engine searches DuckDuckGo for it
     assert [(r["target_domain"], r["status"]) for r in rows("SELECT * FROM business_jobs")] == [("never-seen.org", "pending")]
     assert rows("SELECT COUNT(*) n FROM crawl_history")[0]["n"] == before  # a search never crawls
-    assert rows("SELECT COUNT(*) n FROM target_domains")[0]["n"] == 0  # ...and never registers anything
+    assert [r["domain"] for r in rows("SELECT domain FROM target_domains")] == ["never-seen.org"]  # onboarding (not the search) registers the business as a backlink target
 
 
 def test_lookup_job_crawls_search_results_and_reports_done(env, monkeypatch):

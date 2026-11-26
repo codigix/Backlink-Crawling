@@ -222,14 +222,21 @@ def test_api_root_domain_subdomain_pagination_and_statuses(env):
     with core.connect() as conn:
         for i in range(5):
             core.save_url(conn, f"http://src{i}.org/p", None, "t", 0, True)
+            links = ('<nav><a href="https://codigix.co/">root</a></nav>' if i == 0 else
+                     '<a href="https://codigix.co/">root</a>')
             engine.process_page(conn, f"http://src{i}.org/p", f"http://src{i}.org/p", 0, html(
-                '<a href="https://codigix.co/">root</a><a href="https://blog.codigix.co/post">sub</a><a href="https://evilcodigix.co/">no</a>'),
+                links + '<a href="https://blog.codigix.co/post">sub</a><a href="https://evilcodigix.co/">no</a>'),
                 200, "text/html", c, set(), False, core.now())
         engine.process_page(conn, "http://codigix.co/self", "http://codigix.co/self", 0, html('<a href="https://codigix.co/x">self</a>'),
                             200, "text/html", c, set(), False, core.now())
     root = crawler_api.backlinks("codigix.co", limit=3, offset=0)
-    assert root["total_backlinks"] == 10 and len(root["backlinks"]) == 3 and root["referring_domains"] == 5  # self-links excluded, evilcodigix.co excluded
-    assert len(crawler_api.backlinks("codigix.co", limit=3, offset=9)["backlinks"]) == 1
+    with core.connect() as conn:  # 10 raw links (root + subdomain link on each of 5 pages); the API's contract is one backlink per SOURCE PAGE
+        assert conn.execute("SELECT COUNT(*) FROM outgoing_links WHERE destination_domain='codigix.co' AND source_domain<>'codigix.co' AND link_type='html'").fetchone()[0] == 10
+    assert root["total_backlinks"] == 5 and len(root["backlinks"]) == 3 and root["referring_domains"] == 5  # self-links excluded, evilcodigix.co excluded
+    assert root["backlinks"][0]["anchor_text"] == "sub"  # a page's representative is its first stored link (the subdomain link sorts first)
+    with core.connect() as conn:
+        assert conn.execute("SELECT position FROM outgoing_links WHERE source_url='http://src0.org/p' AND anchor_text='root'").fetchone()[0] == "nav"
+    assert len(crawler_api.backlinks("codigix.co", limit=3, offset=4)["backlinks"]) == 1
     sub = crawler_api.backlinks("blog.codigix.co", limit=100, offset=0)
     assert sub["total_backlinks"] == 5 and {b["destination_url"] for b in sub["backlinks"]} == {"https://blog.codigix.co/post"}
     assert crawler_api.backlinks("evilcodigix.co", limit=100, offset=0)["total_backlinks"] == 5
@@ -240,8 +247,8 @@ def test_api_root_domain_subdomain_pagination_and_statuses(env):
         conn.execute("UPDATE outgoing_links SET lost_at='2026-01-01 00:00:00' WHERE source_url='http://src1.org/p'")
     r = crawler_api.backlinks("codigix.co", limit=100, offset=0)
     states = [b["link_status"] for b in r["backlinks"]]
-    assert states.count("fetch_failed") == 2 and states.count("suspected_removed") == 2 and states.count("verified") == 6
-    assert r["verified_backlinks"] == 6 and r["total_backlinks"] == 10
+    assert states.count("fetch_failed") == 1 and states.count("suspected_removed") == 1 and states.count("verified") == 3
+    assert r["verified_backlinks"] == 3 and r["total_backlinks"] == 5
 
 
 # ---- concurrent persistence: same and different domains, overlapping links ----

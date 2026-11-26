@@ -71,6 +71,9 @@ class Run:
         self.rediscovery_seconds = rediscovery_seconds or REDISCOVERY_SECONDS
         self.hits: list[tuple[str, str, bool]] = []  # (url, query_hash, new for this target)
         self.updates: dict[tuple[str, str], dict] = {}  # cursor rows to upsert
+        self.aliases: set[str] = set()  # verified domains the business owns (business_aliases): never third-party sources
+        self.providers: dict[str, str] = {}  # normalized URL -> provider that returned it first
+        self.stats = {"raw": 0, "invalid": 0, "own_domain": 0, "adult": 0, "duplicate": 0, "eligible": 0}  # what the providers returned vs what was admitted
         self.waiting_until: str | None = None  # every cursor exhausted and none due: the earliest rediscovery time
 
     def cursor(self, qh: str, backend: str, query: str) -> dict:
@@ -107,6 +110,40 @@ def _serper(query: str, page: int) -> list[dict]:
     q = query if os.environ.get("SERPER_QUOTES") == "1" else query.replace('"', "")  # free serper accounts refuse quoted queries; SERPER_QUOTES=1 on a paid plan
     data = _serper_post({"q": q, "page": page, "num": 10, "gl": "in"})
     return [{"href": x["link"], "title": x.get("title", ""), "body": x.get("snippet", "")} for x in data.get("organic", []) if x.get("link")]
+
+
+class KeenableStop(RuntimeError):
+    """Retrying cannot help: no/refused key, out of credits, or a request Keenable rejects."""
+
+
+def _no_crawl() -> set[str]:
+    from crawler_engine import NO_CRAWL_DOMAINS  # lazy: crawler_engine must not be needed to import this module
+    return NO_CRAWL_DOMAINS
+
+
+def keenable_on() -> bool:
+    """Keenable is a provider only with an explicit key: the SDK would otherwise fall back silently to its rate-limited keyless endpoint."""
+    return os.environ.get("KEENABLE_ENABLED", "1") != "0" and bool(os.environ.get("KEENABLE_API_KEY", "").strip())
+
+
+def _keenable(query: str, page: int, own: "str | list[str] | None" = None) -> list[dict]:
+    """Keenable results as [{"href","title","body"}]. It has no pagination: one call returns up to KEENABLE_MAX_RESULTS (page 1), later pages are
+    empty. [] = no results; a failure raises (never an empty page). The SDK's own retries are off: _page already retries.
+    `own` (the target's registrable domain) and the no-crawl platforms are excluded SERVER-side: without it ~40% of a domain query's 50 results were
+    the target's own pages (measured live), which the application filter then discards, leaving fewer than the batch size."""
+    if page > 1:
+        return []
+    if not keenable_on():
+        raise KeenableStop("keenable is not configured (KEENABLE_API_KEY)")
+    import keenable as kn  # imported here: the module must load where the SDK is not installed
+    q = re.sub(r"\s*-site:\S+", "", query).replace('"', "").strip()  # its index is semantic: operators and quotes mean nothing to it
+    try:
+        res = kn.Keenable(timeout=float(os.environ.get("KEENABLE_TIMEOUT", 30)), max_retries=0).search(
+            q, max_results=min(int(os.environ.get("KEENABLE_MAX_RESULTS", 50)), 50), disable_cards=True,
+            **({"exclude_domains": [*([own] if isinstance(own, str) else own), *sorted(_no_crawl())]} if own else {}))
+    except (kn.KeenableAuthError, kn.KeenableInsufficientCreditsError, kn.KeenableInvalidRequestError) as e:
+        raise KeenableStop(f"keenable refused the request: {type(e).__name__}") from None  # never the SDK message: it may echo request details
+    return [{"href": r.url, "title": r.title, "body": (r.snippet or "")[:500]} for r in res if r.url]
 
 
 def _dogpile_url(href: str) -> str:
@@ -166,7 +203,7 @@ def _dogpile(query: str, page: int) -> list[dict]:
     return out
 
 
-def _page(query: str, page: int, attempts: int, end: float = float("inf"), backend: str = "auto") -> list[dict]:
+def _page(query: str, page: int, attempts: int, end: float = float("inf"), backend: str = "auto", own: str | None = None) -> list[dict]:
     """One result page. Every attempt uses a fresh client, after an exponential pause with jitter (some engines refuse with 429/403 or answer
     "No results" for a query another one serves). Returns [] when every attempt came back empty; raises the last error when it was a failure
     (rate limit, timeout, transport): a failure is never an empty page."""
@@ -176,10 +213,12 @@ def _page(query: str, page: int, attempts: int, end: float = float("inf"), backe
                 return _serper(query, page)
             if backend == "dogpile":
                 return _dogpile(query, page)
+            if backend == "keenable":
+                return _keenable(query, page, own)
             with DDGS(timeout=10) as ddgs:
                 return ddgs.text(query, region="in-en", safesearch="moderate", max_results=10, page=page, backend=backend)
         except Exception as e:  # noqa: BLE001
-            last = n == attempts - 1 or time.time() > end or isinstance(e, SerperStop)
+            last = n == attempts - 1 or time.time() > end or isinstance(e, (SerperStop, KeenableStop))
             if last and _is_empty(e):
                 return []
             if last:
@@ -237,16 +276,34 @@ def is_adult(url: str) -> bool:
     return reg in ADULT_DOMAINS or any(w in reg for w in ADULT_WORDS)
 
 
-def _collect(run: Run, hrefs: list[str], qh: str, own: str, found: dict, seen: set) -> int:
+def is_own(url: str, own: str, aliases=()) -> bool:
+    """The URL belongs to the target: its registrable domain (public-suffix aware), or the host is the target or a subdomain of it (host-boundary match,
+    never substring: codigix.co.evil-example.com is NOT codigix.co; also right for suffixes the public-suffix list does not know)."""
+    host = core.hostname(url)
+    return any(core.registrable_domain(host) == d or core.host_matches(host, d) for d in (own, *aliases))  # aliases: verified company-owned domains
+
+
+def _collect(run: Run, hrefs: list[str], qh: str, own: str, found: dict, seen: set, backend: str = "") -> int:
     """Record one page's URLs (a known URL still records WHICH query found it again); returns how many are new to the target."""
     new = 0
     for h in hrefs:
+        st = run.stats
+        st["raw"] += 1
         norm = core.normalize_url(h)
-        if not norm or core.registrable_domain(core.hostname(h)) == own or is_adult(h):
+        if not norm:
+            st["invalid"] += 1
+            continue
+        if is_own(h, own, run.aliases):  # the target's own pages and subdomains, and its verified alias domains
+            st["own_domain"] += 1
+            continue
+        if is_adult(h):
+            st["adult"] += 1
             continue
         fresh = norm not in run.known and norm not in seen
+        st["eligible" if fresh else "duplicate"] += 1  # duplicate = already known to the target, or already seen in this run
         seen.add(norm)
         run.hits.append((h, qh, fresh))
+        run.providers.setdefault(norm, backend)  # which provider first returned this URL
         if fresh:
             found[h] = None
             new += 1
@@ -263,12 +320,12 @@ def _head(run: Run, q: str, qh: str, backend: str, cur: dict, own: str, found: d
             return -1
         _sent.append(time.time())
         try:
-            hrefs = [r["href"] for r in _page(q, page, 2, end, backend=backend) or [] if r.get("href")]
+            hrefs = [r["href"] for r in _page(q, page, 2, end, backend=backend, **({"own": ([own, *sorted(run.aliases)] if run.aliases else own)} if backend == "keenable" else {})) or [] if r.get("href")]
         except Exception:  # noqa: BLE001
             return -1
         if not hrefs:
             return -1
-        new += _collect(run, hrefs, qh, own, found, seen)
+        new += _collect(run, hrefs, qh, own, found, seen, backend)
         time.sleep(1 + random.random())
     cur["head_checked_at"] = core.later(seconds=-random.uniform(0, HEAD_JITTER * HEAD_RECHECK_SECONDS))
     return new
@@ -278,6 +335,8 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
     """Read up to `pages` pages of one query on one backend, from its cursor; True if a page had results. A failing page raises and leaves the cursor ON that page."""
     got = False
     kw = {"backend": backend} if run.persist else {}
+    if backend == "keenable":
+        kw["own"] = [own, *sorted(run.aliases)] if run.aliases else own
     for _ in range(pages):
         if time.time() > end:
             raise TimeoutError("search budget exhausted")
@@ -299,7 +358,7 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
         got = True
         if page == 1 and run.persist:
             cur["head_checked_at"] = core.now()
-        new = _collect(run, hrefs, qh, own, found, seen)
+        new = _collect(run, hrefs, qh, own, found, seen, backend)
         cur["dup_streak"] = 0 if new else cur["dup_streak"] + 1
         cur.update(empty_streak=0, next_page=page + 1, pages_done=cur["pages_done"] + 1, urls_found=cur["urls_found"] + new, last_ok_at=core.now())
         if cur["dup_streak"] >= (DUP_PAGES_LIMIT if run.persist else 1):
@@ -315,8 +374,9 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
 
 
 def search_urls(domain: str, target: int = 50, name: str | None = None, pages: int | None = None, budget: float | None = None,
-                run: Run | None = None) -> list[str]:
+                run: Run | None = None, qs: list[str] | None = None, backends: list[str] | None = None) -> list[str]:
     """Result URLs new to the business (excluding its own pages), `target` or more (the last page is kept whole), over several query variations.
+    qs / backends override the fixed query variations and the provider chain (profile-driven search themes: Keenable first, then the usual chain).
     With a Run each (query, backend) continues from its saved page; without one it is the stateless search of old. Raises when NOTHING was found
     and a request failed (a provider failure is never "no backlinks"); an empty answer with no error returns []."""
     domain = domain.strip().lower()
@@ -327,8 +387,8 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
     seen: set[str] = set()
     err: Exception | None = None
     end = time.time() + (SEARCH_BUDGET if budget is None else budget)
-    backends = BACKENDS if run.persist else ["auto"]
-    qs = queries(domain, name)
+    backends = (backends or BACKENDS) if run.persist else ["auto"]
+    qs = qs or queries(domain, name)
     dead: set[str] = _cooling(backends) if run.persist else set()
     for q in qs:
         if len(found) >= target:
@@ -365,12 +425,13 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
             if run.persist and b not in dead:
                 if got or cur.get("pages_done", 0) == 0:  # empty on a cursor that never read anything here: a blocked engine; an exhausted cursor's empty page is not
                     _note(b, got)
-            if len(found) >= target or (got and run.updates.get((qh, b), cur)["status"] != "exhausted"):
-                break  # served; an empty or exhausted backend hands the query to the next one
+            if len(found) >= target or (got and b != "keenable" and run.updates.get((qh, b), cur)["status"] != "exhausted"):
+                break  # served; an empty or exhausted backend hands the query to the next one. Keenable has one page only: a short batch is filled by the next provider
     if run.persist:  # every (query, backend) cursor exhausted and none due yet: nothing to read until the earliest rediscovery time
         rows = [run.cursor(qhash(q), b, q) for q in qs for b in backends]
         if all(r["status"] == "exhausted" and r["rediscover_after"] > core.now() for r in rows):
             run.waiting_until = min(r["rediscover_after"] for r in rows)
+    log.info("search %s: %s", domain, run.stats)
     if not found and err and not run.updates:  # pages that were read (even with nothing new) are progress to keep; no page at all is a failure
         raise err
     return list(found) if run.persist else list(found)[:target]

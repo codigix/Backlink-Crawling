@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import httpx
 
 import business_jobs
+import business_intelligence
 import ddg_lookup  # noqa: F401 - the job search phase calls ddg_lookup.search_urls; kept importable as autonomous.ddg_lookup
 import crawler_core as core
 import crawler_engine as engine
@@ -601,6 +602,10 @@ class Engine:
         """Business jobs waiting for their DuckDuckGo search (bounded concurrency, provider cooldown): see business_jobs.search_pending."""
         return await business_jobs.search_pending()
 
+    async def profiles(self) -> bool:
+        """Websites waiting to be understood (business_intelligence): bounded concurrency, durable states, never blocks the other workers."""
+        return await business_intelligence.profile_pending()
+
     async def business(self) -> bool:
         """Advance business jobs: expand crawled pages one level, refresh counters, close finished jobs (freeing their capacity)."""
         return bool(await asyncio.to_thread(business_jobs.tick))
@@ -750,7 +755,7 @@ class Engine:
         log.info("autonomous engine started, resuming from saved state: %s | sources: %s", n, ",".join(self.cfg.sources))
         self.specs = {"discovery": (self.discovery, 30), "scheduler": (self.scheduler, 30, 1), "crawler": (self.crawler, 15, 1),
                       "indexer": (self.indexer, 300), "verifier": (self.verifier, 60, 5),
-                      "lookups": (self.lookups, 5), "business": (self.business, 5, 1)}  # own workers: a slow search or admission round never delays the others
+                      "lookups": (self.lookups, 5), "profiles": (self.profiles, 5), "business": (self.business, 5, 1)}  # own workers: a slow search or admission round never delays the others
         log.info("BUSINESS-WORKER-STARTED workers=%s ddgs_enabled=%s", ",".join(self.specs), business_jobs.DDGS_ENABLED)
         for name in self.specs:
             self._spawn(name)

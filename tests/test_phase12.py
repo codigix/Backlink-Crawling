@@ -258,8 +258,11 @@ def test_grouped_routes_page_deterministically_with_ties_through_offset_and_curs
 def test_target_backlinks_keyset_and_offset_cover_every_row_once(db, client):
     with core.connect() as c:
         build(c)
-        want = [r[0] for r in c.execute("SELECT source_url||'|'||destination_url||'|'||anchor_text FROM outgoing_links WHERE destination_domain=? AND link_type='html'"
-                                        " AND is_active=1 AND source_domain<>? ORDER BY id", (CA, CA))]
+        # the API's contract: ONE backlink per source page (its first link into the target); raw link rows are counted separately below
+        base = "FROM outgoing_links WHERE destination_domain=? AND link_type='html' AND is_active=1 AND source_domain<>?"
+        want = [r[0] for r in c.execute("SELECT source_url||'|'||destination_url||'|'||anchor_text " + base + " AND id IN (SELECT MIN(id) " + base + " GROUP BY source_url) ORDER BY id", (CA, CA, CA, CA))]
+        raw = c.execute("SELECT COUNT(*) " + base, (CA, CA)).fetchone()[0]
+    assert raw > len(want)  # pages that link the target several times are still one backlink each
     assert len(want) > 40
     for limit in (1, 7, 100):
         for style in ("after_id", "offset"):

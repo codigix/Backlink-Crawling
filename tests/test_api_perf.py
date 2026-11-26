@@ -168,8 +168,10 @@ NEW_KEYS = {"next_after_id", "next_offset", "total_anchors", "has_more", "next_c
 
 
 def old_shape(r: dict) -> dict:
-    """The response without the additive paging fields (limit/offset of the list-all endpoints are echoed only where the old response had them)."""
+    """The response without additive paging fields or backlink position (list-all limit/offset follow the old response shape)."""
     out = {k: v for k, v in r.items() if k not in NEW_KEYS}
+    if "backlinks" in out:
+        out["backlinks"] = [{k: v for k, v in row.items() if k != "position"} for row in out["backlinks"]]
     if "anchors" in out or "referring_domains" in out and "backlinks" not in out:
         out.pop("limit", None), out.pop("offset", None)
     return out
