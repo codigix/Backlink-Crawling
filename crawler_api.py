@@ -479,14 +479,6 @@ def discovery_rescan(domain: str) -> dict:
             "priority": f"P{job['priority']}", "created": created}
 
 
-@router.post("/businesses", status_code=202)
-def onboard_business(body: OnboardRequest) -> dict:
-    """Older form of /discovery/onboard (returns the whole job)."""
-    with connect() as c:
-        job, created = business_jobs.create_job(c, _clean(body.domain))
-    return {"created": created, "job": job}
-
-
 @router.get("/discovery/business/{domain}/status")
 def discovery_business_status(domain: str) -> dict:
     with connect() as c:

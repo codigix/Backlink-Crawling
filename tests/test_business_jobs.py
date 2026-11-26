@@ -293,8 +293,8 @@ def test_onboarding_is_idempotent_and_api_creates_jobs(env):
         j1, made1 = bj.create_job(c, "https://www.Idem.localhost/x")
         j2, made2 = bj.create_job(c, "idem.localhost")
     assert made1 and not made2 and j1["id"] == j2["id"]
-    r = crawler_api.onboard_business(crawler_api.OnboardRequest(domain="idem.localhost"))
-    assert r["created"] is False and r["job"]["id"] == j1["id"]
+    r = crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="idem.localhost"))
+    assert r["created"] is False and r["job_id"] == j1["id"]
     assert crawler_api.backlinks("idem.localhost", include_removed=False, limit=10, offset=0)["status"] == "discovering"  # GET only reports, creates nothing
     assert rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"] == 1
     assert crawler_api.business_status("idem.localhost")["status"] == "pending"
@@ -461,7 +461,6 @@ def test_repeated_onboarding_and_dashboard_polling_never_start_another_scan(env)
         r = crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="dash.localhost"))
         assert not r["created"] and r["job_id"] == first["job_id"] and r["status"] == "completed_no_results"
         assert r["next_run_at"] == before["next_run_at"]
-        crawler_api.onboard_business(crawler_api.OnboardRequest(domain="dash.localhost"))  # the older POST /businesses form
         crawler_api.discovery_business_status("dash.localhost")
         crawler_api.business_status("dash.localhost")
     assert rows("SELECT COUNT(*) n FROM business_jobs")[0]["n"] == 1

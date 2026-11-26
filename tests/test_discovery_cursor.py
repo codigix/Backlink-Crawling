@@ -457,8 +457,8 @@ def test_engine_end_to_end_via_api_with_only_the_ddgs_client_faked(env, monkeypa
         pools[ddg_lookup.queries(t)[0]] = pool  # 12 results each: batch 1 reads page 1 (10), batch 2 page 2 (2)
     SITES["shared.localhost"] = {"/": page(a(u("ea"), "A"), a(u("eca"), "CA"))}
 
-    crawler_api.onboard_business(crawler_api.OnboardRequest(domain="ea.localhost"))
-    crawler_api.onboard_business(crawler_api.OnboardRequest(domain="eb.localhost"))
+    crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="ea.localhost"))
+    crawler_api.discovery_onboard(crawler_api.OnboardRequest(domain="eb.localhost"))
     assert crawler_api.add_business_competitors("ea.localhost", crawler_api.CompetitorsRequest(domains=["eca.localhost"]))["results"][0]["status"] == "registered"
     cfg = acfg(claim_batch=10)
 

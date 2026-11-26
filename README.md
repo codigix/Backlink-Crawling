@@ -4,7 +4,7 @@ Crawls the web, stores every URL, link and backlink in PostgreSQL. Crawling runs
 `autonomous.py` finds new domains and keeps the queue fed. More detail on the design: [CELERY.md](CELERY.md).
 
 ## Business onboarding (highest priority)
-`POST /businesses {"domain": "example.com"}` (or `GET /backlinks/<domain>` for a domain with no stored backlinks) creates one discovery job per business
+`POST /discovery/onboard {"domain": "example.com"}` (or `GET /backlinks/<domain>` for a domain with no stored backlinks) creates one discovery job per business
 (idempotent while a job for that domain is active). The engine then: searches DuckDuckGo (`ddg_lookup.py`, top ~50 results, the domain's own pages excluded;
 bounded concurrency and a provider-wide cooldown after a failure), and crawls those pages **and the other pages of the same site up to depth 3** (external destinations are stored as links but not followed unless `FOLLOW_EXTERNAL_DOMAINS=true`),
 at most 150 pages per run. Every business also re-runs every `DDGS_INTERVAL_HOURS` (default 6, +0-10% jitter, `businesses.next_run_at`; a missed run fires once after a restart) as a P2 job. `POST /discovery/onboard {domain, business_name}`; `GET /discovery/business/<domain>/status|runs`. `GET /businesses/<domain>` shows progress; `GET /businesses` lists jobs.

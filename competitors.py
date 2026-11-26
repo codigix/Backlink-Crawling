@@ -123,6 +123,14 @@ def is_competitor(conn, domain: str) -> bool:
 _ACTIVE = "l.link_type='html' AND l.is_active=1"  # the one definition of an eligible link: html, active; "not from the target's own domain" is added per query
 # source_domain<>destination_domain is source_domain<>comps.c (the join makes them equal) written so a partial index on exactly that predicate is provable
 _COMP_LINK = f"FROM outgoing_links l JOIN unnest(?::text[]) AS comps(c) ON l.destination_domain=comps.c WHERE {_ACTIVE} AND l.source_domain<>l.destination_domain"
+# Sites the competitor built or owns are not opportunities (nobody can place a backlink there for us). They show up as: (1) a source domain linking the
+# same competitor from SITEWIDE_MIN+ pages (footer/credit link, client site, PBN); (2) the SAME link (destination + anchor) repeated on TEMPLATE_MIN+ pages
+# of one domain = a theme footer "Design by ..."; (3) a link on the source site's homepage (footer credit of a one-page client site).
+# shortcut: judged from link counts and URL shape only (no HTML is stored), so a genuine publisher that repeats one anchor on 2 pages or links from its
+# homepage is dropped too: raise the limits or add an allowlist if that bites.
+SITEWIDE_MIN = 10
+TEMPLATE_MIN = 2
+_HOME = "^https*://[^/#]+/*$"  # no '?': the driver would read it as a placeholder
 _LISTS = (("opportunities", "g", "ic AND NOT io"), ("shared_domains", "s", "ic AND io"), ("own_only_domains", "o", "io AND NOT ic"))  # response key, tag, filter on j
 
 
@@ -159,7 +167,9 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
     parts.append(f"(SELECT 'u' AS k, u AS d, {nulls} FROM gp WHERE TRUE" + (' AND u COLLATE "C" > ?' if pcur is not None else "") + ' ORDER BY u COLLATE "C" OFFSET ? LIMIT ?)')
     args += ([pcur] if pcur is not None else []) + [offset, limit + 1]
     rows = conn.execute(
-        f"WITH cl AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d, l.source_url AS u {_COMP_LINK}),"
+        f"WITH cl0 AS MATERIALIZED (SELECT l.source_domain AS d, l.source_url AS u, l.destination_domain AS c, l.destination_url AS t, COALESCE(l.anchor_text,'') AS a {_COMP_LINK}),"
+        f" cl1 AS MATERIALIZED (SELECT d, u, c FROM cl0 WHERE u !~ '{_HOME}' AND (d, c, t, a) NOT IN (SELECT d, c, t, a FROM cl0 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN})),"
+        f" cl AS MATERIALIZED (SELECT DISTINCT d, u FROM cl1 WHERE (d, c) NOT IN (SELECT d, c FROM cl0 GROUP BY d, c HAVING COUNT(DISTINCT u) >= {SITEWIDE_MIN})),"
         " ol AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d, l.source_url AS u FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>? AND l.source_domain<>l.destination_domain),"
         " j AS MATERIALIZED (SELECT COALESCE(cd.d, od.d) AS d, cd.d IS NOT NULL AS ic, od.d IS NOT NULL AS io FROM (SELECT DISTINCT d FROM cl) cd FULL JOIN (SELECT DISTINCT d FROM ol) od ON cd.d=od.d),"
         " gp AS MATERIALIZED (SELECT DISTINCT u FROM cl WHERE NOT EXISTS (SELECT 1 FROM ol WHERE ol.u=cl.u))"
