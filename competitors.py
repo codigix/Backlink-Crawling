@@ -131,7 +131,19 @@ _COMP_LINK = f"FROM outgoing_links l JOIN unnest(?::text[]) AS comps(c) ON l.des
 SITEWIDE_MIN = 10
 TEMPLATE_MIN = 2
 _HOME = "^https*://[^/#]+/*$"  # no '?': the driver would read it as a placeholder
+# (4) the source domain is the competitor's own sibling brand site (brainmine.co.in vs brainminetech.com): one name is the start of the other and
+# they are close in length. starts_with, not LIKE: a literal % would collide with the driver's placeholders.
+_SIB = "(length(split_part({d},'.',1)) >= 6 AND length(split_part({d},'.',1)) >= 0.6 * length(split_part({c},'.',1)) AND (starts_with(split_part({c},'.',1), split_part({d},'.',1)) OR starts_with(split_part({d},'.',1), split_part({c},'.',1))))"
 _LISTS = (("opportunities", "g", "ic AND NOT io"), ("shared_domains", "s", "ic AND io"), ("own_only_domains", "o", "io AND NOT ic"))  # response key, tag, filter on j
+
+
+def built_domains_sql(comp: str) -> tuple[str, list]:
+    """SQL (and its args) selecting the source domains of `comp` that the gap EXCLUDES as competitor-built: every active link they have to `comp`
+    is a homepage link, a repeated template link (TEMPLATE_MIN+ pages) or part of a SITEWIDE_MIN+ page footprint. Same three rules as gap()."""
+    base = f"SELECT l.source_domain AS d, l.source_url AS u, l.destination_url AS t, COALESCE(l.anchor_text,'') AS a, l.destination_domain AS c FROM outgoing_links l WHERE l.destination_domain=? AND {_ACTIVE} AND l.source_domain<>l.destination_domain"
+    return (f"SELECT d FROM ({base}) x GROUP BY d HAVING bool_and(u ~ '{_HOME}' OR {_SIB.format(d="d", c="c")}"
+            f" OR (d, t, a) IN (SELECT d, t, a FROM ({base}) y GROUP BY d, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN})"
+            f" OR d IN (SELECT d FROM ({base}) z GROUP BY d HAVING COUNT(DISTINCT u) >= {SITEWIDE_MIN}))", [comp, comp, comp])
 
 
 def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int = 0, after: dict | None = None) -> dict:
@@ -168,7 +180,7 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
     args += ([pcur] if pcur is not None else []) + [offset, limit + 1]
     rows = conn.execute(
         f"WITH cl0 AS MATERIALIZED (SELECT l.source_domain AS d, l.source_url AS u, l.destination_domain AS c, l.destination_url AS t, COALESCE(l.anchor_text,'') AS a {_COMP_LINK}),"
-        f" cl1 AS MATERIALIZED (SELECT d, u, c FROM cl0 WHERE u !~ '{_HOME}' AND (d, c, t, a) NOT IN (SELECT d, c, t, a FROM cl0 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN})),"
+        f" cl1 AS MATERIALIZED (SELECT d, u, c FROM cl0 WHERE u !~ '{_HOME}' AND NOT {_SIB.format(d="d", c="c")} AND (d, c, t, a) NOT IN (SELECT d, c, t, a FROM cl0 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN})),"
         f" cl AS MATERIALIZED (SELECT DISTINCT d, u FROM cl1 WHERE (d, c) NOT IN (SELECT d, c FROM cl0 GROUP BY d, c HAVING COUNT(DISTINCT u) >= {SITEWIDE_MIN})),"
         " ol AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d, l.source_url AS u FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>? AND l.source_domain<>l.destination_domain),"
         " j AS MATERIALIZED (SELECT COALESCE(cd.d, od.d) AS d, cd.d IS NOT NULL AS ic, od.d IS NOT NULL AS io FROM (SELECT DISTINCT d FROM cl) cd FULL JOIN (SELECT DISTINCT d FROM ol) od ON cd.d=od.d),"

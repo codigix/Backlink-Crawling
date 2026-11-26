@@ -327,16 +327,23 @@ def _group_next(rows: list, limit: int, offset: int) -> dict:
 
 @router.get("/backlinks/{target_domain}/referring-domains")
 def referring_domains(target_domain: str, limit: Limit = DEFAULT_LIMIT, offset: Offset = 0, cursor: Cursor = None) -> dict:
+    return _referring_domains(target_domain, limit, offset, cursor)
+
+
+def _referring_domains(target_domain: str, limit: int, offset: int, cursor: str | None, built_only: bool = False) -> dict:
     target = _clean(target_domain)
     after = _group_cursor(cursor, offset)
     cond, args = _graph_cond(target)
+    if built_only:  # only the sites the competitor built/owns (the ones backlink-gap leaves out)
+        sub, sargs = competitors.built_domains_sql(core.registrable_domain(target))
+        cond, args = cond + f" AND source_domain IN ({sub})", [*args, *sargs]
     def compute(c):  # grouped in PostgreSQL; COLLATE "C" = Python's code-point min/max; ties keep first-appearance (lowest id) order like the old stable sort
         rows, total = _grouped_page(c, 'source_domain AS domain, COUNT(*) AS backlinks, MIN(first_seen COLLATE "C") AS first_seen,'
                                     ' MAX(last_seen COLLATE "C") AS last_verified', cond, args, "source_domain", limit, offset, after)
         return [{"domain": r["domain"], "backlinks": r["backlinks"], "first_seen": r["first_seen"], "last_verified": r["last_verified"]} for r in rows[:limit]], total, _group_next(rows, limit, offset)
 
     with connect() as c:
-        items, total, nxt = _cached("referring_domains", target, (limit, offset, after), lambda: compute(c))
+        items, total, nxt = _cached("built_domains" if built_only else "referring_domains", target, (limit, offset, after), lambda: compute(c))
     return {"domain": target, "status": "ok" if total else "not_found_in_current_index", "total_referring_domains": total, "limit": limit, "offset": offset,
             **nxt, "referring_domains": items}
 
@@ -599,7 +606,8 @@ def competitor_backlinks(competitor_domain: str, include_removed: bool = False, 
 
 @router.get("/competitors/{competitor_domain}/referring-domains")
 def competitor_referring_domains(competitor_domain: str, limit: Limit = DEFAULT_LIMIT, offset: Offset = 0, cursor: Cursor = None) -> dict:
-    return referring_domains(_comp(competitor_domain), limit, offset, cursor)
+    """Only the referring domains the competitor built or owns (client sites, footer/credit links, networks): the opposite of backlink-gap."""
+    return _referring_domains(_comp(competitor_domain), limit, offset, cursor, built_only=True)
 
 
 @router.get("/competitors/{competitor_domain}/anchors")
