@@ -85,3 +85,51 @@ def test_tests_never_reach_the_real_serper(monkeypatch):
     monkeypatch.setenv("SERPER_API_KEY", "")  # the state every other test runs in (this file's fixture set a dummy key)
     with pytest.raises(pytest.fail.Exception, match="real serper.dev request"):
         dl._serper_post({"q": "x"})
+
+
+def test_credits_exhaustion_error_classification_and_cooldown(monkeypatch):
+    import time
+    # Test HTTP 400 with "not enough credits"
+    import httpx
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(400, json={"message": "Not enough credits"}, request=httpx.Request("POST", a[0])))
+    with pytest.raises(dl.SerperCreditsExhausted):
+        dl._serper_post({"q": "test"})
+
+    # Test HTTP 402 Payment Required
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(402, json={"message": "Payment Required"}, request=httpx.Request("POST", a[0])))
+    with pytest.raises(dl.SerperCreditsExhausted):
+        dl._serper_post({"q": "test"})
+
+    # Test 24h cooldown set when exhausted
+    monkeypatch.setattr(dl, "_health", {})
+    with pytest.raises(dl.SerperCreditsExhausted):
+        dl._page("test", 1, 1, backend="serper")
+    assert "serper" in dl._health
+    assert dl._health["serper"][1] > time.time() + 80000
+
+
+def test_query_simplification_fallback(monkeypatch):
+    import time
+    # simplify_query strips -site: operators
+    q = '"mybrand.com" -site:mybrand.com'
+    assert dl.simplify_query(q) == '"mybrand.com"'
+    assert dl.simplify_query('"Acme" -site:acme.com') == '"Acme"'
+
+    # When original query yields 0 results on page 1, simplified query is tried
+    calls = []
+    def fake_page(query, page, attempts, end=float("inf"), **kw):
+        calls.append(query)
+        if "-site:" in query:
+            return []  # fails on complex operator
+        return [{"href": "https://external-blog.com/post", "title": "Review"}]
+
+    monkeypatch.setattr(dl, "_page", fake_page)
+    run = dl.Run(persist=False)
+    found, seen = {}, set()
+    cur = run.cursor("qh", "duckduckgo", q)
+    got = dl._read(run, q, "qh", "duckduckgo", cur, 1, "mybrand.com", found, seen, 10, time.time() + 30)
+    assert got is True
+    assert "https://external-blog.com/post" in found
+    assert len(calls) == 2
+    assert calls[0] == q
+    assert calls[1] == '"mybrand.com"'

@@ -15,6 +15,7 @@ import competitors
 import crawler_core as core
 import api_timing
 import engine_stats
+import openpagescore
 from api_timing import connect
 from read_cache import graph_cache
 
@@ -571,18 +572,35 @@ def backlink_gap(business_domain: str, competitor: str | None = None, limit: Ann
                  after_own_only: Annotated[str | None, Query(description="keyset paging of `own_only_domains` (next_after of the previous page)")] = None,
                  after_page: Annotated[str | None, Query(description="keyset paging of `source_page_gap` (next_after of the previous page)")] = None,
                  refresh: Annotated[bool, Query(description="bypass the read cache (GRAPH_CACHE_ENABLED) and recompute; the fresh result replaces the cached one")] = False) -> dict:
-    """Referring domains and pages that link the competitors but not this business, over the discovered index (not the whole internet). Every list is
-    cut in PostgreSQL to `limit` entries; `summary` and `pagination.lists.*.total` always describe the whole comparison. Page with `offset` or with the
+    """Discovered backlink gaps followed by unique historical OpenPageScore domains. postgres_gap_domains is the discovered gap count;
+    gap_domains and the opportunity pagination total include both sources. Page with `offset` or with the
     per-list `after_*` cursors (not both); with cursors each list advances on its own, so stop asking for a list once its has_more is false."""
     after = {k: v for k, v in (("opportunities", after_opportunity), ("shared_domains", after_shared), ("own_only_domains", after_own_only),
                                ("source_page_gap", after_page)) if v is not None}
     if after and offset:
         raise HTTPException(422, "use either the after_* cursors or offset, not both")
     owner, comp = _owner(business_domain), _clean(competitor) if competitor else None
+    external_cursor = bool(after_opportunity and after_opportunity.startswith(openpagescore.CURSOR))
+    if external_cursor and not re.fullmatch(r"[0-9]{1,16}", after_opportunity[len(openpagescore.CURSOR):]):
+        raise HTTPException(422, "invalid OpenPageScore opportunity cursor")
 
     def compute():
         with connect() as c:
-            return competitors.gap(c, owner, comp, limit, offset, after)
+            result = competitors.gap(c, owner, comp, limit, offset, after, skip_opportunity_page=external_cursor)
+        extra, warnings = openpagescore.candidates(result["business_domain"], result["competitors"])
+        if extra:
+            excluded = {"links_to_business": 0, "database_opportunity": 0}
+            with connect() as c:
+                for domain, reason in competitors.known_gap_sources(c, owner, result["competitors"]):
+                    if extra.pop(domain, None) is not None:
+                        excluded[reason] += 1
+                        openpagescore.log.info("OpenPageScore excluded domain=%s reason=%s", domain, reason)
+            openpagescore.log.info("OpenPageScore overlap owner=%s database_opportunities=%d links_to_business=%d remaining=%d",
+                                   owner, excluded["database_opportunity"], excluded["links_to_business"], len(extra))
+        result["coverage"]["warnings"].extend(warnings)
+        if extra:
+            result["coverage"]["basis"] += "; additional opportunities from the historical OpenPageScore graph"
+        return openpagescore.append_page(result, extra, after_opportunity)
     try:
         if refresh:
             graph_cache.drop(("gap", owner, comp, limit, offset, tuple(sorted(after.items()))))  # a Refresh must never be answered from (or re-stamp) an old entry
@@ -605,9 +623,15 @@ def competitor_backlinks(competitor_domain: str, include_removed: bool = False, 
 
 
 @router.get("/competitors/{competitor_domain}/referring-domains")
-def competitor_referring_domains(competitor_domain: str, limit: Limit = DEFAULT_LIMIT, offset: Offset = 0, cursor: Cursor = None) -> dict:
-    """Only the referring domains the competitor built or owns (client sites, footer/credit links, networks): the opposite of backlink-gap."""
-    return _referring_domains(_comp(competitor_domain), limit, offset, cursor, built_only=True)
+def competitor_referring_domains(
+    competitor_domain: str,
+    built_only: bool = False,
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
+    cursor: Cursor = None,
+) -> dict:
+    """Referring domains for a competitor. built_only=false returns all referring domains; built_only=true returns footprint/built websites."""
+    return _referring_domains(_comp(competitor_domain), limit, offset, cursor, built_only=built_only)
 
 
 @router.get("/competitors/{competitor_domain}/anchors")

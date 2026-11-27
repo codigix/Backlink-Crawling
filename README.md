@@ -31,7 +31,9 @@ several targets is fetched once and its links stored once. Customer-business job
   business's `GET /businesses/{domain}/backlink-gap`. `GET /competitors`, `GET|PATCH {"active":false}|DELETE /competitors/{competitor}` (delete keeps all crawled data).
   `GET /backlinks` lists the backlinks of all businesses and competitors (`?target_type=`).
 - `GET /competitors/{domain}/backlinks|referring-domains|anchors|history|discovery/status`
-- `GET /businesses/{domain}/backlink-gap[?competitor=x.com]`: referring domains / pages that link the competitors but not you, over the DISCOVERED index only.
+- `GET /businesses/{domain}/backlink-gap[?competitor=x.com]` returns discovered opportunities first, followed by unique historical OpenPageScore domains. Source pages and discovery status come from the local index.
+  `summary.postgres_gap_domains` retains the database count. `openpagescore_unique_domains` counts eligible additions. `gap_domains`, `total_unique_opportunities` and the opportunity pagination total describe the combined list.
+  Pass the returned `next_after` unchanged as `after_opportunity` to continue across both sources. Provider coverage issues appear in `coverage.warnings`.
 
 ## One-time setup (Windows)
 

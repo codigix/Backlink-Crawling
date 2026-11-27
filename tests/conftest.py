@@ -30,3 +30,19 @@ def _no_real_serper(monkeypatch):
             pytest.fail(f"a test tried a real serper.dev request ({url}); fake ddg_lookup._serper_post instead")
         return real(url, *a, **kw)
     monkeypatch.setattr(httpx, "post", guarded)
+
+
+@pytest.fixture(autouse=True)
+def _offline_linkgap(monkeypatch):
+    """Regression tests use an empty provider graph unless a test supplies its own HTTP response."""
+    import openpagescore
+    from read_cache import TTLCache
+    import httpx
+
+    def offline(url, *args, **kwargs):
+        assert url == openpagescore.URL
+        return httpx.Response(200, request=httpx.Request("GET", url), json={"domains": [], "total": 0})
+
+    monkeypatch.setattr(openpagescore, "http_get", offline)
+    monkeypatch.setattr(openpagescore, "cache", TTLCache(enabled=True))
+    monkeypatch.setattr(openpagescore, "_requests", openpagescore.deque())

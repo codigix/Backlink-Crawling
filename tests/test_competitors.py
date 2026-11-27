@@ -237,7 +237,8 @@ def test_backlink_gap_classification_pages_attributes_and_coverage(env):
     link("http://directory.localhost/a", "http://cb.localhost/", "b")
     link("http://extra.localhost/x", "http://cb.localhost/", "b", rel="ugc")
     g = crawler_api.backlink_gap("own.localhost", None, 100)
-    assert g["summary"] == {"own_referring_domains": 3, "competitor_referring_domains": 5, "gap_domains": 3, "shared_domains": 2, "own_only_domains": 1, "gap_pages": 5}
+    assert {k: g["summary"][k] for k in ("own_referring_domains", "competitor_referring_domains", "gap_domains", "shared_domains", "own_only_domains", "gap_pages")} == \
+        {"own_referring_domains": 3, "competitor_referring_domains": 5, "gap_domains": 3, "shared_domains": 2, "own_only_domains": 1, "gap_pages": 5}
     assert {o["referring_domain"]: o["competitor_targets"] for o in g["opportunities"]} == \
         {"directory.localhost": ["ca.localhost", "cb.localhost"], "blog.localhost": ["ca.localhost"], "extra.localhost": ["cb.localhost"]}
     blog = next(o for o in g["opportunities"] if o["referring_domain"] == "blog.localhost")

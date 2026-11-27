@@ -129,24 +129,67 @@ _COMP_LINK = f"FROM outgoing_links l JOIN unnest(?::text[]) AS comps(c) ON l.des
 # shortcut: judged from link counts and URL shape only (no HTML is stored), so a genuine publisher that repeats one anchor on 2 pages or links from its
 # homepage is dropped too: raise the limits or add an allowlist if that bites.
 SITEWIDE_MIN = 10
-TEMPLATE_MIN = 2
+TEMPLATE_MIN = 5
 _HOME = "^https*://[^/#]+/*$"  # no '?': the driver would read it as a placeholder
 # (4) the source domain is the competitor's own sibling brand site (brainmine.co.in vs brainminetech.com): one name is the start of the other and
-# they are close in length. starts_with, not LIKE: a literal % would collide with the driver's placeholders.
-_SIB = "(length(split_part({d},'.',1)) >= 6 AND length(split_part({d},'.',1)) >= 0.6 * length(split_part({c},'.',1)) AND (starts_with(split_part({c},'.',1), split_part({d},'.',1)) OR starts_with(split_part({d},'.',1), split_part({c},'.',1))))"
+# they are close in length. Both names must be substantial (>= 6 chars) and mutually close in length (>= 0.6 ratio).
+_SIB = "(length(split_part({d},'.',1)) >= 6 AND length(split_part({c},'.',1)) >= 6 AND length(split_part({d},'.',1)) >= 0.6 * length(split_part({c},'.',1)) AND length(split_part({c},'.',1)) >= 0.6 * length(split_part({d},'.',1)) AND (starts_with(split_part({c},'.',1), split_part({d},'.',1)) OR starts_with(split_part({d},'.',1), split_part({c},'.',1))))"
+_AGENCY_RE = "(designed by|developed by|powered by|theme by|website by|built by|web design|site by|seo by)"
+_AGENCY_SQL = f"(COALESCE(cx,'') ~* '{_AGENCY_RE}' OR COALESCE(a,'') ~* '(designed by|developed by|web design|website design)')"
 _LISTS = (("opportunities", "g", "ic AND NOT io"), ("shared_domains", "s", "ic AND io"), ("own_only_domains", "o", "io AND NOT ic"))  # response key, tag, filter on j
 
 
 def built_domains_sql(comp: str) -> tuple[str, list]:
-    """SQL (and its args) selecting the source domains of `comp` that the gap EXCLUDES as competitor-built: every active link they have to `comp`
-    is a homepage link, a repeated template link (TEMPLATE_MIN+ pages) or part of a SITEWIDE_MIN+ page footprint. Same three rules as gap()."""
-    base = f"SELECT l.source_domain AS d, l.source_url AS u, l.destination_url AS t, COALESCE(l.anchor_text,'') AS a, l.destination_domain AS c FROM outgoing_links l WHERE l.destination_domain=? AND {_ACTIVE} AND l.source_domain<>l.destination_domain"
-    return (f"SELECT d FROM ({base}) x GROUP BY d HAVING bool_and(u ~ '{_HOME}' OR {_SIB.format(d="d", c="c")}"
-            f" OR (d, t, a) IN (SELECT d, t, a FROM ({base}) y GROUP BY d, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN})"
-            f" OR d IN (SELECT d FROM ({base}) z GROUP BY d HAVING COUNT(DISTINCT u) >= {SITEWIDE_MIN}))", [comp, comp, comp])
+    """SQL (and its args) selecting the source domains of `comp` that are competitor-built: every active link they have to `comp`
+    is a confirmed agency attribution, a footer/template credit, a sibling domain, or a sitewide footprint."""
+    base = (f"SELECT l.source_domain AS d, l.source_url AS u, l.destination_url AS t, COALESCE(l.anchor_text,'') AS a,"
+            f" l.destination_domain AS c, COALESCE(l.position,'') AS p, COALESCE(l.context,'') AS cx"
+            f" FROM outgoing_links l WHERE l.destination_domain=? AND {_ACTIVE} AND l.source_domain<>l.destination_domain")
+    agency_check = f"(COALESCE(cx,'') ~* '{_AGENCY_RE}' OR COALESCE(a,'') ~* '(designed by|developed by|web design|website design)')"
+    footprint_link = (f"({agency_check} OR {_SIB.format(d='d', c='c')}"
+                      f" OR (u ~ '{_HOME}' AND (p = 'footer' OR {agency_check}))"
+                      f" OR (p IN ('footer', 'header', 'nav') AND (d, c, t, a) IN (SELECT d, c, t, a FROM ({base}) y GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= 2))"
+                      f" OR ((d, c, t, a) IN (SELECT d, c, t, a FROM ({base}) y2 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN} AND bool_or(p <> 'content')))"
+                      f" OR (d, c) IN (SELECT d, c FROM ({base}) z GROUP BY d, c HAVING COUNT(DISTINCT u) >= 20 OR (COUNT(DISTINCT u) >= {SITEWIDE_MIN} AND bool_or(p IN ('footer', 'header', 'nav')))))")
+    return (f"SELECT d FROM ({base}) x GROUP BY d HAVING bool_and({footprint_link})", [comp, comp, comp, comp])
 
 
-def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int = 0, after: dict | None = None) -> dict:
+# Shared with the external overlap check so it uses exactly the competitor sources admitted by gap().
+_GAP_COMPETITOR_CTES = (
+    f"WITH cl0 AS MATERIALIZED (SELECT l.source_domain AS d, l.source_url AS u, l.destination_domain AS c, l.destination_url AS t,"
+    f" COALESCE(l.anchor_text,'') AS a, COALESCE(l.position,'') AS p, COALESCE(l.context,'') AS cx {_COMP_LINK}),"
+    f" cl1 AS MATERIALIZED (SELECT d, u, c FROM cl0 WHERE NOT ("
+    f"  {_AGENCY_SQL}"
+    f"  OR {_SIB.format(d='d', c='c')}"
+    f"  OR (u ~ '{_HOME}' AND (p <> 'content' OR {_AGENCY_SQL}))"
+    f"  OR (p IN ('footer', 'header', 'nav') AND (d, c, t, a) IN (SELECT d, c, t, a FROM cl0 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= 2))"
+    f"  OR ((d, c, t, a) IN (SELECT d, c, t, a FROM cl0 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN} AND bool_or(p <> 'content')))"
+    f" )), "
+    f" cl AS MATERIALIZED (SELECT DISTINCT d, u FROM cl1 WHERE (d, c) NOT IN ("
+    f"  SELECT d, c FROM cl0 GROUP BY d, c HAVING COUNT(DISTINCT u) >= 20 OR (COUNT(DISTINCT u) >= {SITEWIDE_MIN} AND bool_or(p IN ('footer', 'header', 'nav')))"
+    f" ))"
+)
+
+
+def known_gap_sources(conn, owner, comps):
+    """Exclude known own backlinks and the competitor domains admitted to the complete comparison."""
+    _no_jit(conn)
+    rows = conn.execute(_GAP_COMPETITOR_CTES +
+                        " SELECT DISTINCT d AS source_domain, 'database_opportunity' AS reason FROM cl"
+                        " UNION SELECT COALESCE(l.source_domain, split_part(l.source_url,'/',3)), 'links_to_business' FROM outgoing_links l"
+                        " WHERE l.is_active=1 AND l.destination_domain=?"
+                        " UNION SELECT split_part(b.source_url,'/',3), 'links_to_business' FROM backlinks b JOIN target_domains t ON t.id=b.target_domain_id"
+                        " WHERE b.is_active=1 AND (t.domain=? OR t.domain LIKE ?)"
+                        " ORDER BY reason DESC", (comps, owner, owner, "%." + owner))
+    for row in rows:
+        try:
+            yield _reg(row["source_domain"]), row["reason"]
+        except ValueError:
+            continue
+
+
+def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int = 0, after: dict | None = None,
+        skip_opportunity_page: bool = False) -> dict:
     """Backlink gap of `owner` against its active competitors (or just `only`), over the DISCOVERED index.
     Referring-domain level: registrable source domains classified competitor_only / shared / own_only (many pages of one domain = one domain).
     Source-page level: individual pages that link a competitor but not the owner. Pure SQL reads of the shared graph; no crawling.
@@ -172,6 +215,8 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
     parts, args = [], [comps, owner, owner]
     nulls = "NULL::bigint AS a, NULL::bigint AS b, NULL::bigint AS g, NULL::bigint AS s, NULL::bigint AS o, NULL::bigint AS p"
     for key, tag, flt in _LISTS:
+        if key == "opportunities" and skip_opportunity_page:
+            continue
         cur = after.get(key)
         parts.append(f"(SELECT '{tag}' AS k, d, {nulls} FROM j WHERE {flt}" + (' AND d COLLATE "C" > ?' if cur is not None else "") + ' ORDER BY d COLLATE "C" OFFSET ? LIMIT ?)')
         args += ([cur] if cur is not None else []) + [offset, limit + 1]
@@ -179,9 +224,7 @@ def gap(conn, owner: str, only: str | None = None, limit: int = 200, offset: int
     parts.append(f"(SELECT 'u' AS k, u AS d, {nulls} FROM gp WHERE TRUE" + (' AND u COLLATE "C" > ?' if pcur is not None else "") + ' ORDER BY u COLLATE "C" OFFSET ? LIMIT ?)')
     args += ([pcur] if pcur is not None else []) + [offset, limit + 1]
     rows = conn.execute(
-        f"WITH cl0 AS MATERIALIZED (SELECT l.source_domain AS d, l.source_url AS u, l.destination_domain AS c, l.destination_url AS t, COALESCE(l.anchor_text,'') AS a {_COMP_LINK}),"
-        f" cl1 AS MATERIALIZED (SELECT d, u, c FROM cl0 WHERE u !~ '{_HOME}' AND NOT {_SIB.format(d="d", c="c")} AND (d, c, t, a) NOT IN (SELECT d, c, t, a FROM cl0 GROUP BY d, c, t, a HAVING COUNT(DISTINCT u) >= {TEMPLATE_MIN})),"
-        f" cl AS MATERIALIZED (SELECT DISTINCT d, u FROM cl1 WHERE (d, c) NOT IN (SELECT d, c FROM cl0 GROUP BY d, c HAVING COUNT(DISTINCT u) >= {SITEWIDE_MIN})),"
+        _GAP_COMPETITOR_CTES + ","
         " ol AS MATERIALIZED (SELECT DISTINCT l.source_domain AS d, l.source_url AS u FROM outgoing_links l WHERE l.destination_domain=? AND " + _ACTIVE + " AND l.source_domain<>? AND l.source_domain<>l.destination_domain),"
         " j AS MATERIALIZED (SELECT COALESCE(cd.d, od.d) AS d, cd.d IS NOT NULL AS ic, od.d IS NOT NULL AS io FROM (SELECT DISTINCT d FROM cl) cd FULL JOIN (SELECT DISTINCT d FROM ol) od ON cd.d=od.d),"
         " gp AS MATERIALIZED (SELECT DISTINCT u FROM cl WHERE NOT EXISTS (SELECT 1 FROM ol WHERE ol.u=cl.u))"

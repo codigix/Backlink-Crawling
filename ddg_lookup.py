@@ -88,16 +88,44 @@ class SerperStop(RuntimeError):
     """Retrying cannot help: the daily limit, or a refused key / out of credits."""
 
 
+class SerperCreditsExhausted(SerperStop):
+    """Account out of credits (HTTP 400 'Not enough credits' or HTTP 402)."""
+
+
+class SerperAuthError(SerperStop):
+    """Invalid or refused API key (HTTP 401, 403)."""
+
+
+class SerperRateLimit(RuntimeError):
+    """Temporary rate limit (HTTP 429)."""
+
+
 def _serper_post(payload: dict) -> dict:
-    r = httpx.post("https://google.serper.dev/search", json=payload, headers={"X-API-KEY": os.environ["SERPER_API_KEY"]}, timeout=10)
-    if r.status_code in (400, 401, 402, 403):
-        raise SerperStop(f"serper refused the request (HTTP {r.status_code})")
+    key = os.environ.get("SERPER_API_KEY", "")
+    r = httpx.post("https://google.serper.dev/search", json=payload, headers={"X-API-KEY": key}, timeout=10)
+    if r.status_code == 429:
+        raise SerperRateLimit("serper rate limited (HTTP 429)")
+    if r.status_code == 402:
+        raise SerperCreditsExhausted("serper credits exhausted (HTTP 402)")
+    if r.status_code in (401, 403):
+        raise SerperAuthError(f"serper refused the request (HTTP {r.status_code})")
+    if r.status_code == 400:
+        msg = ""
+        try:
+            msg = r.text.lower()
+        except Exception:
+            pass
+        if "credit" in msg or "not enough" in msg:
+            raise SerperCreditsExhausted("serper credits exhausted (HTTP 400)")
+        raise SerperStop(f"serper refused the request (HTTP 400)")
     r.raise_for_status()  # the message names the URL and status, never the key
     return r.json()
 
 
 def _serper(query: str, page: int) -> list[dict]:
     """One serper.dev (Google) result page as [{"href": ...}]. [] = Google has no more results; anything else wrong raises (a failure is never an empty page)."""
+    if not os.environ.get("SERPER_API_KEY"):
+        raise SerperStop("SERPER_API_KEY not configured")
     day = core.now()[:10]
     if _serper_day[0] != day:
         _serper_day[:] = [day, 0]
@@ -105,7 +133,12 @@ def _serper(query: str, page: int) -> list[dict]:
         raise SerperStop(f"serper daily limit of {SERPER_DAILY_LIMIT} requests reached")
     _serper_day[1] += 1
     q = query if os.environ.get("SERPER_QUOTES") == "1" else query.replace('"', "")  # free serper accounts refuse quoted queries; SERPER_QUOTES=1 on a paid plan
-    data = _serper_post({"q": q, "page": page, "num": 10, "gl": "in"})
+    try:
+        data = _serper_post({"q": q, "page": page, "num": 10, "gl": "in"})
+    except (SerperCreditsExhausted, SerperAuthError) as e:
+        _health["serper"] = [BACKEND_STRIKES, time.time() + 86400]
+        log.warning("search: serper is unavailable (%s); putting in cooldown for 24h", e)
+        raise
     return [{"href": x["link"], "title": x.get("title", ""), "body": x.get("snippet", "")} for x in data.get("organic", []) if x.get("link")]
 
 
@@ -237,6 +270,11 @@ def is_adult(url: str) -> bool:
     return reg in ADULT_DOMAINS or any(w in reg for w in ADULT_WORDS)
 
 
+def simplify_query(query: str) -> str:
+    """Safely strip problematic operators like -site:... for search engines that do not support them reliably."""
+    return re.sub(r"\s*-site:\S+", "", query).strip()
+
+
 def _collect(run: Run, hrefs: list[str], qh: str, own: str, found: dict, seen: set) -> int:
     """Record one page's URLs (a known URL still records WHICH query found it again); returns how many are new to the target."""
     new = 0
@@ -287,6 +325,22 @@ def _read(run: Run, q: str, qh: str, backend: str, cur: dict, pages: int, own: s
         _sent.append(time.time())
         results = _page(q, page, 4 if page == 1 else 2, end, **kw)
         hrefs = [r["href"] for r in results or [] if r.get("href")]
+        if not hrefs and page == 1:
+            sq = simplify_query(q)
+            if sq != q:
+                simplified_results = _page(sq, page, 2, end, **kw)
+                hrefs = [r["href"] for r in simplified_results or [] if r.get("href")]
+                if hrefs:
+                    log.info("search: %s succeeded with simplified query %r (original: %r)", backend, sq, q)
+                    results = simplified_results
+            if not hrefs:
+                unquoted = sq.strip('"').strip()
+                if unquoted != sq and unquoted != q:
+                    unquoted_results = _page(unquoted, page, 2, end, **kw)
+                    hrefs = [r["href"] for r in unquoted_results or [] if r.get("href")]
+                    if hrefs:
+                        log.info("search: %s succeeded with unquoted query %r (original: %r)", backend, unquoted, q)
+                        results = unquoted_results
         if not hrefs:
             if page > 1 and run.persist:  # an empty page may be a flaky engine: the end of the results needs EMPTY_CONFIRM runs in a row to say so
                 cur["empty_streak"] = cur.get("empty_streak", 0) + 1
@@ -372,5 +426,8 @@ def search_urls(domain: str, target: int = 50, name: str | None = None, pages: i
         if all(r["status"] == "exhausted" and r["rediscover_after"] > core.now() for r in rows):
             run.waiting_until = min(r["rediscover_after"] for r in rows)
     if not found and err and not run.updates:  # pages that were read (even with nothing new) are progress to keep; no page at all is a failure
+        if isinstance(err, (SerperCreditsExhausted, SerperAuthError)) and len(backends) > 1:
+            log.warning("search: discovery finished with no results; serper was exhausted/refused")
+            return []
         raise err
     return list(found) if run.persist else list(found)[:target]
